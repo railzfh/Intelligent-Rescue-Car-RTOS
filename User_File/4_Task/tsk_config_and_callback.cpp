@@ -14,6 +14,7 @@
 
 #include "tsk_config_and_callback.h"
 
+#include "cmsis_os2.h"
 #include "2_Device/Motor/Motor_DJI/dvc_motor_dji.h"
 #include "2_Device/Battery/dvc_battery.h"
 #include "2_Device/BSP/Power/bsp_power.h"
@@ -44,6 +45,7 @@ static volatile uint32_t M2006_Last_Feedback_Ms[2] = {};
 static volatile bool M2006_Feedback_Received[2] = {};
 
 static Class_Battery Battery;
+static volatile uint8_t Battery_LED_Green = 0;
 
 /* Private function declarations ---------------------------------------------*/
 
@@ -93,34 +95,16 @@ static void M2006_CAN2_RxCallback(FDCAN_RxHeaderTypeDef &header, uint8_t *)
 
 /* Function prototypes -------------------------------------------------------*/
 
-/**
- * @brief 每3600s调用一次
- *
- */
-void Task3600s_Callback()
+static void Control_Step()
 {
-    SYS_Timestamp.TIM_3600s_PeriodElapsedCallback();
-}
-
-/**
- * @brief 每1s调用一次
- *
- */
-void Task1s_Callback()
-{
-
-}
-
-/**
- * @brief 每1ms调用一次
- *
- */
-void Task1ms_Callback()
-{
-    TIM_1ms_IWDG_PeriodElapsedCallback();
-
+    // ADC DMA can update Battery at any point outside this short snapshot.
+    const uint32_t irq_state = __get_PRIMASK();
+    __disable_irq();
     Battery.Check_Timeout(HAL_GetTick());
     const bool battery_ready = Battery.Can_Run();
+    Battery_LED_Green = Battery.Get_LED_Green();
+    __set_PRIMASK(irq_state);
+
     BSP_Power.Set_DC24_0(battery_ready);
     BSP_Power.Set_DC24_1(battery_ready);
     if (!battery_ready)
@@ -175,24 +159,18 @@ void Task1ms_Callback()
     // C610的1~4号电流命令为0x200；两条总线分别发送，未使用的槽位保持零。
     CAN_Transmit_Data(&hfdcan1, 0x200, CAN1_0x200_Tx_Data, FDCAN_DLC_BYTES_8);
     CAN_Transmit_Data(&hfdcan2, 0x200, CAN2_0x200_Tx_Data, FDCAN_DLC_BYTES_8);
+    IWDG_Independent_Feed();
 }
 
-/**
- * @brief 每125us调用一次
- *
- */
-void Task125us_Callback()
+static void Wait_For_Next_Period(uint32_t &wake_tick, uint32_t period)
 {
-
-}
-
-/**
- * @brief 每10us调用一次
- *
- */
-void Task10us_Callback()
-{
-
+    wake_tick += period;
+    if (osDelayUntil(wake_tick) != osOK)
+    {
+        // Skip missed deadlines instead of sending a burst of CAN commands.
+        osDelay(1);
+        wake_tick = osKernelGetTickCount();
+    }
 }
 
 /**
@@ -202,6 +180,10 @@ void Task10us_Callback()
 void Task_Init()
 {
     SYS_Timestamp.Init(&htim5);
+    if (HAL_TIM_Base_Start_IT(&htim5) != HAL_OK)
+    {
+        Error_Handler();
+    }
 
     M2006[0].Init(&hfdcan1, M2006_ID[0], Motor_DJI_Control_Method_OMEGA);
     M2006[1].Init(&hfdcan2, M2006_ID[1], Motor_DJI_Control_Method_OMEGA);
@@ -221,35 +203,35 @@ void Task_Init()
         Battery.Stop();
     }
 
-    // 定时器中断初始化
-    HAL_TIM_Base_Start_IT(&htim4);
-    HAL_TIM_Base_Start_IT(&htim5);
-    HAL_TIM_Base_Start_IT(&htim6);
-    HAL_TIM_Base_Start_IT(&htim7);
-    HAL_TIM_Base_Start_IT(&htim8);
-
     // 标记初始化完成
     init_finished = true;
 }
 
-/**
- * @brief 前台循环任务
- *
- */
-void Task_Loop()
+void Task_Control_Run()
 {
-    static uint32_t last_led_ms = 0;
-    const uint32_t now_ms = HAL_GetTick();
-    if ((uint32_t)(now_ms - last_led_ms) < 10U)
+    uint32_t wake_tick = osKernelGetTickCount();
+    for (;;)
     {
-        return;
+        Control_Step();
+        Wait_For_Next_Period(wake_tick, 1U);
     }
-    last_led_ms = now_ms;
+}
 
-    const uint8_t green = Battery.Get_LED_Green();
-    BSP_WS2812.Set_RGB(255U - green, green, 0);
-    // SPI6为阻塞发送，放在前台执行，不占用1ms电机控制中断。
-    BSP_WS2812.TIM_10ms_Write_PeriodElapsedCallback();
+void Task_Status_Run()
+{
+    uint32_t wake_tick = osKernelGetTickCount();
+    for (;;)
+    {
+        const uint8_t green = Battery_LED_Green;
+        BSP_WS2812.Set_RGB(255U - green, green, 0);
+        BSP_WS2812.TIM_10ms_Write_PeriodElapsedCallback();
+        Wait_For_Next_Period(wake_tick, 10U);
+    }
+}
+
+void Task_Timestamp_Overflow()
+{
+    SYS_Timestamp.TIM_3600s_PeriodElapsedCallback();
 }
 
 void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc)
@@ -286,41 +268,6 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     if (!init_finished)
     {
         return;
-    }
-}
-
-/**
- * @brief 定时器中断回调函数
- *
- * @param htim
- */
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
-{
-    if (!init_finished)
-    {
-        return;
-    }
-
-    // 选择回调函数
-    if (htim->Instance == TIM4)
-    {
-        Task10us_Callback();
-    }
-    else if (htim->Instance == TIM5)
-    {
-        Task3600s_Callback();
-    }
-    else if (htim->Instance == TIM6)
-    {
-        Task1s_Callback();
-    }
-    else if (htim->Instance == TIM7)
-    {
-        Task1ms_Callback();
-    }
-    else if (htim->Instance == TIM8)
-    {
-        Task125us_Callback();
     }
 }
 

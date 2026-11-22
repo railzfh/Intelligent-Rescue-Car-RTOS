@@ -54,6 +54,11 @@ include_directories(Core/Inc Drivers/STM32H7xx_HAL_Driver/Inc Drivers/STM32H7xx_
 # User include_directories BEGIN
 
 include_directories(User_File)
+include_directories(
+    Middlewares/Third_Party/FreeRTOS/Source/include
+    Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2
+    Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F
+)
 
 # User include_directories END
 
