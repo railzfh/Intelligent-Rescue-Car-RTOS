@@ -29,6 +29,7 @@ extern "C" {
 
 void Task_Init(void);
 void Task_Control_Run(void);
+void Task_Imu_Run(void);
 void Task_Status_Run(void);
 void Task_Timestamp_Overflow(void);
 

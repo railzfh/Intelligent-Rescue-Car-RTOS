@@ -5,15 +5,27 @@ CMSIS-RTOS2 / FreeRTOS 10.3.1，保留原 CMake 固件目标。
 
 | 执行上下文 | 职责 |
 | --- | --- |
-| `controlTask`，High，1 ms | ADC 超时检查、供电联锁、M2006 计算和两路 CAN 发送，完成后喂独立看门狗 |
+| `controlTask`，High，1 ms | ADC 超时检查、供电联锁、按键、LADRC 定距直行、两路 CAN 发送，完成后喂独立看门狗 |
+| `imuTask`，AboveNormal，1 ms | BMI088 静止校准、SPI2 采样、EKF 姿态与航向发布；初始化失败后每 3 s 重试 |
 | `statusTask`，Normal，10 ms | 启动时初始化 USB CDC，随后刷新 WS2812 |
 | 硬件中断 | CAN 接收解码、ADC DMA 半缓冲处理、TIM5 时间戳溢出及原有外设回调 |
 
-两个应用任务各有 2048 B 栈。周期使用 RTOS 绝对 tick，错过周期不连续补发 CAN 命令。
+控制与状态任务各有 2048 B 栈，IMU 任务 4096 B，沿用 12 KiB RTOS heap。
+周期使用 RTOS 绝对 tick，错过周期不连续补发 CAN 命令。
 SysTick 只驱动 FreeRTOS，TIM6 驱动 HAL 毫秒时基。TIM4、TIM7 和 TIM8 保留配置，但不再启动空回调
 或用其调度任务。DMA、串口、FDCAN、EXTI 等相关 IRQ 的抢占优先级从 0 调整为 5，
 与 CubeMX 的 FreeRTOS 中断配置一致；引脚、外设参数、时钟树、DMA 映射和 CAN 波特率不变。
-M2006 目标仍是 `0 rpm`，电池及电机联锁条件不变。
+启动保持零扭矩。有效电池、两轮反馈、最新姿态、静止条件及 CAN 发送条件均满足后短鸣一次，
+重新按 USER KEY 才起步；再次按键减速停车。初始化期间提前按键不排队，复位时按住须先松开。
+
+迁入实车版本的两轮 LADRC、编码器定距和航向纠偏：右 CAN1/ID1 方向 -1，左 CAN2/ID2 方向 +1；
+最高 50 rpm，斜坡 50 rpm/s，扭矩上限 0.9 Nm，目标 1 m。轮直径 58 mm，里程比例系数 0.90。
+电池/电机/姿态超时或 CAN 发送故障使直行任务停止，恢复反馈后不自行起步。
+控制任务一次性快照电机和 IMU 数据，状态任务读取控制任务发布的灯色。
+
+IMU 任务在 freertos.c 的 USER CODE 区创建，不增加 CubeMX 生成任务或修改 .ioc。
+校准等待使用 osDelay 让出 CPU，并按 1 kHz tick 留出至少规定的寄存器等待时间。
+姿态数据发布后才允许按键起步；SPI6 灯光仍由状态任务独占。TIM7 不启动，避免重复电机控制。
 
 ## 生成和构建
 
@@ -34,5 +46,14 @@ M2006 目标仍是 `0 rpm`，电池及电机联锁条件不变。
 - 干净 Debug 配置、编译及链接通过，Flash 77,236 B，RAM_D1 247,552 B。
   ELF 中已核对 SVC、PendSV、SysTick、TIM5、TIM6 和两个任务入口。
   25 项仓库测试及电池桌面逻辑测试通过。
-- 未烧录。上板时保持 `0 rpm`，验证 USB 枚举、两路 CAN 命令周期与零电流值、任务栈余量、
+- 上述验证为 RTOS 基线记录。此次直行移植额外执行干净 Debug 构建、直行/电池桌面测试、
+  BMI088 实际驱动和 EKF 模拟测试，以及直接提取任务代码的按键/故障联锁测试。
+  桌面命令：
+
+  ```powershell
+  python tests/firmware/run_rtos_drive.py
+  python tests/firmware/run_bmi088.py --dsp-source <CMSIS-DSP/Source/MatrixFunctions>
+  ```
+
+- 本次移植未烧录。上板时先不按 USER KEY，验证 USB 枚举、两路 CAN 命令周期与零电流值、任务栈余量、
   看门狗、ADC 电压和 LED、欠压锁定及 PC13/PC14 供电使能实际状态。

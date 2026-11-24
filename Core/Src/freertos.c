@@ -45,7 +45,12 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
-
+static osThreadId_t imuTaskHandle;
+static const osThreadAttr_t imuTask_attributes = {
+  .name = "imuTask",
+  .stack_size = 4096,
+  .priority = (osPriority_t) osPriorityAboveNormal,
+};
 /* USER CODE END Variables */
 /* Definitions for statusTask */
 osThreadId_t statusTaskHandle;
@@ -64,7 +69,7 @@ const osThreadAttr_t controlTask_attributes = {
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
-
+static void StartImuTask(void *argument);
 /* USER CODE END FunctionPrototypes */
 
 void StartStatusTask(void *argument);
@@ -119,7 +124,8 @@ void MX_FREERTOS_Init(void) {
   controlTaskHandle = osThreadNew(StartControlTask, NULL, &controlTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
-  if (controlTaskHandle == NULL || statusTaskHandle == NULL)
+  imuTaskHandle = osThreadNew(StartImuTask, NULL, &imuTask_attributes);
+  if (controlTaskHandle == NULL || statusTaskHandle == NULL || imuTaskHandle == NULL)
   {
     Error_Handler();
   }
@@ -165,6 +171,10 @@ void StartControlTask(void *argument)
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
-
+static void StartImuTask(void *argument)
+{
+  (void)argument;
+  Task_Imu_Run();
+}
 /* USER CODE END Application */
 
