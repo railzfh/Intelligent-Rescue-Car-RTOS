@@ -1,4 +1,4 @@
-"""Unit tests for MaixCAM protocol (including C++ interop), vision rules, and touch UI."""
+"""Unit tests for MaixCAM protocol (including C++ interop), vision rules, motion estimator, and touch UI."""
 import os
 from pathlib import Path
 import shutil
@@ -15,12 +15,9 @@ from maixcam.protocol import (
     CAMERA_VIEW_FAR,
     CAMERA_VIEW_NEAR,
     CAMERA_VIEW_TRANSITION,
-    Heartbeat,
     MODE_BENCH_STRAIGHT,
     MODE_COMPETITION,
-    MatchConfigCmd,
     RescueProtocolParser,
-    TARGET_BLACK_CORE,
     TARGET_GREEN_MATERIAL,
     TARGET_ORANGE_CASUALTY,
     TEAM_BLUE,
@@ -33,18 +30,17 @@ from maixcam.protocol import (
     VIS_FLAG_HOME_VALID,
     VIS_FLAG_MOTION_STALLED,
     VIS_FLAG_OPPONENT_ZONE_NEAR,
+    VIS_FLAG_REAR_CLEAR,
     VIS_FLAG_SWEEP_CLEAR,
     VIS_FLAG_TARGET_VALID,
     VisionState,
     decode_telemetry,
     decode_vision_state,
-    encode_heartbeat,
-    encode_set_config,
     encode_telemetry,
     encode_vision_state,
 )
 from maixcam.ui import TouchUIController
-from maixcam.vision import Blob, RescueVisionProcessor
+from maixcam.vision import Blob, RescueVisionProcessor, SpatialMotionEstimator
 
 
 class MaixcamProtocolTest(unittest.TestCase):
@@ -126,7 +122,7 @@ int main() {
     tel.team = RESCUE_TEAM_RED;
     tel.start_zone = 4;
     tel.run_mode = RESCUE_MODE_COMPETITION;
-    tel.status_flags = TEL_FLAG_CONFIG_LOCKED | TEL_FLAG_FIRST_GREEN_UNLOCKED;
+    tel.status_flags = TEL_FLAG_CONFIG_LOCKED | TEL_FLAG_FIRST_GREEN_UNLOCKED | TEL_FLAG_CARRYING_CASUALTY;
     tel.fault_flags = 0;
     tel.battery_mv = 23980;
     tel.yaw_cdeg = -9050;
@@ -143,17 +139,11 @@ int main() {
             encoding="utf-8",
         )
         cmd = [
-            "g++",
-            "-std=c++17",
-            "-Wall",
-            "-Wextra",
-            "-Werror",
-            "-I",
-            str(REPO_ROOT / "User_File"),
+            "g++", "-std=c++17", "-Wall", "-Wextra", "-Werror",
+            "-I", str(REPO_ROOT / "User_File"),
             str(probe_cpp),
             str(REPO_ROOT / "User_File/1_Middleware/Protocol/rescue_protocol.cpp"),
-            "-o",
-            str(probe_exe),
+            "-o", str(probe_exe),
         ]
         if os.name == "nt":
             cmd.append("-static")
@@ -192,7 +182,7 @@ int main() {
                 team=TEAM_RED,
                 start_zone=4,
                 run_mode=MODE_COMPETITION,
-                status_flags=TEL_FLAG_CONFIG_LOCKED | (1 << 5),
+                status_flags=TEL_FLAG_CONFIG_LOCKED | (1 << 5) | (1 << 12),
                 fault_flags=0,
                 battery_mv=23980,
                 yaw_cdeg=-9050,
@@ -207,7 +197,6 @@ int main() {
         self.assertEqual(cpp_vis_bytes, py_vis_bytes)
         self.assertEqual(cpp_tel_bytes, py_tel_bytes)
 
-        # Also verify Python parser decodes C++ bytes cleanly.
         parser = RescueProtocolParser()
         decoded_frames = parser.feed(cpp_vis_bytes + cpp_tel_bytes)
         self.assertEqual(len(decoded_frames), 2)
@@ -220,66 +209,100 @@ class MaixcamVisionAndUITest(unittest.TestCase):
         self.cfg = RescueVisionConfig()
         self.proc = RescueVisionProcessor(self.cfg)
 
-    def test_far_view_first_green_and_post_unlock_priority_and_cyan_exclusion(self) -> None:
+    def test_geometry_validation_reaches_capture_distance_and_rejects_unreachable(self) -> None:
+        # Default config must comfortably reach <= 210 mm capture distance.
+        self.assertLess(self.cfg.min_reachable_far_distance_mm(), 210)
+        self.assertLessEqual(self.proc.estimate_far_distance_mm(200), 200)
+
+        bad_cfg = RescueVisionConfig(far_horizon_y=50, far_dist_k=42000.0)
+        with self.assertRaises(ValueError):
+            bad_cfg.validate(target_capture_dist_mm=210, home_drop_dist_mm=230)
+
+    def test_far_view_first_green_priority_and_rear_clear_defaults_false(self) -> None:
         blobs = [
             Blob("cyan", 145, 130, 20, 20, 350),
             Blob("orange", 130, 120, 30, 20, 500),
             Blob("black", 180, 125, 22, 22, 320, density=0.65),
             Blob("green", 80, 110, 22, 22, 420),
         ]
-        # Before first green unlock: must select ONLY green (left of center -> positive bearing).
         st1 = self.proc.process(blobs, camera_near_cmd=False, camera_settled=True, team=TEAM_RED, first_green_unlocked=False)
         self.assertEqual(st1.camera_view, CAMERA_VIEW_FAR)
         self.assertTrue(st1.flags & VIS_FLAG_TARGET_VALID)
         self.assertEqual(st1.target_type, TARGET_GREEN_MATERIAL)
         self.assertGreater(st1.target_err_x_mrad, 0)
+        # Rear clearance must NEVER be fabricated without explicit rear sensor input.
+        self.assertFalse(st1.flags & VIS_FLAG_REAR_CLEAR)
 
-        # After unlock: prefers 15-pt orange casualty over black/green, never selects cyan.
         st2 = self.proc.process(blobs, camera_near_cmd=False, camera_settled=True, team=TEAM_RED, first_green_unlocked=True)
         self.assertEqual(st2.target_type, TARGET_ORANGE_CASUALTY)
 
-        # Unsettled camera pitch reports TRANSITION so STM32 never trusts mid-slew frames.
         st_tr = self.proc.process(blobs, camera_near_cmd=True, camera_settled=False, team=TEAM_RED, first_green_unlocked=True)
         self.assertEqual(st_tr.camera_view, CAMERA_VIEW_TRANSITION)
 
-    def test_near_corral_sweep_and_full_outline_drop_verification(self) -> None:
-        # 1 green inside corral ROI + 1 cyan purely inside right-gate sweep ROI -> sweep_clear MUST be False!
-        blobs_hazard_sweep = [
-            Blob("green", 140, 150, 24, 24, 500),
-            Blob("cyan", 240, 140, 24, 24, 500),
-        ]
-        st = self.proc.process(blobs_hazard_sweep, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False)
-        self.assertEqual(st.corral_green_cnt, 1)
-        self.assertEqual(st.corral_cyan_cnt, 0)
-        self.assertTrue(st.flags & VIS_FLAG_CORRAL_SAFE)
-        self.assertFalse(st.flags & VIS_FLAG_SWEEP_CLEAR)
+    def test_fail_closed_oversized_cyan_and_unknown_in_near_corral(self) -> None:
+        # Adversarial probe: 10,000-pixel close-up cyan blob overlapping corral MUST NOT be discarded!
+        big_cyan = [Blob("cyan", 120, 130, 110, 100, 10000)]
+        st_cyan = self.proc.process(big_cyan, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False)
+        self.assertEqual(st_cyan.corral_cyan_cnt, 1)
+        self.assertFalse(st_cyan.flags & VIS_FLAG_CORRAL_SAFE)
 
-        # Cyan inside corral ROI clears VIS_FLAG_CORRAL_SAFE.
-        blobs_hazard_inside = [
-            Blob("green", 140, 150, 24, 24, 500),
-            Blob("cyan", 170, 150, 24, 24, 500),
-        ]
-        st_bad = self.proc.process(blobs_hazard_inside, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False)
-        self.assertEqual(st_bad.corral_cyan_cnt, 1)
-        self.assertFalse(st_bad.flags & VIS_FLAG_CORRAL_SAFE)
+        # Oversized merged green blob (> max_block_pixels) must fail closed as unknown, NOT be ignored!
+        big_green = [Blob("green", 120, 130, 110, 100, 10500)]
+        st_unk = self.proc.process(big_green, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False)
+        self.assertEqual(st_unk.corral_unknown_cnt, 1)
+        self.assertFalse(st_unk.flags & VIS_FLAG_CORRAL_SAFE)
 
-        # Block straddling purple ramp (y2 > ramp inner y=100) must NOT confirm drop!
-        ramp = Blob("purple_ramp", 40, 100, 240, 30, 3000)
-        straddling = [ramp, Blob("green", 140, 82, 24, 26, 520)]  # y2 = 108 > 100
-        st_straddle = self.proc.process(straddling, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False)
-        self.assertFalse(st_straddle.flags & VIS_FLAG_DROP_CONFIRMED)
+        # Pure sweep-zone hazard clears SWEEP_CLEAR while leaving CORRAL_SAFE intact.
+        sweep_hazard = [Blob("green", 140, 150, 24, 24, 500), Blob("cyan", 240, 140, 24, 24, 500)]
+        st_sw = self.proc.process(sweep_hazard, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False)
+        self.assertTrue(st_sw.flags & VIS_FLAG_CORRAL_SAFE)
+        self.assertFalse(st_sw.flags & VIS_FLAG_SWEEP_CLEAR)
 
-        # Block completely past purple ramp inner edge (y2 = 90 <= 100) confirms drop!
-        inside = [ramp, Blob("green", 140, 64, 24, 26, 520)]
-        st_inside = self.proc.process(inside, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False)
-        self.assertTrue(st_inside.flags & VIS_FLAG_DROP_CONFIRMED)
+    def test_strict_drop_verification_requires_zone_ramp_and_full_correct_half_outline(self) -> None:
+        # Red safe zone x=40..280 (cx=160); material half LEFT => x in [40, 142], casualty half RIGHT => x in [178, 280].
+        home = Blob("red_zone", 40, 20, 240, 100, 15000)
+        ramp = Blob("purple_ramp", 40, 100, 240, 26, 3000)
 
-    def test_home_half_match_opponent_zone_and_visual_stall(self) -> None:
-        # Red safe zone spans x=60..280 (divider at x=170). Center x=160 is within 18px margin -> NOT matched!
-        # Shift zone right so center x=160 is clearly inside LEFT material half (x=80..300 -> divider=190, 190-18=172 >= 160).
+        # 1. No zone / no ramp visible -> MUST NOT confirm drop!
+        no_zone = [Blob("green", 80, 50, 24, 24, 500)]
+        st0 = self.proc.process(no_zone, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False)
+        self.assertFalse(st0.flags & VIS_FLAG_DROP_CONFIRMED)
+
+        # 2. Block straddling the 20 mm center divider (x=135..165 crosses 142) -> MUST NOT confirm!
+        divider_cross = [home, ramp, Blob("green", 135, 50, 30, 24, 600)]
+        st_div = self.proc.process(divider_cross, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False)
+        self.assertFalse(st_div.flags & VIS_FLAG_DROP_CONFIRMED)
+
+        # 3. Block straddling purple ramp (y2 = 108 > ramp.y = 100) -> MUST NOT confirm!
+        straddle = [home, ramp, Blob("green", 80, 82, 24, 26, 520)]
+        st_str = self.proc.process(straddle, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False)
+        self.assertFalse(st_str.flags & VIS_FLAG_DROP_CONFIRMED)
+
+        # 4. Two green blocks before first-green unlock -> MUST NOT confirm!
+        two_green = [home, ramp, Blob("green", 60, 50, 24, 24, 500), Blob("green", 100, 50, 24, 24, 500)]
+        st_two = self.proc.process(two_green, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False)
+        self.assertFalse(st_two.flags & VIS_FLAG_DROP_CONFIRMED)
+
+        # 5. Exactly 1 green block completely inside own MATERIAL half past ramp -> CONFIRMED!
+        valid_first = [home, ramp, Blob("green", 80, 50, 24, 24, 500)]
+        st_ok = self.proc.process(valid_first, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False)
+        self.assertTrue(st_ok.flags & VIS_FLAG_DROP_CONFIRMED)
+
+        # 6. Orange casualty in MATERIAL (left) half rejected; in CASUALTY (right) half confirmed!
+        cas_wrong = [home, ramp, Blob("orange", 80, 50, 36, 24, 700)]
+        st_cw = self.proc.process(cas_wrong, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=True, carrying_casualty=True)
+        self.assertFalse(st_cw.flags & VIS_FLAG_DROP_CONFIRMED)
+
+        cas_right = [home, ramp, Blob("orange", 200, 50, 36, 24, 700)]
+        st_cr = self.proc.process(cas_right, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=True, carrying_casualty=True)
+        self.assertTrue(st_cr.flags & VIS_FLAG_DROP_CONFIRMED)
+
+    def test_home_half_match_checks_full_corral_width_and_opponent_zone(self) -> None:
+        # Home x=100..320 (cx=210, left material half=[100, 192]).
+        # Center=160, corral_align_half_w_px=24 => footprint [136, 184] strictly inside [100, 192]!
         blobs = [
-            Blob("red_zone", 80, 70, 220, 100, 12000),
-            Blob("blue_zone", 10, 120, 60, 50, 2000),  # y2=170 >= opponent_zone_near_y (150)
+            Blob("red_zone", 100, 70, 220, 100, 12000),
+            Blob("blue_zone", 10, 120, 60, 50, 2000),
         ]
         st_mat = self.proc.process(
             blobs,
@@ -288,8 +311,7 @@ class MaixcamVisionAndUITest(unittest.TestCase):
             team=TEAM_RED,
             first_green_unlocked=True,
             carrying_casualty=False,
-            wheels_moving=True,
-            frame_motion_delta=0.4,
+            motion_stalled=True,
         )
         self.assertTrue(st_mat.flags & VIS_FLAG_HOME_VALID)
         self.assertTrue(st_mat.flags & VIS_FLAG_HOME_HALF_MATCH)
@@ -298,15 +320,45 @@ class MaixcamVisionAndUITest(unittest.TestCase):
 
         # Same alignment while carrying CASUALTY (needs RIGHT half) must report half_match = False!
         st_cas = self.proc.process(
-            blobs,
-            camera_near_cmd=False,
-            camera_settled=True,
-            team=TEAM_RED,
-            first_green_unlocked=True,
-            carrying_casualty=True,
+            blobs, camera_near_cmd=False, camera_settled=True, team=TEAM_RED, first_green_unlocked=True, carrying_casualty=True
         )
-        self.assertTrue(st_cas.flags & VIS_FLAG_HOME_VALID)
         self.assertFalse(st_cas.flags & VIS_FLAG_HOME_HALF_MATCH)
+
+    def test_spatial_motion_estimator_rejects_exposure_and_detects_constant_mean_motion(self) -> None:
+        est = SpatialMotionEstimator(width=16, height=12)
+
+        def make_stripe_grid(shift_x: int, brightness_offset: float = 0.0) -> list[float]:
+            # Periodic textured pattern whose global mean is invariant under horizontal shift!
+            grid = []
+            for y in range(12):
+                for x in range(16):
+                    val = 160.0 if ((x + shift_x) % 4) < 2 else 60.0
+                    if (y % 4) < 2:
+                        val += 20.0
+                    grid.append(val + brightness_offset)
+            return grid
+
+        # Case 1: Constant-mean scrolling texture while moving -> MUST NOT report stalled!
+        g0 = make_stripe_grid(0)
+        g1 = make_stripe_grid(1)  # 1 cell shift in 0.1 s = 10 cells/s (> 3.0)
+        self.assertEqual(sum(g0), sum(g1))  # identical global mean brightness!
+        est.update(g0, 1.0, wheels_moving=True)
+        stalled_moving, speed = est.update(g1, 1.1, wheels_moving=True)
+        self.assertFalse(stalled_moving)
+        self.assertGreaterEqual(speed, 9.0)
+
+        # Case 2: Stationary scene with +35 global exposure shift while wheels spin -> MUST detect stall!
+        est.reset()
+        est.update(make_stripe_grid(0, 0.0), 2.0, wheels_moving=True)
+        stalled_exp, _ = est.update(make_stripe_grid(0, 35.0), 2.1, wheels_moving=True)
+        self.assertTrue(stalled_exp)
+
+        # Case 3: Blank textureless scene -> confidence gate returns False (no false stall).
+        est.reset()
+        blank = [120.0] * (16 * 12)
+        est.update(blank, 3.0, wheels_moving=True)
+        stalled_blank, _ = est.update(blank, 3.1, wheels_moving=True)
+        self.assertFalse(stalled_blank)
 
     def test_touch_ui_setup_and_lock(self) -> None:
         ui = TouchUIController(552, 368)
@@ -325,7 +377,6 @@ class MaixcamVisionAndUITest(unittest.TestCase):
         ui.handle_touch(0, 0, False, tel_setup)
         self.assertEqual(ui.config.start_zone, 3)
 
-        # Bench gate button ignored in COMPETITION mode, honored in BENCH mode.
         self.assertIsNone(ui.handle_touch(btn_gate.x + 5, btn_gate.y + 5, True, tel_setup))
         ui.handle_touch(0, 0, False, tel_setup)
         self.assertEqual(ui.handle_touch(btn_mode.x + 5, btn_mode.y + 5, True, tel_setup), "mode_toggle")
@@ -335,7 +386,6 @@ class MaixcamVisionAndUITest(unittest.TestCase):
         ui.handle_touch(0, 0, False, tel_setup)
         self.assertIsNotNone(ui.pop_bench_cmd())
 
-        # Once MC02 reports CONFIG_LOCKED, taps cannot mutate config!
         tel_locked = Telemetry(status_flags=TEL_FLAG_CONFIG_LOCKED)
         self.assertEqual(ui.handle_touch(btn_mode.x + 5, btn_mode.y + 5, True, tel_locked), "locked")
         self.assertEqual(ui.config.run_mode, MODE_BENCH_STRAIGHT)

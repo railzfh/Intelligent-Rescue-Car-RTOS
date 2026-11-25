@@ -27,7 +27,14 @@ from .protocol import (
     encode_vision_state,
 )
 from .ui import TouchUIController, render_touch_overlay
-from .vision import RescueVisionProcessor, extract_blobs_from_maix_image
+from .vision import RescueVisionProcessor, SpatialMotionEstimator, extract_blobs_from_maix_image
+
+
+def _extract_motion_grid(img, width: int, height: int) -> list[int]:
+    from maix import image
+
+    small = img.resize(width, height).to_format(image.Format.FMT_GRAYSCALE)
+    return list(small.to_bytes())
 
 
 def run_maixcam(config_path: Path | None = None) -> None:
@@ -35,6 +42,7 @@ def run_maixcam(config_path: Path | None = None) -> None:
 
     cfg_file = config_path or (Path(__file__).resolve().parent / "config.json")
     cfg = RescueVisionConfig.load(cfg_file)
+    cfg.validate()
 
     pinmap.set_pin_function(cfg.uart_tx_pin, "UART1_TX")
     pinmap.set_pin_function(cfg.uart_rx_pin, "UART1_RX")
@@ -46,6 +54,13 @@ def run_maixcam(config_path: Path | None = None) -> None:
 
     ui = TouchUIController(width=disp.width(), height=disp.height())
     processor = RescueVisionProcessor(cfg)
+    motion_estimator = SpatialMotionEstimator(
+        width=cfg.motion_grid_w,
+        height=cfg.motion_grid_h,
+        min_texture_std=cfg.motion_min_texture_std,
+        static_sad_max=cfg.motion_static_sad_max,
+        min_cells_per_s=cfg.motion_min_cells_per_s,
+    )
     parser = RescueProtocolParser()
     telemetry = Telemetry()
 
@@ -54,7 +69,7 @@ def run_maixcam(config_path: Path | None = None) -> None:
     last_hb_s = 0.0
     last_cfg_s = 0.0
     last_vis_s = 0.0
-    prev_luma = None
+    prev_camera_near = False
 
     while not app.need_exit():
         now_s = time.monotonic()
@@ -68,21 +83,21 @@ def run_maixcam(config_path: Path | None = None) -> None:
                 if tel is not None:
                     telemetry = tel
 
-        # 2. Capture frame and run LAB blob pipeline.
-        img = cam.read()
-        blobs = extract_blobs_from_maix_image(img, cfg)
-
-        # Coarse mean-intensity delta as lightweight visual slip indicator.
-        stats = img.get_statistics()
-        cur_luma = float(stats.l_mean())
-        motion_delta = 10.0 if prev_luma is None else abs(cur_luma - prev_luma)
-        prev_luma = cur_luma
-
         camera_near = bool(telemetry.status_flags & TEL_FLAG_CAMERA_NEAR)
         camera_settled = bool(telemetry.status_flags & TEL_FLAG_CAMERA_SETTLED)
         first_green_unlocked = bool(telemetry.status_flags & TEL_FLAG_FIRST_GREEN_UNLOCKED)
-        wheels_moving = abs(telemetry.vx_mm_s) > 35 or abs(telemetry.omega_mrad_s) > 250
         carrying_casualty = bool(telemetry.status_flags & TEL_FLAG_CARRYING_CASUALTY)
+        wheels_moving = abs(telemetry.vx_mm_s) > 35 or abs(telemetry.omega_mrad_s) > 250
+
+        if camera_near != prev_camera_near or not camera_settled:
+            motion_estimator.reset()
+            prev_camera_near = camera_near
+
+        # 2. Capture frame, run LAB blob pipeline (with near unknown-foreground scan) & spatial motion estimator.
+        img = cam.read()
+        blobs = extract_blobs_from_maix_image(img, cfg, scan_unknown_near=(camera_near and camera_settled))
+        grid = _extract_motion_grid(img, cfg.motion_grid_w, cfg.motion_grid_h)
+        motion_stalled, _ = motion_estimator.update(grid, now_s, wheels_moving=wheels_moving)
 
         vision_state = processor.process(
             blobs=blobs,
@@ -91,8 +106,9 @@ def run_maixcam(config_path: Path | None = None) -> None:
             team=telemetry.team if telemetry.team else ui.config.team,
             first_green_unlocked=first_green_unlocked,
             carrying_casualty=carrying_casualty,
-            wheels_moving=wheels_moving,
-            frame_motion_delta=motion_delta,
+            max_materials_per_trip=telemetry.max_materials_per_trip or ui.config.max_materials_per_trip,
+            motion_stalled=motion_stalled,
+            rear_clear=False,
         )
 
         # 3. Poll touchscreen (locked automatically once MC02 confirms launch).
