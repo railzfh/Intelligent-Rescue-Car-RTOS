@@ -323,6 +323,145 @@ static void Test_Bounded_Recovery_Budget_And_Progress_Watchdog()
     assert(t < 2000U);
 }
 
+static void Test_Cumulative_Yaw_Invalidates_Corridor_And_Active_Reverse_Stops()
+{
+    Class_Rescue_Mission mission;
+    assert(mission.On_Set_Config({RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION, 1U}));
+    uint32_t t = 100U;
+    uint16_t seq = 1U;
+    assert(mission.On_Vision_State(Make_Far_Vision(seq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), t));
+
+    Struct_Mission_Inputs in{};
+    in.now_ms = t;
+    in.hardware_ready = true;
+    in.can_launch = true;
+    in.button_pressed = true;
+    in.gate_settled = true;
+    in.camera_settled = true;
+    mission.Update(in);
+    assert(mission.Get_State() == MISSION_LAUNCH_CROSS_BUMPS);
+
+    // Build 0.12 m straight forward corridor.
+    in.button_pressed = false;
+    in.chassis_active = true;
+    in.forward_delta_m = 0.12f;
+    in.yaw_delta_rad = 0.0f;
+    in.now_ms = (t += 20U);
+    assert(mission.On_Vision_State(Make_Far_Vision(seq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), t));
+    mission.Update(in);
+    assert(mission.Get_Proven_Rear_Clear_M() >= 0.11f);
+
+    // Slow gradual turn of 0.005 rad/tick over 140 ticks (cumulative 0.70 rad, never >= 0.03 in one tick!)
+    // MUST invalidate the old straight corridor!
+    in.forward_delta_m = 0.0f;
+    for (int i = 0; i < 140; ++i)
+    {
+        in.now_ms = (t += 1U);
+        if ((i % 20) == 0)
+        {
+            assert(mission.On_Vision_State(Make_Far_Vision(seq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), t));
+        }
+        in.yaw_delta_rad = 0.005f;
+        mission.Update(in);
+    }
+    assert(mission.Get_Proven_Rear_Clear_M() == 0.0f);
+
+    // Build fresh 0.10 m corridor, start stall escape reversal, then exhaust corridor mid-reverse -> MUST stop reversing!
+    in.yaw_delta_rad = 0.0f;
+    in.forward_delta_m = 0.10f;
+    in.now_ms = (t += 20U);
+    assert(mission.On_Vision_State(Make_Far_Vision(seq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), t));
+    mission.Update(in);
+    assert(mission.Get_Proven_Rear_Clear_M() >= 0.09f);
+
+    in.forward_delta_m = 0.0f;
+    in.chassis_stalled = true;
+    in.now_ms = (t += 20U);
+    auto out = mission.Update(in);
+    // Note: stall resets Proven_Rear_Clear_M so escape turns in place without blind reverse!
+    assert(mission.Get_State() == MISSION_ESCAPE_RECOVERY);
+    assert(out.drive_action == DRIVE_ACTION_START_TURN);
+}
+
+static void Test_Same_Cargo_Reverify_After_Escape_Cannot_Bypass_Recovery_Budget()
+{
+    Class_Rescue_Mission mission;
+    assert(mission.On_Set_Config({RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION, 1U}));
+    const uint16_t safe = VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR;
+    uint32_t t = 1000U;
+    uint16_t seq = 1U;
+    assert(mission.On_Vision_State(Make_Far_Vision(seq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), t));
+
+    Struct_Mission_Inputs in{};
+    in.now_ms = t;
+    in.hardware_ready = true;
+    in.can_launch = true;
+    in.button_pressed = true;
+    in.gate_settled = true;
+    in.camera_settled = true;
+    mission.Update(in);
+
+    in.button_pressed = false;
+    in.chassis_motion_done = true;
+    in.now_ms = (t += 50U);
+    assert(mission.On_Vision_State(Make_Far_Vision(seq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 0, 190U), t));
+    mission.Update(in);
+    in.chassis_motion_done = false;
+    in.now_ms = (t += 50U);
+    assert(mission.On_Vision_State(Make_Far_Vision(seq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 0, 190U), t));
+    mission.Update(in);
+    in.now_ms = (t += 50U);
+    assert(mission.On_Vision_State(Make_Far_Vision(seq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 0, 190U), t));
+    mission.Update(in);
+    for (int k = 0; k < 3; ++k)
+    {
+        in.now_ms = (t += 50U);
+        assert(mission.On_Vision_State(Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U, safe), t));
+        mission.Update(in);
+    }
+    for (int k = 0; k < 3; ++k)
+    {
+        in.now_ms = (t += 50U);
+        assert(mission.On_Vision_State(Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U, safe), t));
+        mission.Update(in);
+    }
+    assert(mission.Get_State() == MISSION_FIND_HOME);
+    assert(mission.Get_Consecutive_Escapes() == 0U);
+
+    // Repeatedly escape while holding the SAME cargo, finish turn, re-confirm same cargo -> MUST hit fault <= 4 escapes!
+    for (int cycle = 0; cycle < 5 && mission.Get_State() != MISSION_FAULT_STOP; ++cycle)
+    {
+        // Trigger escape in FIND_HOME via opponent alert.
+        in.now_ms = (t += 50U);
+        assert(mission.On_Vision_State(Make_Far_Vision(seq++, TARGET_NONE, VIS_FLAG_OPPONENT_NEAR), t));
+        mission.Update(in);
+        if (mission.Get_State() == MISSION_FAULT_STOP)
+        {
+            break;
+        }
+        assert(mission.Get_State() == MISSION_ESCAPE_RECOVERY);
+
+        // Complete escape turn -> returns to CLOSE_GATE_VERIFY.
+        in.chassis_motion_done = true;
+        in.now_ms = (t += 50U);
+        assert(mission.On_Vision_State(Make_Far_Vision(seq++, TARGET_NONE, 0U), t));
+        mission.Update(in);
+        in.chassis_motion_done = false;
+        assert(mission.Get_State() == MISSION_CLOSE_GATE_VERIFY);
+
+        // Re-confirm the SAME cargo -> MUST NOT reset Consecutive_Escapes!
+        for (int k = 0; k < 3; ++k)
+        {
+            in.now_ms = (t += 50U);
+            assert(mission.On_Vision_State(Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U, safe), t));
+            mission.Update(in);
+        }
+        assert(mission.Get_State() == MISSION_FIND_HOME);
+        assert(mission.Get_Consecutive_Escapes() == static_cast<uint8_t>(cycle + 1));
+    }
+    assert(mission.Get_State() == MISSION_FAULT_STOP);
+}
+
 int main()
 {
     Test_Freshness_Nonconsecutive_Replay_Wrap_And_Restart();
@@ -330,5 +469,7 @@ int main()
     Test_Cyan_Interrupts_Unsettled_Gate_Closure();
     Test_Full_First_Green_Delivery_And_Proven_Rear_Corridor();
     Test_Bounded_Recovery_Budget_And_Progress_Watchdog();
+    Test_Cumulative_Yaw_Invalidates_Corridor_And_Active_Reverse_Stops();
+    Test_Same_Cargo_Reverify_After_Escape_Cannot_Bypass_Recovery_Budget();
     std::puts("PASS: rescue mission replay/wrap, stale/opponent interlock, gate cyan abort, proven reverse, bounded recovery");
 }

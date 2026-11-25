@@ -199,9 +199,11 @@ private:
 
     // Swept forward corridor proven clear behind the robot (never fabricated).
     float Proven_Rear_Clear_M = 0.0f;
+    float Proven_Rear_Yaw_Accum_Rad = 0.0f;
     uint32_t Last_Forward_Clear_Ms = 0U;
 
     // Cargo locked upon gate closure for safe-zone half matching and score counting.
+    bool Cargo_Already_Confirmed = false;
     bool Cargo_Is_Casualty = false;
     uint8_t Cargo_Green = 0U;
     uint8_t Cargo_Black = 0U;

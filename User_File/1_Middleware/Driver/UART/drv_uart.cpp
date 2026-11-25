@@ -37,8 +37,8 @@ Struct_UART_Manage_Object UART10_Manage_Object = {nullptr};
 
 static void UART_Start_Rx_DMA(UART_HandleTypeDef *huart, uint8_t *buffer)
 {
-    HAL_UARTEx_ReceiveToIdle_DMA(huart, buffer, UART_BUFFER_SIZE);
-    if (huart->hdmarx != nullptr)
+    if (HAL_UARTEx_ReceiveToIdle_DMA(huart, buffer, UART_BUFFER_SIZE) == HAL_OK &&
+        huart->hdmarx != nullptr)
     {
         // Normal-mode double-buffered IDLE/TC reception must not swap buffers on HT.
         __HAL_DMA_DISABLE_IT(huart->hdmarx, DMA_IT_HT);
@@ -491,7 +491,11 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
  */
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
-    UART_Reinit(huart);
+    // Only re-arm RX when HAL has stopped RX; do not clobber active RX buffer on TX-only errors.
+    if (huart->RxState == HAL_UART_STATE_READY)
+    {
+        UART_Reinit(huart);
+    }
 }
 
 /************************ COPYRIGHT(C) USTC-ROBOWALKER **************************/

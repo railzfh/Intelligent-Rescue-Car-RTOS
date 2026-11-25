@@ -40,7 +40,7 @@ from maixcam.protocol import (
     encode_vision_state,
 )
 from maixcam.ui import TouchUIController
-from maixcam.vision import Blob, RescueVisionProcessor, SpatialMotionEstimator
+from maixcam.vision import Blob, RescueVisionProcessor, SpatialMotionEstimator, classify_unknown_foreground
 
 
 class MaixcamProtocolTest(unittest.TestCase):
@@ -283,12 +283,17 @@ class MaixcamVisionAndUITest(unittest.TestCase):
         st_two = self.proc.process(two_green, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False)
         self.assertFalse(st_two.flags & VIS_FLAG_DROP_CONFIRMED)
 
-        # 5. Exactly 1 green block completely inside own MATERIAL half past ramp -> CONFIRMED!
+        # 5. Old green already in safe zone while current green is STILL inside corral -> MUST NOT confirm!
+        still_in_corral = [home, ramp, Blob("green", 80, 50, 24, 24, 500), Blob("green", 140, 150, 24, 24, 500)]
+        st_still = self.proc.process(still_in_corral, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False)
+        self.assertFalse(st_still.flags & VIS_FLAG_DROP_CONFIRMED)
+
+        # 6. Exactly 1 green block completely inside own MATERIAL half past ramp & corral empty -> CONFIRMED!
         valid_first = [home, ramp, Blob("green", 80, 50, 24, 24, 500)]
         st_ok = self.proc.process(valid_first, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False)
         self.assertTrue(st_ok.flags & VIS_FLAG_DROP_CONFIRMED)
 
-        # 6. Orange casualty in MATERIAL (left) half rejected; in CASUALTY (right) half confirmed!
+        # 7. Orange casualty in MATERIAL (left) half rejected; in CASUALTY (right) half confirmed!
         cas_wrong = [home, ramp, Blob("orange", 80, 50, 36, 24, 700)]
         st_cw = self.proc.process(cas_wrong, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=True, carrying_casualty=True)
         self.assertFalse(st_cw.flags & VIS_FLAG_DROP_CONFIRMED)
@@ -296,6 +301,20 @@ class MaixcamVisionAndUITest(unittest.TestCase):
         cas_right = [home, ramp, Blob("orange", 200, 50, 36, 24, 700)]
         st_cr = self.proc.process(cas_right, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=True, carrying_casualty=True)
         self.assertTrue(st_cr.flags & VIS_FLAG_DROP_CONFIRMED)
+
+    def test_unknown_foreground_not_masked_by_edge_contact_or_zone(self) -> None:
+        # Unknown object barely overlapping a green block (~12% area) and fully inside red_zone MUST be flagged unknown!
+        known = [
+            Blob("green", 100, 140, 24, 24, 500),
+            Blob("red_zone", 80, 120, 160, 100, 12000),
+        ]
+        fg = [
+            Blob("unknown", 100, 140, 24, 24, 500),  # 100% covered by green -> NOT unknown
+            Blob("unknown", 121, 140, 24, 24, 500),  # only 3x24 overlap (12.5%) -> MUST stay unknown!
+        ]
+        unknowns = classify_unknown_foreground(fg, known, min_pixels=60)
+        self.assertEqual(len(unknowns), 1)
+        self.assertEqual(unknowns[0].x, 121)
 
     def test_home_half_match_checks_full_corral_width_and_opponent_zone(self) -> None:
         # Home x=100..320 (cx=210, left material half=[100, 192]).
@@ -353,7 +372,15 @@ class MaixcamVisionAndUITest(unittest.TestCase):
         stalled_exp, _ = est.update(make_stripe_grid(0, 35.0), 2.1, wheels_moving=True)
         self.assertTrue(stalled_exp)
 
-        # Case 3: Blank textureless scene -> confidence gate returns False (no false stall).
+        # Case 3: Stationary periodic checkerboard MUST report 0.0 cells/s and stalled=True (never 42.43 cells/s alias!).
+        est.reset()
+        checker = [180.0 if ((x + y) % 2 == 0) else 40.0 for y in range(12) for x in range(16)]
+        est.update(checker, 2.5, wheels_moving=True)
+        stalled_chk, speed_chk = est.update(checker, 2.6, wheels_moving=True)
+        self.assertTrue(stalled_chk)
+        self.assertEqual(speed_chk, 0.0)
+
+        # Case 4: Blank textureless scene -> confidence gate returns False (no false stall).
         est.reset()
         blank = [120.0] * (16 * 12)
         est.update(blank, 3.0, wheels_moving=True)

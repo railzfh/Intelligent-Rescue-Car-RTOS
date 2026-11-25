@@ -67,6 +67,41 @@ def _rects_intersect(ax: int, ay: int, aw: int, ah: int, bx: int, by: int, bw: i
     return ax < bx + bw and ax + aw > bx and ay < by + bh and ay + ah > by
 
 
+def _rect_intersection_area(ax: int, ay: int, aw: int, ah: int, bx: int, by: int, bw: int, bh: int) -> int:
+    ix1 = max(ax, bx)
+    iy1 = max(ay, by)
+    ix2 = min(ax + aw, bx + bw)
+    iy2 = min(ay + ah, by + bh)
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0
+    return (ix2 - ix1) * (iy2 - iy1)
+
+
+def classify_unknown_foreground(
+    fg_blobs: Iterable[Blob],
+    known_blobs: Iterable[Blob],
+    min_pixels: int,
+    coverage_threshold: float = 0.70,
+) -> List[Blob]:
+    """Flag foreground blobs not substantially covered by known block/hazard classes.
+
+    Zones/ramps/opponents never mask unknown objects inside the corral or sweep zone,
+    and minor bounding-box edge contact (< coverage_threshold) still fails closed.
+    """
+    known_blocks = [b for b in known_blobs if b.label in ("green", "black", "orange", "cyan")]
+    unknowns: List[Blob] = []
+    for fg in fg_blobs:
+        if fg.pixels < min_pixels:
+            continue
+        fg_area = max(1, fg.w * fg.h)
+        covered_area = 0
+        for kb in known_blocks:
+            covered_area += _rect_intersection_area(fg.x, fg.y, fg.w, fg.h, kb.x, kb.y, kb.w, kb.h)
+        if (covered_area / float(fg_area)) < coverage_threshold:
+            unknowns.append(Blob("unknown", fg.x, fg.y, fg.w, fg.h, fg.pixels, fg.density))
+    return unknowns
+
+
 def _blob_in_roi(blob: Blob, roi: List[int]) -> bool:
     return _rects_intersect(blob.x, blob.y, blob.w, blob.h, roi[0], roi[1], roi[2], roi[3])
 
@@ -142,6 +177,7 @@ class SpatialMotionEstimator:
         best_dx = 0
         best_dy = 0
         best_sad = float("inf")
+        best_dist_sq = 0
         sad_zero = float("inf")
 
         for dy in range(-r, r + 1):
@@ -155,12 +191,21 @@ class SpatialMotionEstimator:
                         total += abs(cur_norm[row_cur + x + dx] - prev_norm[row_prev + x])
                         count += 1
                 sad = total / float(max(1, count))
+                dist_sq = dx * dx + dy * dy
                 if dx == 0 and dy == 0:
                     sad_zero = sad
-                if sad < best_sad:
+                # Break periodic/alias SAD ties in favor of minimal spatial displacement.
+                if (sad < best_sad - 1e-6) or (abs(sad - best_sad) <= 1e-6 and dist_sq < best_dist_sq):
                     best_sad = sad
                     best_dx = dx
                     best_dy = dy
+                    best_dist_sq = dist_sq
+
+        # If zero shift explains the scene within static tolerance and matches the best periodic shift,
+        # do not misreport a stationary periodic texture (e.g. checkerboard) as rapid motion.
+        if sad_zero <= self.static_sad_max and sad_zero <= best_sad + 0.5:
+            best_dx = 0
+            best_dy = 0
 
         disp_cells = math.hypot(best_dx, best_dy)
         speed_cells_per_s = disp_cells / dt_s
@@ -295,13 +340,16 @@ class RescueVisionProcessor:
         blocks: List[Blob],
         hazards: List[Blob],
         unknowns: List[Blob],
+        corral_empty: bool,
         team: int,
         first_green_unlocked: bool,
         carrying_casualty: bool,
         max_materials_per_trip: int,
     ) -> bool:
-        # Must observe BOTH own team safe zone and its associated purple ramp (never fallback line).
-        if home is None or assoc_ramp is None:
+        # Must observe BOTH own team safe zone and its associated purple ramp (never fallback line),
+        # AND the corral itself must be empty (an old block already in the safe zone cannot confirm
+        # a drop while the current block is still sitting inside our corral!).
+        if not corral_empty or home is None or assoc_ramp is None:
             return False
 
         half_x1, half_x2, _ = self._target_half_bounds(home, team, carrying_casualty)
@@ -455,12 +503,16 @@ class RescueVisionProcessor:
             if not sweep_occupied:
                 flags |= VIS_FLAG_SWEEP_CLEAR
 
+            corral_empty = (
+                green_cnt == 0 and black_cnt == 0 and orange_cnt == 0 and cyan_cnt == 0 and unknown_cnt == 0
+            )
             if self._verify_drop_inside_correct_half(
                 home=home,
                 assoc_ramp=assoc_ramp,
                 blocks=blocks,
                 hazards=hazards,
                 unknowns=unknowns,
+                corral_empty=corral_empty,
                 team=team,
                 first_green_unlocked=first_green_unlocked,
                 carrying_casualty=carrying_casualty,
@@ -502,9 +554,10 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                 )
             )
 
-    # In NEAR view, detect non-floor foreground inside corral/sweep ROIs that matched no known class.
+    # In NEAR view, detect non-floor foreground inside corral/sweep ROIs not covered by known blocks.
     if scan_unknown_near:
         known = list(blobs)
+        raw_fg: List[Blob] = []
         for roi in (cfg.near_corral_roi, cfg.near_sweep_roi):
             fg_blobs = img.find_blobs(
                 [tuple(cfg.arena_floor_lab)],
@@ -516,9 +569,8 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
             )
             for item in fg_blobs:
                 fx, fy, fw, fh = int(item.x()), int(item.y()), max(1, int(item.w())), max(1, int(item.h()))
-                covered = any(_rects_intersect(fx, fy, fw, fh, kb.x, kb.y, kb.w, kb.h) for kb in known)
-                if not covered:
-                    px = int(item.pixels())
-                    blobs.append(Blob("unknown", fx, fy, fw, fh, px, px / float(fw * fh)))
+                px = int(item.pixels())
+                raw_fg.append(Blob("unknown", fx, fy, fw, fh, px, px / float(fw * fh)))
+        blobs.extend(classify_unknown_foreground(raw_fg, known, cfg.min_hazard_pixels))
 
     return blobs

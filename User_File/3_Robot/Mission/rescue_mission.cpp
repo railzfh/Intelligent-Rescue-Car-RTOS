@@ -5,6 +5,7 @@
 
 static constexpr float Millirad_To_Rad = 0.001f;
 static constexpr uint32_t Proven_Corridor_Expiry_Ms = 3000U;
+static constexpr float Proven_Corridor_Max_Yaw_Rad = 0.10f; // ~5.7 deg cumulative turn invalidates straight corridor
 
 void Class_Rescue_Mission::On_Heartbeat(const Struct_Vision_Heartbeat &hb, uint32_t now_ms)
 {
@@ -93,6 +94,7 @@ void Class_Rescue_Mission::Fault_Stop(uint32_t now_ms)
         State >= MISSION_LAUNCH_CROSS_BUMPS && State <= MISSION_ESCAPE_RECOVERY;
     Clear_Cargo();
     Proven_Rear_Clear_M = 0.0f;
+    Proven_Rear_Yaw_Accum_Rad = 0.0f;
     Gate_Closed_Cmd = false;
     Camera_Near_Cmd = false;
     if (is_competition_active)
@@ -204,6 +206,7 @@ void Class_Rescue_Mission::Enter_State(Enum_Mission_State next, uint32_t now_ms)
 
 void Class_Rescue_Mission::Clear_Cargo()
 {
+    Cargo_Already_Confirmed = false;
     Cargo_Is_Casualty = false;
     Cargo_Green = 0U;
     Cargo_Black = 0U;
@@ -328,22 +331,46 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         const float fwd_d = std::isfinite(in.forward_delta_m) ? in.forward_delta_m : 0.0f;
         const float yaw_d = std::isfinite(in.yaw_delta_rad) ? in.yaw_delta_rad : 0.0f;
 
-        if (!vision_fresh || opponent_alert || in.chassis_stalled || std::fabs(yaw_d) >= 0.03f)
+        if (!vision_fresh || opponent_alert || in.chassis_stalled)
         {
             Proven_Rear_Clear_M = 0.0f;
+            Proven_Rear_Yaw_Accum_Rad = 0.0f;
         }
-        else if (fwd_d > 0.0f)
+        else
         {
-            Proven_Rear_Clear_M = std::min(Config.max_proven_reverse_m, Proven_Rear_Clear_M + fwd_d);
-            Last_Forward_Clear_Ms = in.now_ms;
-        }
-        else if (fwd_d < 0.0f)
-        {
-            Proven_Rear_Clear_M = std::max(0.0f, Proven_Rear_Clear_M + fwd_d);
-        }
-        else if ((uint32_t)(in.now_ms - Last_Forward_Clear_Ms) >= Proven_Corridor_Expiry_Ms)
-        {
-            Proven_Rear_Clear_M = 0.0f;
+            if (Proven_Rear_Clear_M > 0.0f || fwd_d > 0.0f)
+            {
+                Proven_Rear_Yaw_Accum_Rad += std::fabs(yaw_d);
+            }
+            if (Proven_Rear_Yaw_Accum_Rad >= Proven_Corridor_Max_Yaw_Rad)
+            {
+                // Any cumulative heading change >= ~5.7 deg invalidates the previous straight corridor.
+                Proven_Rear_Clear_M = 0.0f;
+                Proven_Rear_Yaw_Accum_Rad = 0.0f;
+            }
+            else if (fwd_d > 0.0f)
+            {
+                if (Proven_Rear_Clear_M == 0.0f)
+                {
+                    Proven_Rear_Yaw_Accum_Rad = std::fabs(yaw_d);
+                }
+                Proven_Rear_Clear_M = std::min(Config.max_proven_reverse_m, Proven_Rear_Clear_M + fwd_d);
+                Last_Forward_Clear_Ms = in.now_ms;
+            }
+            else if (fwd_d < 0.0f)
+            {
+                Proven_Rear_Clear_M = std::max(0.0f, Proven_Rear_Clear_M + fwd_d);
+                if (Proven_Rear_Clear_M == 0.0f)
+                {
+                    Proven_Rear_Yaw_Accum_Rad = 0.0f;
+                }
+            }
+            else if (Proven_Rear_Clear_M > 0.0f &&
+                     (uint32_t)(in.now_ms - Last_Forward_Clear_Ms) >= Proven_Corridor_Expiry_Ms)
+            {
+                Proven_Rear_Clear_M = 0.0f;
+                Proven_Rear_Yaw_Accum_Rad = 0.0f;
+            }
         }
 
         // Physical displacement/yaw progress feeds the < 15 s watchdog (only with fresh vision & no stall).
@@ -490,6 +517,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                 Vision_Outage_Active = false;
                 Interrupted_By_Stale_Vision = false;
                 Proven_Rear_Clear_M = 0.0f;
+                Proven_Rear_Yaw_Accum_Rad = 0.0f;
                 Last_Forward_Clear_Ms = in.now_ms;
                 Record_Progress(in.now_ms, true);
                 Gate_Closed_Cmd = false;
@@ -675,9 +703,10 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         }
         else if (Sub_Phase == 1U)
         {
-            if (opponent_alert || in.chassis_stalled || in.chassis_motion_aborted)
+            const bool reverse_clearance_lost = !rear_sensor_clear && Proven_Rear_Clear_M <= 0.001f;
+            if (opponent_alert || in.chassis_stalled || in.chassis_motion_aborted || reverse_clearance_lost)
             {
-                // Abort reversal immediately on opponent/stall and switch to bounded turn.
+                // Abort reversal immediately on opponent/stall/lost clearance and switch to bounded turn.
                 Sub_Phase = 2U;
                 out.drive_action = DRIVE_ACTION_START_TURN;
                 out.delta_yaw_rad = Escape_Sign * Config.separate_turn_rad;
@@ -765,7 +794,13 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                     Cargo_Green = Latest_Vision.corral_green_cnt;
                     Cargo_Black = Latest_Vision.corral_black_cnt;
                     Cargo_Orange = Latest_Vision.corral_orange_cnt;
-                    Record_Progress(in.now_ms, true);
+                    // Only count initial pickup as new progress; re-verifying the same cargo after
+                    // an escape must NEVER reset the escape budget or progress watchdog!
+                    if (!Cargo_Already_Confirmed)
+                    {
+                        Cargo_Already_Confirmed = true;
+                        Record_Progress(in.now_ms, true);
+                    }
                     Camera_Near_Cmd = false;
                     Enter_State(MISSION_FIND_HOME, in.now_ms);
                 }
@@ -949,8 +984,9 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         Camera_Near_Cmd = true;
         if (Sub_Phase == 0U)
         {
+            const bool reverse_clearance_lost = !rear_sensor_clear && Proven_Rear_Clear_M <= 0.001f;
             if (opponent_alert || in.chassis_stalled || in.chassis_motion_aborted || in.chassis_motion_done ||
-                !in.chassis_active)
+                reverse_clearance_lost || !in.chassis_active)
             {
                 Sub_Phase = 1U;
                 State_Enter_Ms = in.now_ms;
@@ -1010,8 +1046,9 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
     case MISSION_ESCAPE_RECOVERY:
         if (Sub_Phase == 0U)
         {
+            const bool reverse_clearance_lost = !rear_sensor_clear && Proven_Rear_Clear_M <= 0.001f;
             if (opponent_alert || in.chassis_stalled || in.chassis_motion_aborted || in.chassis_motion_done ||
-                !in.chassis_active)
+                reverse_clearance_lost || !in.chassis_active)
             {
                 Sub_Phase = 1U;
                 out.drive_action = DRIVE_ACTION_START_TURN;

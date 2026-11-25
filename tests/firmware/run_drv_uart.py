@@ -35,6 +35,9 @@ extern Mock_Timestamp SYS_Timestamp;
 #define USART10 ((void *)10)
 
 #define DMA_IT_HT (1U << 2)
+#define HAL_OK 0U
+#define HAL_UART_STATE_READY   0x20U
+#define HAL_UART_STATE_BUSY_RX 0x22U
 #define HAL_UART_RXEVENT_TC   0U
 #define HAL_UART_RXEVENT_HT   1U
 #define HAL_UART_RXEVENT_IDLE 2U
@@ -47,6 +50,7 @@ struct UART_HandleTypeDef {
     void *Instance = nullptr;
     DMA_HandleTypeDef *hdmarx = nullptr;
     uint32_t RxEventType = HAL_UART_RXEVENT_TC;
+    uint32_t RxState = HAL_UART_STATE_READY;
     bool dma_busy = false;
     uint8_t *armed_buf = nullptr;
     uint16_t armed_len = 0U;
@@ -62,6 +66,7 @@ struct UART_HandleTypeDef {
 uint8_t HAL_UARTEx_ReceiveToIdle_DMA(UART_HandleTypeDef *huart, uint8_t *pData, uint16_t Size);
 uint8_t HAL_UART_Transmit_DMA(UART_HandleTypeDef *huart, uint8_t *pData, uint16_t Size);
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size);
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart);
 #endif
 ''',
     encoding="ascii",
@@ -84,6 +89,7 @@ uint8_t HAL_UARTEx_ReceiveToIdle_DMA(UART_HandleTypeDef *huart, uint8_t *pData, 
         return 2U; // HAL_BUSY
     }
     huart->dma_busy = true;
+    huart->RxState = HAL_UART_STATE_BUSY_RX;
     huart->armed_buf = pData;
     huart->armed_len = Size;
     ++huart->arm_calls;
@@ -137,6 +143,7 @@ int main() {
     // Next burst completes via TC on Rx_Buffer_1.
     std::memset(UART1_Manage_Object.Rx_Buffer_1, 0xA5, UART_BUFFER_SIZE);
     huart1.dma_busy = false;
+    huart1.RxState = HAL_UART_STATE_READY;
     huart1.RxEventType = HAL_UART_RXEVENT_TC;
     HAL_UARTEx_RxEventCallback(&huart1, UART_BUFFER_SIZE);
     assert(cb_count == 2);
@@ -146,7 +153,26 @@ int main() {
     assert(huart1.armed_buf == UART1_Manage_Object.Rx_Buffer_0);
     assert(hdma.ht_disable_calls == 3U);
 
-    std::puts("PASS: drv_uart disables DMA HT, ignores HT events, preserves double-buffer ownership");
+    // TX-only error while RX DMA is still BUSY_RX must NOT clobber active RX buffer!
+    // Swap to Rx_Buffer_1 active first.
+    huart1.dma_busy = false;
+    huart1.RxState = HAL_UART_STATE_READY;
+    huart1.RxEventType = HAL_UART_RXEVENT_IDLE;
+    HAL_UARTEx_RxEventCallback(&huart1, 10U);
+    assert(UART1_Manage_Object.Rx_Buffer_Active == UART1_Manage_Object.Rx_Buffer_1);
+    HAL_UART_ErrorCallback(&huart1); // RxState is BUSY_RX -> must ignore!
+    assert(UART1_Manage_Object.Rx_Buffer_Active == UART1_Manage_Object.Rx_Buffer_1);
+    assert(huart1.busy_rejects == 0U);
+
+    // Real RX DMA error aborts RX (RxState == READY) -> HAL_UART_ErrorCallback re-arms cleanly and disables HT.
+    huart1.dma_busy = false;
+    huart1.RxState = HAL_UART_STATE_READY;
+    HAL_UART_ErrorCallback(&huart1);
+    assert(UART1_Manage_Object.Rx_Buffer_Active == UART1_Manage_Object.Rx_Buffer_0);
+    assert(huart1.dma_busy && huart1.RxState == HAL_UART_STATE_BUSY_RX);
+    assert(hdma.ht_disable_calls == 5U);
+
+    std::puts("PASS: drv_uart HT guard, double-buffer ownership, TX-error preservation, RX-error recovery");
     return 0;
 }
 ''',
