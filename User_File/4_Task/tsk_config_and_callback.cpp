@@ -112,6 +112,11 @@ static constexpr uint16_t Vision_Rx_Ring_Size = 256U;
 static uint8_t Vision_Rx_Ring[Vision_Rx_Ring_Size] = {};
 static volatile uint16_t Vision_Rx_Head = 0U;
 static volatile uint16_t Vision_Rx_Tail = 0U;
+static volatile uint32_t Vision_Rx_Overflow_Count = 0U;
+
+static bool Drive_Prev_Odom_Valid = false;
+static std::array<float, 2> Drive_Prev_Angle = {};
+static float Drive_Prev_Heading_Rad = 0.0f;
 
 static volatile bool Attitude_Valid = false;
 static volatile bool Imu_Quiet = false;
@@ -186,12 +191,14 @@ static void Vision_Uart_RxCallback(uint8_t *buffer, uint16_t length)
         const uint16_t next = static_cast<uint16_t>((head + 1U) % Vision_Rx_Ring_Size);
         if (next == tail)
         {
-            // 缓冲区满时丢弃剩余字节，由协议层重同步和超时保护兜底。
+            // 缓冲区满时丢弃剩余字节并累计溢出计数，由协议层重同步和超时保护兜底。
+            Vision_Rx_Overflow_Count = Vision_Rx_Overflow_Count + static_cast<uint32_t>(length - i);
             break;
         }
         Vision_Rx_Ring[head] = buffer[i];
         head = next;
     }
+    __DMB();
     Vision_Rx_Head = head;
 }
 
@@ -260,6 +267,7 @@ static void Vision_Drain_Rx(uint32_t now_ms)
 {
     uint16_t tail = Vision_Rx_Tail;
     const uint16_t head = Vision_Rx_Head;
+    __DMB();
     Struct_Rescue_Frame frame;
     while (tail != head)
     {
@@ -302,6 +310,7 @@ static void Vision_Drain_Rx(uint32_t now_ms)
             }
         }
     }
+    __DMB();
     Vision_Rx_Tail = tail;
 }
 
@@ -381,6 +390,25 @@ static void Drive_Control()
     const bool can_start = ready && wheels_still && imu_quiet;
     const bool button_pressed = Drive_Button_Pressed(now_ms);
 
+    float forward_delta_m = 0.0f;
+    float yaw_delta_rad = 0.0f;
+    if (feedback_fresh && attitude_fresh)
+    {
+        if (Drive_Prev_Odom_Valid)
+        {
+            forward_delta_m = 0.5f * Drive_Wheel_Radius_M *
+                              ((angle[0] - Drive_Prev_Angle[0]) + (angle[1] - Drive_Prev_Angle[1]));
+            yaw_delta_rad = heading - Drive_Prev_Heading_Rad;
+        }
+        Drive_Prev_Angle = angle;
+        Drive_Prev_Heading_Rad = heading;
+        Drive_Prev_Odom_Valid = true;
+    }
+    else
+    {
+        Drive_Prev_Odom_Valid = false;
+    }
+
     const Enum_Mission_State prev_state = Rescue_Mission.Get_State();
     Struct_Mission_Inputs mission_in{};
     mission_in.now_ms = now_ms;
@@ -391,9 +419,12 @@ static void Drive_Control()
                                     ? Straight_Drive.Is_Running()
                                     : Chassis_Drive.Is_Active();
     mission_in.chassis_motion_done = Chassis_Drive.Is_Motion_Done();
+    mission_in.chassis_motion_aborted = Chassis_Drive.Is_Motion_Aborted();
     mission_in.chassis_stalled = Chassis_Drive.Is_Stalled();
     mission_in.gate_settled = Gate_Servo.Is_Settled();
     mission_in.camera_settled = Pitch_Servo.Is_Settled();
+    mission_in.forward_delta_m = forward_delta_m;
+    mission_in.yaw_delta_rad = yaw_delta_rad;
 
     const Struct_Mission_Output cmd = Rescue_Mission.Update(mission_in);
     Drive_Notify_Buzzer(can_start, cmd.launch_rejected_cue, now_ms);
@@ -472,10 +503,25 @@ static void Drive_Control()
     const bool can_tx_ok = (can1_status == HAL_OK && can2_status == HAL_OK);
     if (!can_tx_ok)
     {
+        // CAN 发送失败必须立即锁停任务，防止下一周期自动恢复扭矩；并在可用总线上立刻补发零扭矩。
         Straight_Drive.Stop();
         Chassis_Drive.Emergency_Stop();
-        Drive_Tx_Ready(hfdcan1);
-        Drive_Tx_Ready(hfdcan2);
+        Rescue_Mission.Fault_Stop(now_ms);
+        for (uint8_t i = 0; i < 2; ++i)
+        {
+            M2006[i].Set_Target_Torque(0.0f);
+            M2006[i].TIM_Calculate_PeriodElapsedCallback();
+        }
+        const bool can1_zero_ok = Drive_Tx_Ready(hfdcan1);
+        const bool can2_zero_ok = Drive_Tx_Ready(hfdcan2);
+        if (can1_status == HAL_OK && can1_zero_ok)
+        {
+            CAN_Transmit_Data(&hfdcan1, 0x200, CAN1_0x200_Tx_Data, FDCAN_DLC_BYTES_8);
+        }
+        if (can2_status == HAL_OK && can2_zero_ok)
+        {
+            CAN_Transmit_Data(&hfdcan2, 0x200, CAN2_0x200_Tx_Data, FDCAN_DLC_BYTES_8);
+        }
     }
 
     // 发布灯光颜色与遥测快照，供 statusTask 消费。

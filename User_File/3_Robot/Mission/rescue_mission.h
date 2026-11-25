@@ -48,8 +48,12 @@ struct Struct_Mission_Config
 {
     uint32_t match_duration_ms = 180000U;      // 3-minute competition round
     uint32_t vision_timeout_ms = 300U;         // Vision freshness window
+    uint32_t vision_abort_ms = 4000U;          // Sustained vision outage -> fault stop (< 15 s DQ)
+    uint32_t camera_restart_resync_ms = 1000U; // Minimum outage before accepting seq restart from 0..5
     uint32_t heartbeat_timeout_ms = 1000U;     // Link liveness window (never refreshes vision)
     uint32_t visual_stall_ms = 800U;           // Track-slip visual stall window (< 15 s DQ)
+    uint32_t progress_watchdog_ms = 10000U;    // Cumulative no-progress fault limit (< 15 s DQ)
+    uint8_t max_consecutive_escapes = 3U;      // Bounded escape attempts before latching fault
     uint32_t inspect_timeout_ms = 2500U;
     uint32_t drop_verify_timeout_ms = 2500U;
     uint8_t confirm_frames_required = 3U;
@@ -64,6 +68,8 @@ struct Struct_Mission_Config
     uint16_t target_capture_dist_mm = 210U;
     uint16_t home_drop_dist_mm = 230U;
 
+    float min_proven_reverse_m = 0.06f;        // Minimum proven swept corridor before reverse is authorized
+    float max_proven_reverse_m = 0.26f;        // Maximum tracked forward swept corridor
     float separate_backout_m = -0.18f;
     float separate_turn_rad = 0.45f;
     float drop_push_distance_m = 0.16f;
@@ -82,9 +88,12 @@ struct Struct_Mission_Inputs
     bool button_pressed = false;
     bool chassis_active = false;
     bool chassis_motion_done = false;
+    bool chassis_motion_aborted = false;
     bool chassis_stalled = false;
     bool gate_settled = false;
     bool camera_settled = false;
+    float forward_delta_m = 0.0f;
+    float yaw_delta_rad = 0.0f;
 };
 
 struct Struct_Mission_Output
@@ -111,6 +120,7 @@ public:
     bool On_Set_Config(const Struct_Match_Config_Cmd &cfg);
     bool On_Vision_State(const Struct_Vision_State &vis, uint32_t now_ms);
     bool On_Bench_Actuator(const Struct_Bench_Actuator_Cmd &cmd);
+    void Fault_Stop(uint32_t now_ms);
 
     Struct_Mission_Output Update(const Struct_Mission_Inputs &in);
 
@@ -133,10 +143,16 @@ public:
     uint8_t Get_Delivered_Green() const { return Delivered_Green; }
     uint8_t Get_Delivered_Black() const { return Delivered_Black; }
     uint8_t Get_Delivered_Orange() const { return Delivered_Orange; }
+    uint8_t Get_Consecutive_Escapes() const { return Consecutive_Escapes; }
+    float Get_Proven_Rear_Clear_M() const { return Proven_Rear_Clear_M; }
 
 private:
     void Enter_State(Enum_Mission_State next, uint32_t now_ms);
-    void Start_Escape(uint32_t now_ms, bool allow_reverse, Struct_Mission_Output &out);
+    void Clear_Cargo();
+    void Record_Progress(uint32_t now_ms, bool reset_escapes);
+    float Available_Reverse_M(bool vision_fresh, bool rear_sensor_clear,
+                              bool opponent_alert, float requested_abs_m) const;
+    void Start_Escape(uint32_t now_ms, float reverse_abs_m, Struct_Mission_Output &out);
 
     const Struct_Mission_Config Config;
 
@@ -165,11 +181,25 @@ private:
     uint32_t Last_Vision_Ms = 0U;
     Struct_Vision_State Latest_Vision = {};
 
+    bool Vision_Outage_Active = false;
+    uint32_t Vision_Outage_Start_Ms = 0U;
+    bool Interrupted_By_Stale_Vision = false;
+
     bool Has_Confirm_Frame = false;
     uint16_t Last_Confirm_Frame_Seq = 0U;
     uint8_t Confirm_Count = 0U;
     uint32_t Visual_Stall_Counter_Ms = 0U;
     float Escape_Sign = 1.0f;
+
+    // Recovery budget & cumulative progress watchdog (< 15 s DQ limit).
+    uint8_t Consecutive_Escapes = 0U;
+    uint32_t Last_Progress_Ms = 0U;
+    float Progress_Dist_Accum_M = 0.0f;
+    float Progress_Yaw_Accum_Rad = 0.0f;
+
+    // Swept forward corridor proven clear behind the robot (never fabricated).
+    float Proven_Rear_Clear_M = 0.0f;
+    uint32_t Last_Forward_Clear_Ms = 0U;
 
     // Cargo locked upon gate closure for safe-zone half matching and score counting.
     bool Cargo_Is_Casualty = false;

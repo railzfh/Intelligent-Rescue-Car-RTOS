@@ -33,7 +33,7 @@
 | 右侧倒 L 杆舵机 | `PE9`（`SERVO_1__PWM`） | `TIM1_CH1`，`PSC=240-1`，运行时重设 `ARR=20000-1`（`50 Hz`，`1 tick = 1 us`）并开启 `OC1PE` | 软限位 `[900, 2100] us`，需台架实测标定 `OPEN/CLOSED` 脉宽 |
 | MaixCAM 俯仰舵机 | `PA0`（`SERVO_3__PWM`） | `TIM2_CH1`，`PSC=240-1`，运行时重设 `ARR=20000-1`（`50 Hz`，`1 tick = 1 us`）并开启 `OC1PE` | 软限位 `[900, 2100] us`，需台架实测标定 `FAR/NEAR` 脉宽 |
 | 备用舵机通道 | `PE13`（`TIM1_CH3`）、`PA2`（`TIM2_CH3`） | 保留未启用 | 本方案不使用 |
-| MaixCAM 串口通信 | `PA9 (TX)` / `PA10 (RX)` | `USART1`，`115200 8N1`，DMA1 Stream5 RX（Idle 双缓冲）/ Stream6 TX | 对接 MaixCAM `UART1`（`A19 TX -> PA10 RX`，`A18 RX <- PA9 TX`，仅接 TX/RX/GND） |
+| MaixCAM 串口通信 | `PA9 (TX)` / `PA10 (RX)` | `USART1`，`115200 8N1`，DMA1 Stream5 RX（Idle/TC 双缓冲，禁用 HT 避免半传输错换缓冲）/ Stream6 TX | 对接 MaixCAM `UART1`（`A19 TX -> PA10 RX`，`A18 RX <- PA9 TX`，仅接 TX/RX/GND） |
 | 实体一键启动键 | `PA15`（`KEY__INPUT`） | 低有效，25 ms 消抖，上电按住须先松开 | `PRE_MATCH` 启动比赛；运行中按下执行安全减速停车 |
 | 状态回显灯 | `PA7`（`WS2812` / `SPI6`） | 10 ms 刷新（`statusTask` 独占） | 欠压/故障恒红优先；未选边显示电量红绿渐变；选定红/蓝方后回显队色 |
 | 蜂鸣器 | `PB15`（`TIM12_CH2`） | 就绪短鸣提示 | 电量/IMU/电机/CAN 全就绪时短鸣一次 |
@@ -73,7 +73,7 @@
 2. `0x02 MSG_SET_CONFIG`（MaixCAM → STM32，4 B）：`team(u8: 0未定/1红/2蓝)`, `start_zone(u8: 1..4)`, `run_mode(u8: 0比赛/1台架1m直行)`, `max_materials_per_trip(u8: 1..3)`。
    - 仅在 `PRE_MATCH` 未发车时生效；一键发车后配置立即锁定。
 3. `0x03 MSG_VISION_STATE`（MaixCAM → STM32，20 B，推荐 `20 Hz`）：
-   - `frame_seq(u16)`：相机递增帧号；**重复 `frame_seq` 不会刷新视觉新鲜度**（防止旧画面被重复发送伪装在线）。
+   - `frame_seq(u16)`：相机单调递增帧号（16 位回绕安全）；**重复或倒退的旧 `frame_seq` 绝不刷新视觉新鲜度**（仅在视觉真实断联 `>= 1000 ms` 后允许相机重启从 `0..5` 重新同步）。
    - `camera_view(u8)`：`0=TRANSITION`, `1=FAR`, `2=NEAR`；舵机切换期间 STM32 强制丢弃不匹配视角的观测。
    - `target_type(u8)`：`0=NONE`, `1=GREEN`, `2=BLACK`, `3=ORANGE`, `4=CYAN`。
    - `flags(u16)`：位掩码涵盖目标有效、本方区有效、半区匹配、紫坡可见、框内无危险块、右杆扫掠区清空、卸货完整入区确认、对手临近、对方安全区临近、后方清空、视觉停滞打滑。
@@ -108,8 +108,8 @@ DROP_BACKOUT_VERIFY (直线倒车退出 → 近视连续确认物块完整越过
    ├─ 首单确认完整入区 → first_green_unlocked = true
    └─ 返回 SEARCH_TARGET (满 180 s 进入 MATCH_FINISHED)
 
-任意推进/搜索状态若触发 [底盘堵转 >=600ms] 或 [视觉停滞打滑 >=800ms]：
-   ──► ESCAPE_RECOVERY (立即停推 → 后方清空时有界倒退 → 交替方向转45° → 重新决策)
+任意推进/搜索状态若触发 [底盘堵转 >=600ms] 或 [去均值空间位移视觉打滑 >=800ms]：
+   ──► ESCAPE_RECOVERY (仅在有实测已验证前向清空走廊或显式后向传感器许可时有界倒退，全程监测对手与视觉新鲜度 → 交替方向转45°；连续脱困超过 3 次或累计 10 s 无进展立即锁停 FAULT_STOP)
 ```
 
 ## 6. 分阶段开发与上车验收清单

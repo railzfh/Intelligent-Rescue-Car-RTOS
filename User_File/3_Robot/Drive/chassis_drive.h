@@ -58,6 +58,7 @@ public:
     Enum_Chassis_Mode Get_Mode() const { return Mode; }
     bool Is_Active() const { return Mode != CHASSIS_MODE_IDLE; }
     bool Is_Motion_Done() const { return Motion_Done; }
+    bool Is_Motion_Aborted() const { return Motion_Aborted; }
     bool Is_Stalled() const { return Stalled; }
     float Get_Travelled_M() const { return Travelled_M; }
     float Get_Linear_Speed_Mps(const std::array<float, 2> &speed) const;
@@ -75,6 +76,7 @@ private:
 
     Enum_Chassis_Mode Mode = CHASSIS_MODE_IDLE;
     bool Motion_Done = false;
+    bool Motion_Aborted = false;
     bool Stalled = false;
 
     std::array<float, 2> Wheel_Target_Rad_S = {};

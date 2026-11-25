@@ -39,6 +39,7 @@ void Class_Chassis_Drive::Prepare_Active_Mode(const std::array<float, 2> &measur
         }
     }
     Motion_Done = false;
+    Motion_Aborted = false;
     Settled_Samples = 0U;
 }
 
@@ -215,6 +216,7 @@ void Class_Chassis_Drive::Emergency_Stop()
 {
     Mode = CHASSIS_MODE_IDLE;
     Motion_Done = false;
+    Motion_Aborted = false;
     Settled_Samples = 0U;
     Wheel_Target_Rad_S = {};
     Forward_Profile_Rad_S = 0.0f;
@@ -280,6 +282,7 @@ std::array<float, 2> Class_Chassis_Drive::Update(const std::array<float, 2> &ang
             (uint32_t)(now_ms - Mode_Start_Ms) >= Mode_Timeout_Ms)
         {
             Emergency_Stop();
+            Motion_Aborted = true;
             return {};
         }
 
@@ -316,6 +319,7 @@ std::array<float, 2> Class_Chassis_Drive::Update(const std::array<float, 2> &ang
         if ((uint32_t)(now_ms - Mode_Start_Ms) >= Mode_Timeout_Ms)
         {
             Emergency_Stop();
+            Motion_Aborted = true;
             return {};
         }
 
@@ -358,6 +362,7 @@ std::array<float, 2> Class_Chassis_Drive::Update(const std::array<float, 2> &ang
         if ((uint32_t)(now_ms - Stop_Start_Ms) >= Chassis_Stop_Timeout_Ms)
         {
             Mode = CHASSIS_MODE_IDLE;
+            Motion_Aborted = !Motion_Done;
             Wheel_Target_Rad_S = {};
             return {};
         }

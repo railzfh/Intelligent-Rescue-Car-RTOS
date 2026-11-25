@@ -45,7 +45,7 @@ struct Class_PWM_Servo {
     bool Is_Settled() const { return ctrl.Is_Settled(); }
     uint16_t Get_Current_Us() const { return ctrl.Get_Current_Us(); }
 };
-struct FDCAN_HandleTypeDef { bool pending = false, fail = false; };
+struct FDCAN_HandleTypeDef { bool pending = false, fail = false; int tx_calls = 0; };
 FDCAN_HandleTypeDef hfdcan1, hfdcan2;
 uint8_t CAN1_0x200_Tx_Data[8], CAN2_0x200_Tx_Data[8];
 constexpr int FDCAN_DLC_BYTES_8 = 8, HAL_OK = 0;
@@ -56,11 +56,12 @@ uint32_t HAL_GetTick() { return now_ms; }
 uint32_t __get_PRIMASK() { return irq_mask; }
 void __disable_irq() { irq_mask = 1; }
 void __set_PRIMASK(uint32_t mask) { irq_mask = mask; }
+void __DMB() {}
 int HAL_GPIO_ReadPin(int, int) { return key ? 0 : 1; }
 uint32_t HAL_FDCAN_GetLatestTxFifoQRequestBuffer(FDCAN_HandleTypeDef *) { return 0; }
 bool HAL_FDCAN_IsTxBufferMessagePending(FDCAN_HandleTypeDef *c, uint32_t) { return c->pending; }
 void HAL_FDCAN_AbortTxRequest(FDCAN_HandleTypeDef *c, uint32_t) { c->pending = false; }
-int CAN_Transmit_Data(FDCAN_HandleTypeDef *c, int, uint8_t *, int) { return c->fail ? 1 : 0; }
+int CAN_Transmit_Data(FDCAN_HandleTypeDef *c, int, uint8_t *, int) { ++c->tx_calls; return c->fail ? 1 : 0; }
 struct { float volume = 0; void Set_Loudness(float v) { volume = v; } } BSP_Buzzer;
 '''
 checks = r'''
@@ -70,14 +71,14 @@ void Feed_Config(uint8_t team, uint8_t zone, uint8_t mode) {
     const size_t n = Rescue_Encode_Set_Config(seq++, {team, zone, mode, 1U}, buf, sizeof(buf));
     Vision_Uart_RxCallback(buf, static_cast<uint16_t>(n));
 }
-void Feed_Vision(uint16_t frame_seq) {
+void Feed_Vision(uint16_t frame_seq, uint16_t flags = VIS_FLAG_TARGET_VALID) {
     uint8_t buf[RESCUE_PROTO_MAX_FRAME];
     static uint8_t seq = 10U;
     Struct_Vision_State vis{};
     vis.frame_seq = frame_seq;
     vis.camera_view = CAMERA_VIEW_FAR;
     vis.target_type = TARGET_GREEN_MATERIAL;
-    vis.flags = VIS_FLAG_TARGET_VALID;
+    vis.flags = flags;
     vis.target_dist_mm = 500U;
     vis.confidence = 90U;
     const size_t n = Rescue_Encode_Vision_State(seq++, vis, buf, sizeof(buf));
@@ -102,9 +103,63 @@ int main(int argc, char **argv) {
     Pitch_Servo.Init_Mock(Pitch_Servo_Config);
     const bool held = argc > 1 && std::strcmp(argv[1], "held") == 0;
     const bool comp = argc > 1 && std::strcmp(argv[1], "comp") == 0;
+    const bool can_fault = argc > 1 && std::strcmp(argv[1], "can_fault") == 0;
+    const bool frozen = argc > 1 && std::strcmp(argv[1], "frozen") == 0;
+
+    if (can_fault) {
+        // Adversarial probe: single CAN TX failure during active competition must latch MISSION_FAULT_STOP
+        // and never auto-resume torque on the next tick.
+        Feed_Config(RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION);
+        Feed_Vision(1U);
+        Step(0, false); Step(30, false);
+        Step(40, true); Step(70, true);
+        assert(Rescue_Mission.Get_State() == MISSION_LAUNCH_CROSS_BUMPS);
+        assert(M2006[0].torque < 0 && M2006[1].torque > 0);
+
+        // Inject single-bus CAN1 TX failure.
+        hfdcan1.fail = true;
+        Feed_Vision(2U);
+        Step(80, false);
+        assert(Rescue_Mission.Get_State() == MISSION_FAULT_STOP);
+        Stopped();
+
+        // Next tick CAN1 recovers -> must STAY latched in MISSION_FAULT_STOP with zero torque!
+        hfdcan1.fail = false;
+        Feed_Vision(3U);
+        Step(90, false);
+        assert(Rescue_Mission.Get_State() == MISSION_FAULT_STOP);
+        Stopped();
+        std::puts("PASS: competition CAN TX failure latches MISSION_FAULT_STOP with zero torque");
+        return 0;
+    }
+
+    if (frozen) {
+        // Adversarial probe: frozen wheel/IMU feedback must exhaust bounded recovery and fault < 15 s!
+        Feed_Config(RESCUE_TEAM_BLUE, 2U, RESCUE_MODE_COMPETITION);
+        uint16_t fseq = 1U;
+        Feed_Vision(fseq++);
+        Step(0, false); Step(30, false);
+        Step(40, true); Step(70, true);
+        assert(Rescue_Mission.Get_State() == MISSION_LAUNCH_CROSS_BUMPS);
+
+        uint32_t fault_at_ms = 0U;
+        for (uint32_t t = 71U; t <= 12000U; ++t) {
+            if ((t % 50U) == 0U) {
+                Feed_Vision(fseq++);
+            }
+            Step(t, false);
+            if (Rescue_Mission.Get_State() == MISSION_FAULT_STOP) {
+                fault_at_ms = t;
+                break;
+            }
+        }
+        assert(fault_at_ms > 0U && fault_at_ms < 11000U);
+        Stopped();
+        std::puts("PASS: frozen wheel/IMU exhausts recovery budget and faults well under 15 s");
+        return 0;
+    }
 
     if (comp) {
-        // Competition mode: must refuse launch without team/vision, echo team LED, lock config on launch.
         Step(0, false, true);
         Step(30, false, true);
         Step(40, true, true);
@@ -112,7 +167,6 @@ int main(int argc, char **argv) {
         Stopped();
         assert(Rescue_Mission.Get_State() == MISSION_PRE_MATCH);
 
-        // Select BLUE team via UART1 frame -> WS2812 echoes blue.
         Feed_Config(RESCUE_TEAM_BLUE, 2U, RESCUE_MODE_COMPETITION);
         Feed_Vision(1U);
         Step(80, false, true);
@@ -120,17 +174,14 @@ int main(int argc, char **argv) {
         assert(Status_LED_Color.Blue > 200U && Status_LED_Color.Red == 0U);
         assert(Telemetry_Snapshot.team == RESCUE_TEAM_BLUE && Telemetry_Snapshot.start_zone == 2U);
 
-        // One-button launch starts crossing speed bumps and locks config.
         Step(120, true, true);
         Step(150, true, true);
         assert(Rescue_Mission.Get_State() == MISSION_LAUNCH_CROSS_BUMPS);
         assert(Rescue_Mission.Is_Config_Locked());
         assert(M2006[0].torque < 0 && M2006[1].torque > 0);
-        // Late config change ignored.
         Feed_Config(RESCUE_TEAM_RED, 4U, RESCUE_MODE_COMPETITION);
         Step(160, false, true);
         assert(Rescue_Mission.Get_Team() == RESCUE_TEAM_BLUE);
-        // Low-voltage latch cuts motors AND disables both servos.
         Battery.Update(19.0f, 170U);
         now_ms = 170U;
         Drive_Control();
@@ -162,14 +213,12 @@ int main(int argc, char **argv) {
     Step(180, true);
     assert(Straight_Drive.Is_Running());
     assert(M2006[0].torque < 0 && M2006[1].torque > 0);
-    // An old IMU sample stops immediately and does not restart on recovery.
     now_ms = 211;
     M2006_Last_Feedback_Ms[0] = M2006_Last_Feedback_Ms[1] = now_ms;
     Drive_Control();
     Stopped();
     Step(220, true);
     Stopped();
-    // Only a new press may start after a fault.
     Step(230, false); Step(260, false); Step(270, true); Step(300, true);
     assert(Straight_Drive.Is_Running());
     hfdcan2.pending = true;
@@ -214,6 +263,5 @@ cmd = ["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-Wno-unused-variable
 if os.name == "nt":
     cmd.append("-static")
 subprocess.run(cmd, check=True)
-subprocess.run([str(exe)], check=True)
-subprocess.run([str(exe), "held"], check=True)
-subprocess.run([str(exe), "comp"], check=True)
+for mode in ([], ["held"], ["comp"], ["can_fault"], ["frozen"]):
+    subprocess.run([str(exe), *mode], check=True)
