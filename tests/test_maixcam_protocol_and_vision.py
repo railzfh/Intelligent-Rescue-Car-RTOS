@@ -2065,7 +2065,31 @@ class MaixcamVisionAndUITest(unittest.TestCase):
         self.assertTrue(any(b.label == "purple_ramp" and b.pixels == 1312 for b in fallback_ramp))
         self.assertTrue(any(b.label == "green" and b.pixels == 144 for b in fallback_ramp))
 
-        # 3. R15 P1-2: MaixCAM echoes pre_match_settle_gen ONLY when FAR settled and gate is open & settled!
+        # 2b. R16 P2-4 interlocking geometry: 1,584-px purple_ramp with a tongue protruding INSIDE
+        #     the bounding box of a disconnected 528-px reversed-C green block -> ZERO unknowns in Tier 1 & Tier 3!
+        img_lock = _FakeMaixImage(320, 240, (85, 0, 0))
+        for rx, ry, rw, rh in ((100, 30, 68, 8), (100, 38, 8, 28), (100, 66, 68, 8), (108, 49, 34, 8)):
+            img_lock.fill_rect(rx, ry, rw, rh, ramp_lab)
+        for gx, gy, gw, gh in ((120, 41, 38, 6), (152, 47, 6, 12), (120, 59, 38, 6)):
+            img_lock.fill_rect(gx, gy, gw, gh, (55, -35, 30))
+        exact_lock = extract_blobs_from_maix_image(img_lock, cfg, scan_unknown_near=True)
+        fallback_lock = extract_blobs_from_maix_image(
+            SimpleNamespace(find_blobs=img_lock.find_blobs), cfg, scan_unknown_near=True
+        )
+        self.assertEqual([b for b in exact_lock if b.label == "unknown"], [])
+        self.assertEqual([b for b in fallback_lock if b.label == "unknown"], [])
+        self.assertTrue(any(b.label == "purple_ramp" and b.pixels == 1584 for b in fallback_lock))
+        self.assertTrue(any(b.label == "green" and b.pixels == 528 for b in fallback_lock))
+
+        # 2c. Adding a 120-px unknown wart attached to the interlocking purple_ramp MUST still be caught in Tier 3!
+        img_lock.fill_rect(100, 74, 15, 8, unknown_lab)  # 120 px unknown attached to ramp bottom bar
+        fallback_wart = extract_blobs_from_maix_image(
+            SimpleNamespace(find_blobs=img_lock.find_blobs), cfg, scan_unknown_near=True
+        )
+        self.assertTrue(any(b.label == "unknown" for b in fallback_wart))
+
+        # 3. R15 P1-2 & R16 P1-2: MaixCAM echoes pre_match_settle_gen ONLY when FAR settled and gate is open & settled,
+        #    AND run_maixcam() fences camera buffer via clear_buff() on a new settle gen (failing closed without clear_buff)!
         proc = RescueVisionProcessor(cfg)
         st_closed = proc.process(
             [], camera_near_cmd=False, camera_settled=True, team=TEAM_RED,
@@ -2082,6 +2106,74 @@ class MaixcamVisionAndUITest(unittest.TestCase):
             first_green_unlocked=False, gate_closed=False, gate_settled=True, pre_match_settle_gen=2,
         )
         self.assertEqual((st_open_settled.flags & VIS_FLAG_PRE_MATCH_GEN_MASK) >> VIS_FLAG_PRE_MATCH_GEN_SHIFT, 2)
+
+        # End-to-end run_maixcam() camera queue fence check (both WITH and WITHOUT clear_buff):
+        from unittest.mock import patch
+        from maixcam import main as maix_main
+        from maixcam.protocol import (
+            TEL_FLAG_CAMERA_SETTLED,
+            TEL_FLAG_GATE_SETTLED,
+            TEL_FLAG_PRE_MATCH_GEN_SHIFT,
+            decode_vision_state,
+            encode_telemetry,
+        )
+
+        payload_gen1 = encode_telemetry(
+            1,
+            Telemetry(
+                status_flags=TEL_FLAG_CAMERA_SETTLED
+                | TEL_FLAG_GATE_SETTLED
+                | (1 << TEL_FLAG_PRE_MATCH_GEN_SHIFT),
+            ),
+        )
+        for has_clear in (True, False):
+            events: list[str] = []
+            stale = SimpleNamespace(resize=lambda *_: None)
+            fresh = SimpleNamespace(resize=lambda *_: None)
+            q = [stale]
+            written: list[bytes] = []
+
+            def _read_frame(queue=q, ev=events, st=stale, fr=fresh):
+                f = queue.pop(0) if queue else fr
+                ev.append("stale" if f is st else "fresh")
+                return f
+
+            cam_obj = (
+                SimpleNamespace(read=_read_frame, clear_buff=q.clear)
+                if has_clear
+                else SimpleNamespace(read=_read_frame)
+            )
+            fake_maix = SimpleNamespace(
+                app=SimpleNamespace(need_exit=iter((False, True)).__next__),
+                camera=SimpleNamespace(Camera=lambda *_: cam_obj),
+                display=SimpleNamespace(Display=lambda: SimpleNamespace(width=lambda: 552, height=lambda: 368, show=lambda _: None)),
+                pinmap=SimpleNamespace(set_pin_function=lambda *_: None),
+                touchscreen=SimpleNamespace(TouchScreen=lambda: SimpleNamespace(read=lambda: (0, 0, False))),
+                uart=SimpleNamespace(UART=lambda *_: SimpleNamespace(read=lambda: payload_gen1, write=written.append)),
+            )
+            with (
+                patch.dict(sys.modules, {"maix": fake_maix}),
+                patch.object(maix_main, "time", SimpleNamespace(monotonic=iter((0.0, 1.0)).__next__)),
+                patch.object(maix_main, "extract_blobs_from_maix_image", return_value=[]),
+                patch.object(maix_main, "_extract_motion_grid", return_value=[0] * (16 * 12)),
+                patch.object(maix_main, "render_touch_overlay"),
+            ):
+                maix_main.run_maixcam()
+            p_check = RescueProtocolParser()
+            states = [
+                vs
+                for raw_tx in written
+                for fr in p_check.feed(raw_tx)
+                if (vs := decode_vision_state(fr)) is not None
+            ]
+            self.assertEqual(len(states), 1)
+            echo_gen = (states[0].flags & VIS_FLAG_PRE_MATCH_GEN_MASK) >> VIS_FLAG_PRE_MATCH_GEN_SHIFT
+            if has_clear:
+                self.assertEqual(events, ["fresh"])
+                self.assertEqual(echo_gen, 1)
+            else:
+                self.assertEqual(events, ["stale"])
+                self.assertEqual(echo_gen, 0)
 
 
 if __name__ == "__main__":

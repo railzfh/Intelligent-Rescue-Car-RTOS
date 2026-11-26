@@ -174,6 +174,7 @@ void (*irq_after_unmask)() = nullptr;
 void (*each_mask)() = nullptr;
 void (*each_unmask)() = nullptr;
 void (*on_can_tx)(FDCAN_HandleTypeDef *) = nullptr;
+void (*on_can_consume_bus_off)(FDCAN_HandleTypeDef *) = nullptr;
 uint32_t __get_PRIMASK() { return irq_mask; }
 void __disable_irq() {
     irq_mask = 1;
@@ -209,6 +210,7 @@ bool CAN_Is_Bus_Off_Latched(const FDCAN_HandleTypeDef *c) {
 }
 bool CAN_Consume_Bus_Off(FDCAN_HandleTypeDef *c) {
     if (c == nullptr) { return false; }
+    if (on_can_consume_bus_off != nullptr) { on_can_consume_bus_off(c); }
     const bool v = c->bus_off_latched || c->psr_bo || c->ir_bo;
     c->bus_off_latched = false;
     return v;
@@ -1077,6 +1079,51 @@ int main(int argc, char **argv) {
         assert(Can_Tx_Fault_Reported_Seq == Can_Tx_Fault_Event_Seq);
         Step(ct += 10U, false);
         assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_CAN_TX) == 0U);
+
+        // Part C0 (R16 P1-1): Bus-Off first appearing AT the pre-TX recheck (after torque calculation,
+        // BEFORE the first CAN_Transmit_Data call) on EITHER bus MUST NOT submit nonzero torque to the
+        // healthy peer; it must regenerate zero-torque payloads first, roll back launch, and zero the peer!
+        for (int fbus = 1; fbus <= 2; ++fbus) {
+            Step(ct += 10U, false);
+            Step(ct += 30U, false);
+            Feed_Vision(bseq++);
+            Step(ct += 10U, true);
+            static int pre_tx_fbus = 0;
+            static unsigned pre_tx_can1_reads = 0U;
+            static float pre_tx_peer_nonzero = 0.0f;
+            pre_tx_fbus = fbus;
+            pre_tx_can1_reads = 0U;
+            pre_tx_peer_nonzero = 0.0f;
+            on_can_consume_bus_off = [](FDCAN_HandleTypeDef *can) {
+                // 1st CAN1 read: top of final commit; 2nd CAN1 read: pre-TX recheck right after torque calc!
+                if (can == &hfdcan1 && ++pre_tx_can1_reads == 2U) {
+                    (pre_tx_fbus == 1 ? hfdcan1 : hfdcan2).inject_hw_bus_off_pending();
+                }
+            };
+            on_can_tx = [](FDCAN_HandleTypeDef *can) {
+                if (pre_tx_fbus == 1 && can == &hfdcan2 && M2006[1].torque != 0.0f) {
+                    pre_tx_peer_nonzero = M2006[1].torque;
+                }
+                if (pre_tx_fbus == 2 && can == &hfdcan1 && M2006[0].torque != 0.0f) {
+                    pre_tx_peer_nonzero = M2006[0].torque;
+                }
+            };
+            Step(ct += 30U, true);
+            on_can_consume_bus_off = nullptr;
+            on_can_tx = nullptr;
+            assert(pre_tx_can1_reads >= 2U);
+            assert(pre_tx_peer_nonzero == 0.0f);
+            assert(Rescue_Mission.Get_State() == MISSION_PRE_MATCH);
+            assert(!Rescue_Mission.Is_Config_Locked());
+            assert((Telemetry_Snapshot.status_flags & TEL_FLAG_CONFIG_LOCKED) == 0U);
+            assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_CAN_TX) != 0U);
+            Stopped();
+            (fbus == 1 ? hfdcan1 : hfdcan2).inject_bus_off();
+            Step(ct += 10U, false);
+            assert(Telemetry_Service_Tx());
+            huart1.complete_tx();
+            Step(ct += 10U, false);
+        }
 
         // Part C (R15 P1-1a): Bus-Off asserted on CAN1 right BETWEEN CAN1 TX and CAN2 TX MUST prevent
         // ANY nonzero torque submission to CAN2, roll back launch (no Config_Locked), and zero CAN2!

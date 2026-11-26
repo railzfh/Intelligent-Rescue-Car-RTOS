@@ -224,6 +224,9 @@ HAL_StatusTypeDef HAL_UARTEx_ReceiveToIdle_DMA(UART_HandleTypeDef *huart, uint8_
 }
 
 HAL_StatusTypeDef HAL_UART_Transmit_DMA(UART_HandleTypeDef *huart, uint8_t *, uint16_t) {
+    if (huart->gState != HAL_UART_STATE_READY) {
+        return HAL_BUSY;
+    }
     huart->gState = HAL_UART_STATE_BUSY_TX;
     if (huart->hdmatx != nullptr) {
         huart->hdmatx->State = HAL_DMA_STATE_BUSY;
@@ -371,7 +374,16 @@ int main() {
     HAL_UART_ErrorCallback(&huart1);
     assert(tx_fail_count == fail_before + 2);
 
-    std::puts("PASS: drv_uart HT guard, HAL-faithful DMA ERROR DeInit/Init recovery, wedged-stream latch, and active-TX callback gating");
+    // 7. R16 P2-3: HAL_BUSY retry while an earlier TX is active MUST preserve Tx_Active
+    //    so the original transfer's HAL_UART_TxCpltCallback still fires!
+    const int ok_before_busy_retry = tx_ok_count;
+    assert(UART_Transmit_Data(&huart1, tx_dummy, 4U) == HAL_OK);
+    assert(UART_Transmit_Data(&huart1, tx_dummy, 4U) == HAL_BUSY);
+    huart1.gState = HAL_UART_STATE_READY;
+    HAL_UART_TxCpltCallback(&huart1);
+    assert(tx_ok_count == ok_before_busy_retry + 1);
+
+    std::puts("PASS: drv_uart HT guard, HAL-faithful DMA ERROR DeInit/Init recovery, wedged-stream latch, active-TX gating, and HAL_BUSY preservation");
     return 0;
 }
 ''',

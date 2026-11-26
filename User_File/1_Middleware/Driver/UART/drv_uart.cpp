@@ -275,14 +275,17 @@ uint8_t UART_Transmit_Data(UART_HandleTypeDef *huart, uint8_t *Data, uint16_t Le
     Struct_UART_Manage_Object *obj = UART_Get_Manage_Object(huart);
     const uint32_t primask = __get_PRIMASK();
     __disable_irq();
-    if (obj != nullptr && obj->UART_Handler == huart)
+    const bool track = (obj != nullptr && obj->UART_Handler == huart);
+    const bool was_active = track && obj->Tx_Active;
+    if (track && !was_active)
     {
         obj->Tx_Active = true;
     }
     const uint8_t status = static_cast<uint8_t>(HAL_UART_Transmit_DMA(huart, Data, Length));
-    if (status != HAL_OK && obj != nullptr && obj->UART_Handler == huart)
+    if (status != HAL_OK && track)
     {
-        obj->Tx_Active = false;
+        // Preserve prior active TX state on HAL_BUSY/failed retry so original TX completion is never suppressed.
+        obj->Tx_Active = was_active;
     }
     __set_PRIMASK(primask);
     return status;

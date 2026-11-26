@@ -42,6 +42,15 @@ def _extract_motion_grid(img, width: int, height: int) -> list[int]:
     return list(small.to_bytes())
 
 
+def _fence_camera_queue(cam) -> bool:
+    """Flush queued pre-transition camera frames; return True if buffer flush is supported."""
+    clear_fn = getattr(cam, "clear_buff", None)
+    if not callable(clear_fn):
+        return False
+    clear_fn()
+    return True
+
+
 def run_maixcam(config_path: Path | None = None) -> None:
     from maix import app, camera, display, pinmap, touchscreen, uart
 
@@ -75,6 +84,10 @@ def run_maixcam(config_path: Path | None = None) -> None:
     last_cfg_s = 0.0
     last_vis_s = 0.0
     prev_camera_near = False
+    prev_camera_settled = False
+    prev_gate_settled = False
+    fenced_pre_match_gen = 0
+    pre_match_gen_fresh = False
 
     while not app.need_exit():
         now_s = time.monotonic()
@@ -98,9 +111,33 @@ def run_maixcam(config_path: Path | None = None) -> None:
         pre_match_settle_gen = (telemetry.status_flags & TEL_FLAG_PRE_MATCH_GEN_MASK) >> TEL_FLAG_PRE_MATCH_GEN_SHIFT
         wheels_moving = abs(telemetry.vx_mm_s) > 35 or abs(telemetry.omega_mrad_s) > 250
 
+        need_cam_fence = (
+            camera_near != prev_camera_near
+            or (camera_settled and not prev_camera_settled)
+            or (gate_settled and not prev_gate_settled)
+        )
         if camera_near != prev_camera_near or not camera_settled:
             motion_estimator.reset()
             prev_camera_near = camera_near
+        prev_camera_settled = camera_settled
+        prev_gate_settled = gate_settled
+
+        pre_match_ready_state = (
+            (not camera_near)
+            and camera_settled
+            and (not gate_closed)
+            and gate_settled
+            and (1 <= pre_match_settle_gen <= 3)
+        )
+        if not pre_match_ready_state:
+            fenced_pre_match_gen = 0
+            pre_match_gen_fresh = False
+        elif pre_match_settle_gen != fenced_pre_match_gen:
+            fenced_pre_match_gen = pre_match_settle_gen
+            pre_match_gen_fresh = _fence_camera_queue(cam)
+            need_cam_fence = False
+        if need_cam_fence:
+            _fence_camera_queue(cam)
 
         # 2. Capture frame, run LAB blob pipeline (with near unknown-foreground scan) & spatial motion estimator.
         img = cam.read()
@@ -122,7 +159,7 @@ def run_maixcam(config_path: Path | None = None) -> None:
             gate_closed=gate_closed,
             gate_settled=gate_settled,
             drop_pushing=drop_pushing,
-            pre_match_settle_gen=pre_match_settle_gen,
+            pre_match_settle_gen=pre_match_settle_gen if pre_match_gen_fresh else 0,
         )
 
         # 3. Poll touchscreen (locked automatically once MC02 confirms launch).

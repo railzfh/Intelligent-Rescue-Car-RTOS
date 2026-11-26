@@ -2527,41 +2527,47 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                         return None
                     if not other_fgs:
                         return candidate
-                    overlap_other_px = 0
-                    for ox, oy, ow, oh, _ in other_fgs:
-                        inter = _rect_intersection(
-                            candidate.x, candidate.y, candidate.w, candidate.h, ox, oy, ow, oh
+                    # Connected-component subgraph membership proof (R14 P2-5, R15 P2-4, R16 P2-4):
+                    # Each candidate from _extract_roi_blobs_for_label (merge=False) is a single connected
+                    # component of `thresh`. When `thresh` is disjoint from `arena_floor_lab`, every pixel
+                    # of `candidate` is non-floor, so `candidate` MUST lie wholly inside ONE connected
+                    # component of `box_fg_comps` (`fg` or one of `other_fgs`) — never split across them!
+                    # A component C can contain `candidate` ONLY if AABB(C) encloses AABB(candidate) AND
+                    # C.pixels >= candidate.pixels.
+                    if thresh is not None and not _lab_ranges_overlap(thresh, cfg.arena_floor_lab):
+                        fits_self = (
+                            candidate.x >= fx
+                            and candidate.y >= fy
+                            and candidate.x2 <= fx + fg_w
+                            and candidate.y2 <= fy + fg_h
+                            and candidate.pixels <= px
                         )
-                        if inter is None:
-                            continue
-                        if thresh is None:
-                            # Cannot verify pixel occupancy inside other_fg without a threshold: fail closed.
+                        if not fits_self:
                             return None
-                        ix1, iy1, ix2, iy2 = inter
-                        iw, ih = max(1, ix2 - ix1), max(1, iy2 - iy1)
-                        hits = _find_blobs_unit_stride(
-                            img,
-                            [tuple(thresh)],
-                            roi=(ix1, iy1, iw, ih),
-                            pixels_threshold=1,
-                            area_threshold=1,
-                            merge=True,
-                        )
-                        overlap_other_px += sum(int(h.pixels()) for h in hits)
-                    if overlap_other_px <= 0:
-                        return candidate
-                    proven_px = max(0, candidate.pixels - overlap_other_px)
-                    if proven_px <= 0:
+                        enclosing_others = [
+                            (ox, oy, ow, oh, opx)
+                            for ox, oy, ow, oh, opx in other_fgs
+                            if ox <= candidate.x
+                            and oy <= candidate.y
+                            and ox + ow >= candidate.x2
+                            and oy + oh >= candidate.y2
+                            and opx >= candidate.pixels
+                        ]
+                        if not enclosing_others:
+                            # `fg` is the UNIQUE connected foreground component that can contain `candidate`!
+                            return candidate
+                        # Ambiguous: another disconnected foreground component also encloses `candidate`'s AABB
+                        # and pixel count; fail closed so a disconnected known block can never mask `fg`.
                         return None
-                    return Blob(
-                        candidate.label,
-                        candidate.x,
-                        candidate.y,
-                        candidate.w,
-                        candidate.h,
-                        proven_px,
-                        min(1.0, proven_px / float(max(1, candidate.w * candidate.h))),
-                    )
+
+                    # Fallback when `thresh` is unavailable or overlaps `arena_floor_lab`:
+                    # require strict AABB disjointness from all disconnected `other_fgs` (fail closed).
+                    if any(
+                        _rects_intersect(candidate.x, candidate.y, candidate.w, candidate.h, ox, oy, ow, oh)
+                        for ox, oy, ow, oh, _ in other_fgs
+                    ):
+                        return None
+                    return candidate
 
                 roi_surfaces: List[Blob] = []
                 for surface_label in _SURFACE_LABELS:

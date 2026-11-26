@@ -846,9 +846,11 @@ static void Drive_Control()
                 can2_submitted = (can2_status == HAL_OK);
             }
         }
-        else
+        else if (can_bus_off)
         {
-            // Already bus-off before TX: torque is 0.0f; still send zero torque on any healthy ready bus.
+            // Already bus-off BEFORE torque calculation (torque is guaranteed 0.0f); send zero on any healthy ready bus.
+            // If Bus-Off was FIRST detected at the pre-TX recheck above, TX buffers still hold nonzero torque:
+            // skip transmitting here so the late_bus_off fault block regenerates zero-torque payloads first!
             if (can1_ready && !can1_bus_off_now)
             {
                 can1_status = CAN_Transmit_Data(&hfdcan1, 0x200, CAN1_0x200_Tx_Data, FDCAN_DLC_BYTES_8);
