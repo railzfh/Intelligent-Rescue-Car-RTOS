@@ -6,13 +6,27 @@
 static constexpr float Millirad_To_Rad = 0.001f;
 static constexpr uint32_t Proven_Corridor_Expiry_Ms = 3000U;
 static constexpr float Proven_Corridor_Max_Yaw_Rad = 0.10f; // ~5.7 deg cumulative turn invalidates straight corridor
+static constexpr uint32_t Restart_Quiet_Ms = 150U; // Three nominal 20 Hz vision periods
+static constexpr uint32_t Restart_Min_Receive_Gap_Ms = 20U; // Reject near-contiguous UART drains as evidence
+static constexpr uint16_t Restart_Startup_Seq_Max = 5U;
+static constexpr uint16_t Restart_Delayed_Seq_Max = 32U;
+static constexpr uint16_t Restart_Max_Seq_Step = 4U; // Captures can be skipped between UART sends
+static constexpr uint8_t Restart_Confirm_Frames = 3U;
 
 void Class_Rescue_Mission::On_Heartbeat(const Struct_Vision_Heartbeat &hb, uint32_t now_ms)
 {
-    (void)hb;
-    // Heartbeat confirms UART link liveness ONLY; it never extends vision observation freshness.
+    // A backwards uptime (other than a normal uint32 wrap) fences the old session.
+    // The heartbeat itself never refreshes vision.
+    const uint32_t uptime_step = hb.vision_uptime_ms - Last_Heartbeat_Vision_Uptime_Ms;
+    if (Heartbeat_Received && hb.vision_uptime_ms < Last_Heartbeat_Vision_Uptime_Ms &&
+        uptime_step > Config.heartbeat_timeout_ms)
+    {
+        Awaiting_Vision_Sequence_Base = true;
+        Invalidate_Vision_Session();
+    }
     Heartbeat_Received = true;
     Last_Heartbeat_Ms = now_ms;
+    Last_Heartbeat_Vision_Uptime_Ms = hb.vision_uptime_ms;
 }
 
 bool Class_Rescue_Mission::On_Set_Config(const Struct_Match_Config_Cmd &cfg)
@@ -48,25 +62,73 @@ bool Class_Rescue_Mission::On_Set_Config(const Struct_Match_Config_Cmd &cfg)
     return true;
 }
 
-bool Class_Rescue_Mission::On_Vision_State(const Struct_Vision_State &vis, uint32_t now_ms)
+bool Class_Rescue_Mission::Accept_Vision_Sequence(uint16_t seq, uint32_t now_ms)
 {
-    if (vis.camera_view > CAMERA_VIEW_NEAR || vis.target_type > TARGET_CYAN_HAZARD || vis.confidence > 100U)
+    if (!Vision_Received || Awaiting_Vision_Sequence_Base)
+    {
+        return true;
+    }
+
+    const uint16_t delta = static_cast<uint16_t>(seq - Last_Vision_Frame_Seq);
+    if (delta == 0U)
     {
         return false;
     }
 
-    if (Vision_Received)
+    // Without uptime evidence, a lone rollback is ambiguous. Require an advancing startup run
+    // across separate receive ticks; a buffered burst never supplies all the evidence.
+    const uint32_t candidate_gap_ms = now_ms - Restart_Candidate_Ms;
+    if (Restart_Candidate_Count != 0U && candidate_gap_ms < Config.vision_timeout_ms)
     {
-        // Enforce forward uint16 sequence progression with wraparound handling.
-        const uint16_t delta = static_cast<uint16_t>(vis.frame_seq - Last_Vision_Frame_Seq);
-        const bool forward_step = (delta >= 1U && delta < 0x8000U);
-        // Explicit camera-restart policy: after a sustained outage, allow rebooting seq 0..5.
-        const bool camera_restarted =
-            (uint32_t)(now_ms - Last_Vision_Ms) >= Config.camera_restart_resync_ms && vis.frame_seq <= 5U;
-        if (!forward_step && !camera_restarted)
+        const uint16_t step = static_cast<uint16_t>(seq - Restart_Candidate_Seq);
+        if (step == 0U)
         {
             return false;
         }
+        if (step <= Restart_Max_Seq_Step)
+        {
+            Restart_Candidate_Seq = seq;
+            if (candidate_gap_ms < Restart_Min_Receive_Gap_Ms)
+            {
+                return false;
+            }
+            Restart_Candidate_Ms = now_ms;
+            if (++Restart_Candidate_Count < Restart_Confirm_Frames)
+            {
+                return false;
+            }
+            Invalidate_Vision_Session();
+            return true;
+        }
+    }
+    Restart_Candidate_Count = 0U;
+
+    const uint32_t quiet_ms = now_ms - Last_Vision_Ms;
+    const bool forward = delta < 0x8000U;
+    // Keep normal small uint16 wraps forward. A jump to startup seq after a quiet gap can
+    // look forward modulo uint16 even though the camera rebooted near the end of its range.
+    const bool startup_rollback = quiet_ms >= Restart_Quiet_Ms && seq <= Restart_Startup_Seq_Max &&
+                                  seq < Last_Vision_Frame_Seq && delta > Restart_Max_Seq_Step;
+    if (forward && !startup_rollback)
+    {
+        return true;
+    }
+    const bool delayed_rollback = seq <= Restart_Delayed_Seq_Max && quiet_ms >= Config.camera_restart_resync_ms;
+    if (startup_rollback || delayed_rollback)
+    {
+        Restart_Candidate_Seq = seq;
+        Restart_Candidate_Ms = now_ms;
+        Restart_Candidate_Count = 1U;
+    }
+    return false;
+}
+
+bool Class_Rescue_Mission::On_Vision_State(const Struct_Vision_State &vis, uint32_t now_ms)
+{
+    if (vis.camera_view > CAMERA_VIEW_NEAR || vis.target_type > TARGET_CYAN_HAZARD || vis.confidence > 100U ||
+        !Accept_Vision_Sequence(vis.frame_seq, now_ms))
+    {
+        return false;
     }
 
     Latest_Vision = vis;
@@ -75,6 +137,7 @@ bool Class_Rescue_Mission::On_Vision_State(const Struct_Vision_State &vis, uint3
     ++Vision_Accept_Counter;
     Vision_Received = true;
     Vision_Invalidated_By_Rx_Fault = false;
+    Awaiting_Vision_Sequence_Base = false;
     if ((vis.flags & (VIS_FLAG_OPPONENT_NEAR | VIS_FLAG_OPPONENT_ZONE_NEAR)) != 0U)
     {
         Pending_Opponent_Alert_Event = true;
@@ -153,6 +216,7 @@ bool Class_Rescue_Mission::On_Vision_State(const Struct_Vision_State &vis, uint3
 void Class_Rescue_Mission::On_Uart_Rx_Fault()
 {
     Vision_Invalidated_By_Rx_Fault = true;
+    Restart_Candidate_Count = 0U;
 }
 
 void Class_Rescue_Mission::Latch_Standstill_Boundary(const uint32_t motor_seq[2], const uint32_t motor_ms[2])
@@ -261,7 +325,7 @@ bool Class_Rescue_Mission::Consume_Pre_Match_Rx_Fence()
 
 bool Class_Rescue_Mission::Is_Vision_Fresh(uint32_t now_ms) const
 {
-    return Vision_Received && !Vision_Invalidated_By_Rx_Fault &&
+    return Vision_Received && !Vision_Invalidated_By_Rx_Fault && !Awaiting_Vision_Sequence_Base &&
            (uint32_t)(now_ms - Last_Vision_Ms) < Config.vision_timeout_ms;
 }
 
@@ -353,6 +417,26 @@ void Class_Rescue_Mission::Reset_Confirm_Streak()
     Confirm_Boundary_Accept_Id = Vision_Accept_Counter;
 }
 
+void Class_Rescue_Mission::Invalidate_Vision_Session()
+{
+    Restart_Candidate_Count = 0U;
+    Reset_Confirm_Streak();
+
+    // Even settled servos must re-advertise a new generation and wait for the camera to drain.
+    Pre_Match_Settled_Latched = false;
+    Pre_Match_Need_Post_Settle_Far = true;
+    Pre_Match_Settle_Gen = 0U;
+    Pre_Match_Settle_Accept_Id = Vision_Accept_Counter;
+    Gate_Close_Settled_Latched = false;
+    Gate_Close_Settle_Gen = 0U;
+    Gate_Open_Settled_Latched = false;
+    Gate_Open_Settle_Gen = 0U;
+    // Preserve continuity breaks even when a new frame arrives in the same UART drain.
+    Pending_Non_Near_View_Event = true;
+    Pending_Non_Far_View_Event = true;
+    Pending_Drop_Unconfirmed_Event = true;
+}
+
 void Class_Rescue_Mission::Enter_State(Enum_Mission_State next, uint32_t now_ms)
 {
     State = next;
@@ -366,7 +450,6 @@ void Class_Rescue_Mission::Enter_State(Enum_Mission_State next, uint32_t now_ms)
     Gate_Close_Settle_Gen = 0U;
     Gate_Open_Settled_Latched = false;
     Gate_Open_Settle_Gen = 0U;
-    Gate_Settled_Frame_Seq = 0U;
     Pre_Match_Settled_Latched = false;
     if (next != MISSION_PRE_MATCH)
     {
@@ -586,7 +669,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
     // the UART can never resume motion or VISION_FRESH until a newly accepted frame arrives.
     if (!in.uart_rx_healthy)
     {
-        Vision_Invalidated_By_Rx_Fault = true;
+        On_Uart_Rx_Fault();
     }
 
     if (Reverse_Motion_In_Flight && !Require_Standstill_Gate && !in.use_motor_feedback_seq &&
@@ -1324,7 +1407,6 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                 Gate_Close_Settled_Latched = true;
                 Gate_Settle_Last_Gen = static_cast<uint8_t>((Gate_Settle_Last_Gen % 3U) + 1U);
                 Gate_Close_Settle_Gen = Gate_Settle_Last_Gen;
-                Gate_Settled_Frame_Seq = Latest_Vision.frame_seq;
                 Reset_Confirm_Streak();
                 break;
             }
@@ -1519,7 +1601,6 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                 Gate_Closed_Cmd = false;
                 Sub_Phase = 1U;
                 Gate_Open_Settled_Latched = false;
-                Gate_Settled_Frame_Seq = Latest_Vision.frame_seq;
                 State_Enter_Ms = in.now_ms;
             }
         }
@@ -1565,8 +1646,8 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                 break;
             }
             // Continuously recheck latest NEAR frame for corral/sweep/path safety, exact cargo match,
-            // and half alignment while gate opens; at the settled edge record frame_seq and require a
-            // strictly later NEAR frame acknowledging open-and-settled telemetry before pushing.
+            // and half alignment while gate opens. After latching settle, require a newly accepted
+            // NEAR frame acknowledging this generation before pushing.
             if (!non_near_view_event && in.camera_settled && Latest_Vision.camera_view == CAMERA_VIEW_NEAR)
             {
                 const Enum_Corral_Verdict verdict = Validate_Corral(Latest_Vision);
@@ -1611,13 +1692,11 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                     Gate_Open_Settled_Latched = true;
                     Gate_Settle_Last_Gen = static_cast<uint8_t>((Gate_Settle_Last_Gen % 3U) + 1U);
                     Gate_Open_Settle_Gen = Gate_Settle_Last_Gen;
-                    Gate_Settled_Frame_Seq = Latest_Vision.frame_seq;
+                    Gate_Open_Settle_Accept_Id = Vision_Accept_Counter;
                 }
                 else
                 {
-                    const uint16_t seq_delta =
-                        static_cast<uint16_t>(Latest_Vision.frame_seq - Gate_Settled_Frame_Seq);
-                    const bool post_settle_frame = (seq_delta >= 1U && seq_delta < 0x8000U);
+                    const bool post_settle_frame = Vision_Accept_Counter != Gate_Open_Settle_Accept_Id;
                     const uint8_t vis_open_gen = static_cast<uint8_t>(
                         (Latest_Vision.flags & VIS_FLAG_SETTLE_GEN_MASK) >> VIS_FLAG_SETTLE_GEN_SHIFT);
                     const bool open_settled_ack = (Latest_Vision.flags & VIS_FLAG_GATE_OPEN_SETTLED_ACK) != 0U &&

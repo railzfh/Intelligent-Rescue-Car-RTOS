@@ -49,7 +49,7 @@ struct Struct_Mission_Config
     uint32_t match_duration_ms = 180000U;      // 3-minute competition round
     uint32_t vision_timeout_ms = 300U;         // Vision freshness window
     uint32_t vision_abort_ms = 4000U;          // Sustained vision outage -> fault stop (< 15 s DQ)
-    uint32_t camera_restart_resync_ms = 1000U; // Minimum outage before accepting seq restart from 0..5
+    uint32_t camera_restart_resync_ms = 1000U; // Outage before considering a delayed startup sequence
     uint32_t heartbeat_timeout_ms = 1000U;     // Link liveness window (never refreshes vision)
     uint32_t visual_stall_ms = 800U;           // Track-slip visual stall window (< 15 s DQ)
     uint32_t progress_watchdog_ms = 10000U;    // Cumulative no-progress fault limit (< 15 s DQ)
@@ -164,6 +164,8 @@ public:
 private:
     void Enter_State(Enum_Mission_State next, uint32_t now_ms);
     void Reset_Confirm_Streak();
+    bool Accept_Vision_Sequence(uint16_t seq, uint32_t now_ms);
+    void Invalidate_Vision_Session();
     void Clear_Cargo();
     void Record_Progress(uint32_t now_ms, bool reset_escapes);
     float Available_Reverse_M(bool vision_fresh, bool rear_sensor_clear,
@@ -195,11 +197,16 @@ private:
 
     bool Heartbeat_Received = false;
     uint32_t Last_Heartbeat_Ms = 0U;
+    uint32_t Last_Heartbeat_Vision_Uptime_Ms = 0U;
 
     bool Vision_Received = false;
     uint16_t Last_Vision_Frame_Seq = 0U;
     uint32_t Last_Vision_Ms = 0U;
     uint32_t Vision_Accept_Counter = 0U;
+    bool Awaiting_Vision_Sequence_Base = false;
+    uint16_t Restart_Candidate_Seq = 0U;
+    uint8_t Restart_Candidate_Count = 0U;
+    uint32_t Restart_Candidate_Ms = 0U;
     Struct_Vision_State Latest_Vision = {};
 
     bool Vision_Outage_Active = false;
@@ -251,7 +258,7 @@ private:
     bool Gate_Open_Settled_Latched = false;
     uint8_t Gate_Open_Settle_Gen = 0U;
     uint8_t Gate_Settle_Last_Gen = 0U;
-    uint16_t Gate_Settled_Frame_Seq = 0U;
+    uint32_t Gate_Open_Settle_Accept_Id = 0U;
     bool Reverse_Motion_In_Flight = false;
     bool Require_Standstill_Gate = false;
     bool Standstill_Boundary_Pending = false;

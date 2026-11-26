@@ -69,16 +69,20 @@ static void Test_Freshness_Nonconsecutive_Replay_Wrap_And_Restart()
     assert(mission.Is_Link_Alive(110U));
     assert(!mission.Is_Vision_Fresh(110U));
 
-    // Forward seq accepted; immediate duplicate or backwards replay (1 after 2) MUST be rejected!
-    assert(mission.On_Vision_State(Make_Far_Vision(1U, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), 120U));
-    assert(mission.On_Vision_State(Make_Far_Vision(2U, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), 170U));
-    assert(!mission.On_Vision_State(Make_Far_Vision(2U, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), 220U));
+    // Forward seq accepted; duplicate or isolated backwards replay never refreshes vision.
+    assert(mission.On_Vision_State(Make_Far_Vision(300U, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), 120U));
+    assert(mission.On_Vision_State(Make_Far_Vision(301U, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), 170U));
+    assert(!mission.On_Vision_State(Make_Far_Vision(301U, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), 220U));
     assert(!mission.On_Vision_State(Make_Far_Vision(1U, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), 270U));
     assert(!mission.Is_Vision_Fresh(480U));
 
-    // Explicit camera restart resync after >= 1000 ms outage accepts rebooted seq=1.
-    assert(mission.On_Vision_State(Make_Far_Vision(1U, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), 1300U));
-    assert(mission.Is_Vision_Fresh(1350U));
+    // Even after a long outage, a duplicate or one backwards frame must not rebase the session.
+    assert(!mission.On_Vision_State(Make_Far_Vision(301U, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), 1250U));
+    assert(!mission.On_Vision_State(Make_Far_Vision(1U, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), 1300U));
+    assert(!mission.On_Vision_State(Make_Far_Vision(2U, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), 1350U));
+    assert(!mission.Is_Vision_Fresh(1350U));
+    assert(mission.On_Vision_State(Make_Far_Vision(3U, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), 1400U));
+    assert(mission.Is_Vision_Fresh(1400U));
 
     // 16-bit wraparound (65535 -> 0 -> 1) works cleanly.
     Class_Rescue_Mission wrap_m;
@@ -87,14 +91,80 @@ static void Test_Freshness_Nonconsecutive_Replay_Wrap_And_Restart()
     assert(wrap_m.On_Vision_State(Make_Far_Vision(1U, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), 200U));
     assert(!wrap_m.On_Vision_State(Make_Far_Vision(65535U, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), 250U));
 
-    // Launch locks config and blocks bench overrides.
-    in.now_ms = 1350U;
+    // A new generation is required after resync, and old ACKs do not authorize launch.
+    in.now_ms = 1400U;
     in.button_pressed = true;
+    out = mission.Update(in);
+    assert(mission.Get_State() == MISSION_PRE_MATCH);
+    assert(out.launch_rejected_cue);
+    const uint8_t post_resync_gen = mission.Get_Pre_Match_Settle_Gen();
+    assert(post_resync_gen == 2U);
+    assert(mission.Consume_Pre_Match_Rx_Fence());
+    assert(mission.On_Vision_State(
+        Make_Far_Vision(4U, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), 1450U));
+    in.now_ms = 1450U;
+    assert(mission.Update(in).launch_rejected_cue);
+    assert(mission.On_Vision_State(
+        Make_Far_Vision(5U, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 0, 600U, post_resync_gen), 1500U));
+    in.now_ms = 1500U;
     out = mission.Update(in);
     assert(mission.Get_State() == MISSION_LAUNCH_CROSS_BUMPS);
     assert(mission.Is_Config_Locked());
     assert(!mission.On_Set_Config({RESCUE_TEAM_BLUE, 1U, RESCUE_MODE_COMPETITION, 3U}));
     assert(!mission.On_Bench_Actuator({BENCH_SERVO_POS_B, BENCH_SERVO_POS_B, 0U}));
+}
+
+static void Test_Vision_Restart_Evidence()
+{
+    auto far = [](uint16_t seq) { return Make_Far_Vision(seq, TARGET_NONE, 0U); };
+
+    // Buffered, duplicated, out-of-order and expired candidates do not prove a live restart.
+    Class_Rescue_Mission replay;
+    assert(replay.On_Vision_State(far(500U), 1000U));
+    assert(!replay.On_Vision_State(far(1U), 1050U));
+    assert(!replay.On_Vision_State(far(2U), 1100U));
+    assert(!replay.On_Vision_State(far(3U), 1101U));
+    assert(!replay.On_Vision_State(far(1U), 1200U));
+    assert(!replay.On_Vision_State(far(2U), 1200U));
+    assert(!replay.On_Vision_State(far(3U), 1202U));
+    assert(!replay.On_Vision_State(far(4U), 1203U));
+    assert(!replay.On_Vision_State(far(3U), 1250U));
+    assert(!replay.On_Vision_State(far(2U), 1300U));
+    assert(!replay.On_Vision_State(far(3U), 1350U));
+    assert(!replay.On_Vision_State(far(6U), 1700U));
+    assert(!replay.Is_Vision_Fresh(1700U));
+    assert(replay.On_Vision_State(far(501U), 1750U));
+
+    // Natural uptime wrap is not a restart; a real regression allows an arbitrary new frame sequence.
+    Class_Rescue_Mission heartbeat;
+    heartbeat.On_Heartbeat({0xFFFFFFF0U, 1U, 0U, 0U}, 1000U);
+    assert(heartbeat.On_Vision_State(far(500U), 1000U));
+    heartbeat.On_Heartbeat({100U, 1U, 0U, 0U}, 1120U);
+    assert(heartbeat.Is_Vision_Fresh(1120U));
+    assert(!heartbeat.On_Vision_State(far(20U), 1120U));
+    heartbeat.On_Heartbeat({20U, 1U, 0U, 0U}, 1200U);
+    assert(!heartbeat.Is_Vision_Fresh(1200U));
+    assert(heartbeat.On_Vision_State(far(20U), 1200U));
+    assert(!heartbeat.On_Vision_State(far(20U), 1250U));
+    assert(!heartbeat.On_Vision_State(far(19U), 1300U));
+    assert(heartbeat.On_Vision_State(far(21U), 1350U));
+
+    // Allow a delayed startup after a long outage, but not a replay of mature sequence numbers.
+    Class_Rescue_Mission late;
+    assert(late.On_Vision_State(far(500U), 1000U));
+    assert(!late.On_Vision_State(far(400U), 2000U));
+    assert(!late.On_Vision_State(far(401U), 2050U));
+    assert(!late.On_Vision_State(far(402U), 2100U));
+    assert(!late.On_Vision_State(far(20U), 2150U));
+    assert(!late.On_Vision_State(far(21U), 2200U));
+    assert(late.On_Vision_State(far(22U), 2250U));
+
+    // A jump to startup after a quiet gap can look forward modulo uint16.
+    Class_Rescue_Mission near_wrap;
+    assert(near_wrap.On_Vision_State(far(65500U), 1000U));
+    assert(!near_wrap.On_Vision_State(far(1U), 1200U));
+    assert(!near_wrap.On_Vision_State(far(2U), 1250U));
+    assert(near_wrap.On_Vision_State(far(3U), 1300U));
 }
 
 static void Test_Stale_Vision_And_Opponent_Interlock_During_Moving_States()
@@ -424,7 +494,7 @@ static void Test_Full_First_Green_Delivery_And_Proven_Rear_Corridor()
         out = mission.Update(in);
     }
     assert(!out.gate_closed);
-    // Settled edge tick: latches Gate_Settled_Frame_Seq without starting push on pre-settle frame!
+    // Settled edge tick: record the observation boundary without pushing on a pre-settle frame.
     in.now_ms = (t += 50U);
     out = mission.Update(in);
     assert(out.drive_action == DRIVE_ACTION_SOFT_STOP);
@@ -1524,7 +1594,7 @@ static void Test_Round12_Push_Same_Drain_Standstill_Bench_Leave_And_Interrupted_
         {
             assert(m.On_Vision_State(Make_Near_Vision(seq++, g, 0U, 0U, 0U, 0U, flags), t));
         }
-        void to_inspect()
+        void to_search()
         {
             assert(m.On_Set_Config({RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION, 1U}));
             in.hardware_ready = in.can_launch = in.wheels_still = in.gate_settled = in.camera_settled = true;
@@ -1535,6 +1605,11 @@ static void Test_Round12_Push_Same_Drain_Standstill_Bench_Leave_And_Interrupted_
             in.chassis_motion_done = true;
             tick();
             in.chassis_motion_done = false;
+            assert(m.Get_State() == MISSION_SEARCH_TARGET);
+        }
+        void to_inspect()
+        {
+            to_search();
             tick();
             tick();
             assert(m.Get_State() == MISSION_INSPECT_CORRAL);
@@ -1996,11 +2071,104 @@ static void Test_Round12_Push_Same_Drain_Standstill_Bench_Leave_And_Interrupted_
         h.tick();
         assert(h.m.Get_State() == MISSION_FIND_HOME);
     }
+
+    // 8. A 200 ms camera restart at 20 Hz without a heartbeat recovers before the outage fault.
+    {
+        Harness h;
+        h.seq = 500U;
+        h.to_search();
+        h.far(TARGET_NONE, 0U, 0U);
+        h.t += 200U;
+        for (uint16_t seq = 1U; seq <= 90U; ++seq)
+        {
+            assert(h.m.On_Vision_State(Make_Far_Vision(seq, TARGET_NONE, 0U), h.t) == (seq >= 3U));
+            h.tick(0U);
+            assert(h.m.Get_State() == MISSION_SEARCH_TARGET);
+            h.t += 50U;
+        }
+        assert(h.m.Is_Vision_Fresh(h.t));
+    }
+
+    // 9. Resync during close discards an incomplete confirmation streak and the old generation.
+    {
+        Harness h;
+        h.seq = 500U;
+        h.to_inspect();
+        for (unsigned i = 0; i < 3U; ++i)
+        {
+            h.near(1U, safe);
+            h.tick();
+        }
+        assert(h.m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
+        h.tick();
+        const uint8_t old_gen = h.m.Get_Gate_Close_Settle_Gen();
+        assert(old_gen != 0U);
+        const uint16_t old_ack = safe | Settle_Gen_Flag(old_gen);
+        for (unsigned i = 0; i < 2U; ++i)
+        {
+            h.near(1U, old_ack);
+            h.tick();
+        }
+        h.t += 200U;
+        for (uint16_t seq = 1U; seq <= 3U; ++seq)
+        {
+            assert(h.m.On_Vision_State(Make_Near_Vision(seq, 1U, 0U, 0U, 0U, 0U, old_ack), h.t) == (seq == 3U));
+            h.tick(50U);
+        }
+        assert(h.m.Get_Gate_Close_Settle_Gen() == 0U);
+        h.seq = 4U;
+        h.near(1U, old_ack);
+        h.tick();
+        const uint8_t new_gen = h.m.Get_Gate_Close_Settle_Gen();
+        assert(new_gen != 0U && new_gen != old_gen);
+        for (unsigned i = 0; i < 5U; ++i)
+        {
+            h.near(1U, i < 3U ? old_ack : safe | Settle_Gen_Flag(new_gen));
+            assert(h.tick().gate_closed);
+            assert(h.m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
+        }
+        h.near(1U, safe | Settle_Gen_Flag(new_gen));
+        h.tick();
+        assert(h.m.Get_State() == MISSION_FIND_HOME);
+    }
+
+    // 10. A heartbeat and the first new-session frame in the same drain still fence open-gate ACKs.
+    {
+        Harness h;
+        h.seq = 500U;
+        h.to_opening();
+        h.near(1U, aligned);
+        h.tick();
+        const uint8_t old_gen = h.m.Get_Gate_Open_Settle_Gen();
+        assert(old_gen != 0U);
+        h.m.On_Heartbeat({4000U, 1U, 1U, 0U}, h.t);
+        h.t += 50U;
+        h.m.On_Heartbeat({20U, 1U, 1U, 0U}, h.t);
+        assert(h.m.Get_Gate_Open_Settle_Gen() == 0U);
+        const uint16_t old_ack = aligned | VIS_FLAG_GATE_OPEN_SETTLED_ACK | Settle_Gen_Flag(old_gen);
+        h.seq = 1U;
+        h.near(1U, old_ack);
+        assert(h.tick().drive_action == DRIVE_ACTION_SOFT_STOP);
+        h.near(1U, aligned);
+        assert(h.tick().drive_action == DRIVE_ACTION_SOFT_STOP);
+        const uint8_t new_gen = h.m.Get_Gate_Open_Settle_Gen();
+        assert(new_gen != 0U && new_gen != old_gen);
+        h.near(1U, old_ack);
+        assert(h.tick().drive_action == DRIVE_ACTION_SOFT_STOP);
+        // A generation match on a duplicate cannot satisfy the post-settle observation.
+        const uint16_t new_ack = aligned | VIS_FLAG_GATE_OPEN_SETTLED_ACK | Settle_Gen_Flag(new_gen);
+        assert(!h.m.On_Vision_State(Make_Near_Vision(3U, 1U, 0U, 0U, 0U, 0U, new_ack), h.t));
+        assert(h.tick().drive_action == DRIVE_ACTION_SOFT_STOP);
+        h.near(1U, new_ack);
+        const auto out = h.tick();
+        assert(out.drive_action == DRIVE_ACTION_START_DISTANCE && out.distance_m > 0.0f);
+    }
 }
 
 int main()
 {
     Test_Freshness_Nonconsecutive_Replay_Wrap_And_Restart();
+    Test_Vision_Restart_Evidence();
     Test_Stale_Vision_And_Opponent_Interlock_During_Moving_States();
     Test_Cyan_Interrupts_Unsettled_Gate_Closure();
     Test_Full_First_Green_Delivery_And_Proven_Rear_Corridor();
@@ -2012,6 +2180,6 @@ int main()
     Test_Braking_Phase_Vision_Outage_And_Uart_Rx_Unhealthy();
     Test_Drop_Verify_Requires_Consecutive_Near_Frames();
     Test_Round12_Push_Same_Drain_Standstill_Bench_Leave_And_Interrupted_Drop();
-    std::puts("PASS: rescue mission replay/wrap, stale/opponent interlock, gate/push hazard abort, margin reverse + standstill, braking outage gate, drop consecutive confirm, R12 safety invariants, bounded recovery");
+    std::puts("PASS: rescue mission restart/settle, replay/wrap, stale/opponent interlock, gate/push hazard abort, margin reverse + standstill, braking outage gate, drop consecutive confirm, R12 safety invariants, bounded recovery");
     return 0;
 }
