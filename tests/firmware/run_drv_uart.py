@@ -262,6 +262,7 @@ int main() {
     assert((hdmarx.disabled_it_mask & DMA_IT_HT) != 0U);
     assert(UART_Is_Rx_Healthy(&huart1));
     assert(!UART_Is_Rx_Fault_Latched(&huart1));
+    assert(UART_Get_Rx_Epoch(&huart1) == 0U);
 
     // 1. Mid-transfer HT event ignored; IDLE delivers Rx_Buffer_0 cleanly.
     std::memset(UART1_Manage_Object.Rx_Buffer_0, 0x5A, 300U);
@@ -277,10 +278,14 @@ int main() {
     // 2. Bundled HAL TX DMA error leaves hdmarx BUSY while setting RxState=READY -> task context recovers.
     uint8_t tx_dummy[4] = {1, 2, 3, 4};
     UART_Transmit_Data(&huart1, tx_dummy, 4U);
+    const uint32_t epoch0 = UART_Get_Rx_Epoch(&huart1);
     Simulate_Bundled_HAL_Tx_DMA_Error(&huart1);
     assert(!UART_Is_Rx_Healthy(&huart1));
+    assert(UART_Get_Rx_Epoch(&huart1) > epoch0);
+    const uint32_t epoch1 = UART_Get_Rx_Epoch(&huart1);
     assert(UART1_Manage_Object.Rx_Recovery_Pending && huart1.arm_failures == 0U);
     assert(UART_Service_Rx_Recovery(&huart1));
+    assert(UART_Get_Rx_Epoch(&huart1) > epoch1);
     assert(UART_Is_Rx_Healthy(&huart1));
     assert(huart1.RxState == HAL_UART_STATE_BUSY_RX && hdmarx.State == HAL_DMA_STATE_BUSY);
     assert(!UART_Is_Rx_Fault_Latched(&huart1));

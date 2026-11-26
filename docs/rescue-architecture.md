@@ -47,7 +47,7 @@
 
 | 任务 | 优先级 / 周期 | 职责 |
 | --- | --- | --- |
-| `controlTask` | `High` / `1 ms` | ADC 超时与供电联锁、非阻塞查询 `USART1` RX 健康状态（异常立即抑制运动）、消费 `USART1` 无锁字节环缓冲并解析帧、按键消抖、任务状态机与底盘差速/定距/定角/堵转控制、电池校验通过后启动双舵机并执行 1 ms 缓动插补、双路 CAN 发送、遥测快照发布、喂 IWDG |
+| `controlTask` | `High` / `1 ms` | ADC 超时与供电联锁、非阻塞查询 `USART1` RX 健康与恢复纪元（异常或跨周期恢复时清空旧环缓冲/复位协议解析器/失效故障前缓存视觉并立即抑制运动）、消费 `USART1` 无锁字节环缓冲并解析帧、按键消抖、任务状态机与底盘差速/定距/定角/堵转控制（倒车停机联锁要求左右双电机在停机请求后各自回报新 CAN 静止样本才释放）、电池校验通过后启动双舵机并执行 1 ms 缓动插补、双路 CAN 发送、遥测快照发布、喂 IWDG |
 | `imuTask` | `AboveNormal` / `1 ms` | `BMI088` 静止校准、SPI2 采样、EKF 姿态与相对航向发布 |
 | `statusTask` | `Normal` / `10 ms` | 初始化 USB CDC、10 ms 刷新 WS2812 灯光、执行 `USART1` RX DMA 阻塞恢复（含 `HAL_DMA_STATE_ERROR` 显式 DeInit/Init 与上限锁存）、每 50 ms（`20 Hz`）在 `huart1` DMA 空闲时发送遥测帧（静态缓冲区） |
 | 硬件中断 | 抢占优先级 `5` | CAN 接收解码、ADC DMA 半缓冲处理、`USART1` DMA-to-Idle 接收并将字节快速压入无锁环缓冲、TIM5 时间戳溢出 |
@@ -76,9 +76,10 @@
    - `frame_seq(u16)`：相机单调递增帧号（16 位回绕安全）；**重复或倒退的旧 `frame_seq` 绝不刷新视觉新鲜度**（仅在视觉真实断联 `>= 1000 ms` 后允许相机重启从 `0..5` 重新同步）。
    - `camera_view(u8)`：`0=TRANSITION`, `1=FAR`, `2=NEAR`；舵机切换期间 STM32 强制丢弃不匹配视角的观测。
    - `target_type(u8)`：`0=NONE`, `1=GREEN`, `2=BLACK`, `3=ORANGE`, `4=CYAN`。
-   - `flags(u16)`：位掩码涵盖目标有效（bit 0）、本方区有效（bit 1）、半区匹配（bit 2）、紫坡可见（bit 3）、框内无危险块（bit 4）、右杆扫掠区清空（bit 5）、卸货完整入区确认（bit 6）、对手临近（bit 7）、对方安全区临近（bit 8）、后方清空（bit 9）、视觉停滞打滑（bit 10）、推进路径与目标区清空（`VIS_FLAG_DROP_PATH_CLEAR`，bit 11）、开杆到位遥测回执（`VIS_FLAG_GATE_OPEN_SETTLED_ACK`，bit 12）。
-     - `VIS_FLAG_DROP_PATH_CLEAR`：确认本方区、关联紫坡、卸货区及前向推进走廊内无浅蓝危险块或未知前景，且推进前紫坡/中线无存量压线物块。
-     - `VIS_FLAG_GATE_OPEN_SETTLED_ACK`：**证明内容**：MaixCAM 已收到 MCU 遥测 `TEL_FLAG_GATE_CLOSED=0 && TEL_FLAG_GATE_SETTLED=1`，且当前冻结的本趟基线无危险/无压线/货型与开杆前完全一致；MCU 另在 `gate_settled` 上升沿锁存 `Gate_Settled_Frame_Seq`，仅接受严格晚于该帧号且携带该 ACK 的近视帧才启动推进。**失效条件**：任一危险/未知物出现、货型变化、进入显式推进态（`TEL_FLAG_DROP_PUSHING`）、关杆/未到位、切回远视、离开卸货状态或超过 `vision_timeout_ms (300 ms)` 即刻失效。
+   - `flags(u16)`：位掩码涵盖目标有效（bit 0）、本方区有效（bit 1）、半区匹配（bit 2）、紫坡可见（bit 3）、框内无危险块（bit 4）、右杆扫掠区清空（bit 5）、卸货完整入区确认（bit 6）、对手临近（bit 7）、对方安全区临近（bit 8）、后方清空（bit 9）、视觉停滞打滑（bit 10）、推进路径无危险/未知物（`VIS_FLAG_DROP_PATH_CLEAR`，bit 11）、开杆到位遥测回执（`VIS_FLAG_GATE_OPEN_SETTLED_ACK`，bit 12）、卸货前基线就绪（`VIS_FLAG_DROP_BASELINE_READY`，bit 13）。
+     - `VIS_FLAG_DROP_PATH_CLEAR`：连续路径安全标志，确认本方区、关联紫坡、卸货区及前向推进走廊内无浅蓝危险块或未知前景；推进中自有合法货块移出围框边界不会误清该位，延迟的 `TEL_FLAG_DROP_PUSHING` 遥测不会误中止正常推进，但任一浅蓝/未知物出现即刻清零停机。
+     - `VIS_FLAG_DROP_BASELINE_READY`：推进前基线授权标志，要求未进入显式推进态、本趟基线已清洁锁定且紫坡/中线无存量压线物块、当前框内货型与基线一致且路径无危险；MCU 在 `MISSION_DROP_OPEN_AND_PUSH` 的关杆核验与开杆等待阶段同时校验该位与 `VIS_FLAG_DROP_PATH_CLEAR`。
+     - `VIS_FLAG_GATE_OPEN_SETTLED_ACK`：**证明内容**：MaixCAM 已收到 MCU 遥测 `TEL_FLAG_GATE_CLOSED=0 && TEL_FLAG_GATE_SETTLED=1`，且 `VIS_FLAG_DROP_BASELINE_READY` 为真；MCU 另在 `gate_settled` 上升沿锁存 `Gate_Settled_Frame_Seq`，仅接受严格晚于该帧号且携带该 ACK 的近视帧才启动推进。**失效条件**：任一危险/未知物出现、货型变化、进入显式推进态（`TEL_FLAG_DROP_PUSHING`）、关杆/未到位、切回远视、离开卸货状态或超过 `vision_timeout_ms (300 ms)` 即刻失效。
    - `target_err_x_mrad(i16)`、`target_dist_mm(u16)`、`home_err_x_mrad(i16)`、`home_dist_mm(u16)`（左偏为正，与车体 `+omega` 左转一致）。
    - `corral_{green,black,orange,cyan,unknown}_cnt(u8 × 5)`、`confidence(u8: 0..100)`。
    - **超时保护**：视觉有效超时默认 `300 ms`，超时即降速/停车，禁止盲跑。

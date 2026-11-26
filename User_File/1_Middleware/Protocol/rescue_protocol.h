@@ -72,6 +72,7 @@ static constexpr uint16_t VIS_FLAG_REAR_CLEAR = (1U << 9);
 static constexpr uint16_t VIS_FLAG_MOTION_STALLED = (1U << 10);
 static constexpr uint16_t VIS_FLAG_DROP_PATH_CLEAR = (1U << 11);
 static constexpr uint16_t VIS_FLAG_GATE_OPEN_SETTLED_ACK = (1U << 12);
+static constexpr uint16_t VIS_FLAG_DROP_BASELINE_READY = (1U << 13);
 
 // Bitmask for Struct_Rescue_Telemetry::status_flags
 static constexpr uint16_t TEL_FLAG_CONFIG_LOCKED = (1U << 0);

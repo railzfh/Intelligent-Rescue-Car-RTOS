@@ -56,6 +56,7 @@ struct Struct_UART_Manage_Object
     // 中断上下文检测到 RX 停止或重装失败后，交由任务上下文终止旧 DMA 流并重装。
     volatile bool Rx_Recovery_Pending;
     volatile bool Rx_Recovery_Fault_Latched;
+    volatile uint32_t Rx_Recovery_Epoch;
     uint8_t Rx_Recovery_Fail_Count;
 };
 
@@ -85,6 +86,8 @@ bool UART_Service_Rx_Recovery(UART_HandleTypeDef *huart);
 bool UART_Is_Rx_Healthy(UART_HandleTypeDef *huart);
 
 bool UART_Is_Rx_Fault_Latched(UART_HandleTypeDef *huart);
+
+uint32_t UART_Get_Rx_Epoch(UART_HandleTypeDef *huart);
 
 uint8_t UART_Transmit_Data(UART_HandleTypeDef *huart, uint8_t *Data, uint16_t Length);
 

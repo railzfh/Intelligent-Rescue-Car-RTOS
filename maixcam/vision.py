@@ -24,6 +24,7 @@ from .protocol import (
     TEAM_BLUE,
     TEAM_RED,
     VIS_FLAG_CORRAL_SAFE,
+    VIS_FLAG_DROP_BASELINE_READY,
     VIS_FLAG_DROP_CONFIRMED,
     VIS_FLAG_DROP_PATH_CLEAR,
     VIS_FLAG_GATE_OPEN_SETTLED_ACK,
@@ -894,21 +895,25 @@ class RescueVisionProcessor:
             corral_empty = (
                 green_cnt == 0 and black_cnt == 0 and orange_cnt == 0 and cyan_cnt == 0 and unknown_cnt == 0
             )
-            # Before pushing (not in explicit MCU push phase), require zero preexisting ramp/divider
-            # blocks and a valid frozen baseline; during explicit push phase, allow own cargo to cross
-            # the ramp while still immediately inhibiting on any cyan hazard or unknown obstruction.
-            if drop_path_hazards_clear and (drop_pushing or corral_empty or (baseline_ok and mis_cnt == (0, 0, 0))):
+            # Separate continuous push-path hazard clearance (VIS_FLAG_DROP_PATH_CLEAR) from pre-push
+            # baseline authorization (VIS_FLAG_DROP_BASELINE_READY / VIS_FLAG_GATE_OPEN_SETTLED_ACK):
+            # - Delayed TEL_FLAG_DROP_PUSHING telemetry can NEVER abort a clean push as own cargo exits
+            #   the corral onto the ramp.
+            # - Any cyan hazard or unknown obstruction STILL clears VIS_FLAG_DROP_PATH_CLEAR immediately.
+            if drop_path_hazards_clear:
                 flags |= VIS_FLAG_DROP_PATH_CLEAR
 
-            if (
-                gate_closed is False
-                and gate_settled is True
-                and not drop_pushing
+            baseline_ready = (
+                not drop_pushing
                 and baseline_ok
                 and corral_safe
                 and drop_path_hazards_clear
                 and mis_cnt == (0, 0, 0)
-            ):
+            )
+            if baseline_ready:
+                flags |= VIS_FLAG_DROP_BASELINE_READY
+
+            if gate_closed is False and gate_settled is True and baseline_ready:
                 flags |= VIS_FLAG_GATE_OPEN_SETTLED_ACK
 
             if self._verify_drop_inside_correct_half(
@@ -994,97 +999,69 @@ def _filter_opponent_excluding_floor(
         oh = max_y - min_y + 1
         return Blob("opponent", min_x, min_y, ow, oh, non_floor_opp, non_floor_opp / float(ow * oh))
 
-    # Tier 2: Real MaixPy Image binary() union with tight opponent-minus-floor bounds!
-    # Recompute position strictly from non-floor components that contain opponent pixels so
-    # overlapping floor LAB bands never inflate opponent bounds (e.g. y2=240 on a distant robot).
+    # Tier 2: Real MaixPy Image single-crop unique (opponent \ floor) count + exact binary-search bounds!
+    # Evaluating floor_mask and both_mask ONCE on the candidate crop guarantees every pixel is counted
+    # at most once (even when an opponent lies inside an unrelated non-floor ring) and derives exact
+    # tight bounds strictly from (opponent \ floor).
     if hasattr(img, "crop") and hasattr(img, "binary"):
-        non_floor_comps = img.find_blobs(
-            [tuple(floor_thresh)],
-            roi=(bx, by, bw, bh),
-            pixels_threshold=1,
-            area_threshold=1,
-            invert=True,
-            merge=False,
-        )
-        if not non_floor_comps:
-            return None
         white = [(50, 100, -128, 127, -128, 127)]
-        total_opp_px = 0
-        min_x, min_y = bx + bw, by + bh
-        max_x, max_y = bx, by
-        for nf in non_floor_comps:
-            nx, ny, nw, nh = int(nf.x()), int(nf.y()), max(1, int(nf.w())), max(1, int(nf.h()))
-            sub = img.crop(nx, ny, nw, nh)
-            floor_mask = sub.binary([list(floor_thresh)], invert=False, copy=True)
-            both_mask = sub.binary([list(floor_thresh), list(opp_thresh)], invert=False, copy=True)
+        sub = img.crop(bx, by, bw, bh)
+        floor_mask = sub.binary([list(floor_thresh)], invert=False, copy=True)
+        both_mask = sub.binary([list(floor_thresh), list(opp_thresh)], invert=False, copy=True)
 
-            def _opp_minus_floor_px(rx: int, ry: int, rw: int, rh: int) -> int:
-                if rw <= 0 or rh <= 0:
-                    return 0
-                r = (rx, ry, rw, rh)
-                f_px = sum(int(b.pixels()) for b in floor_mask.find_blobs(white, roi=r, pixels_threshold=1, area_threshold=1, merge=True))
-                b_px = sum(int(b.pixels()) for b in both_mask.find_blobs(white, roi=r, pixels_threshold=1, area_threshold=1, merge=True))
-                return max(0, b_px - f_px)
+        def _opp_minus_floor_px(rx: int, ry: int, rw: int, rh: int) -> int:
+            if rw <= 0 or rh <= 0:
+                return 0
+            r = (rx, ry, rw, rh)
+            f_px = sum(int(b.pixels()) for b in floor_mask.find_blobs(white, roi=r, pixels_threshold=1, area_threshold=1, merge=True))
+            b_px = sum(int(b.pixels()) for b in both_mask.find_blobs(white, roi=r, pixels_threshold=1, area_threshold=1, merge=True))
+            return max(0, b_px - f_px)
 
-            floor_px = sum(int(b.pixels()) for b in floor_mask.find_blobs(white, pixels_threshold=1, area_threshold=1, merge=True))
-            both_px = sum(int(b.pixels()) for b in both_mask.find_blobs(white, pixels_threshold=1, area_threshold=1, merge=True))
-            nf_opp_px = max(0, both_px - floor_px)
-            if nf_opp_px <= 0:
-                continue
-            total_opp_px += nf_opp_px
-            if nf_opp_px == max(0, nw * nh - floor_px):
-                # Fast path: every non-floor pixel in sub belongs to opponent \ floor.
-                ox1, oy1, ox2, oy2 = nx, ny, nx + nw, ny + nh
-            else:
-                # Exact binary search for tight bounds of (opponent \ floor) inside sub even when
-                # another non-floor object touches the opponent component!
-                lo, hi = 0, nh - 1
-                while lo < hi:
-                    mid = (lo + hi) // 2
-                    if _opp_minus_floor_px(0, 0, nw, mid + 1) > 0:
-                        hi = mid
-                    else:
-                        lo = mid + 1
-                ty1 = lo
-                lo, hi = ty1 + 1, nh
-                while lo < hi:
-                    mid = (lo + hi) // 2
-                    if _opp_minus_floor_px(0, ty1, nw, mid - ty1) >= nf_opp_px:
-                        hi = mid
-                    else:
-                        lo = mid + 1
-                ty2 = lo
-                th = max(1, ty2 - ty1)
-                lo, hi = 0, nw - 1
-                while lo < hi:
-                    mid = (lo + hi) // 2
-                    if _opp_minus_floor_px(0, ty1, mid + 1, th) > 0:
-                        hi = mid
-                    else:
-                        lo = mid + 1
-                tx1 = lo
-                lo, hi = tx1 + 1, nw
-                while lo < hi:
-                    mid = (lo + hi) // 2
-                    if _opp_minus_floor_px(tx1, ty1, mid - tx1, th) >= nf_opp_px:
-                        hi = mid
-                    else:
-                        lo = mid + 1
-                tx2 = lo
-                ox1, oy1, ox2, oy2 = nx + tx1, ny + ty1, nx + tx2, ny + ty2
-            if ox1 < min_x:
-                min_x = ox1
-            if oy1 < min_y:
-                min_y = oy1
-            if ox2 > max_x:
-                max_x = ox2
-            if oy2 > max_y:
-                max_y = oy2
-        if total_opp_px < cfg.min_opponent_pixels or max_x <= min_x or max_y <= min_y:
+        floor_px = sum(int(b.pixels()) for b in floor_mask.find_blobs(white, pixels_threshold=1, area_threshold=1, merge=True))
+        both_px = sum(int(b.pixels()) for b in both_mask.find_blobs(white, pixels_threshold=1, area_threshold=1, merge=True))
+        total_opp_px = max(0, both_px - floor_px)
+        if total_opp_px < cfg.min_opponent_pixels:
             return None
-        ow = max_x - min_x
-        oh = max_y - min_y
-        return Blob("opponent", min_x, min_y, ow, oh, total_opp_px, min(1.0, total_opp_px / float(ow * oh)))
+        if floor_px == 0 and both_px == bw * bh:
+            ox1, oy1, ox2, oy2 = bx, by, bx + bw, by + bh
+        else:
+            lo, hi = 0, bh - 1
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if _opp_minus_floor_px(0, 0, bw, mid + 1) > 0:
+                    hi = mid
+                else:
+                    lo = mid + 1
+            ty1 = lo
+            lo, hi = ty1 + 1, bh
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if _opp_minus_floor_px(0, ty1, bw, mid - ty1) >= total_opp_px:
+                    hi = mid
+                else:
+                    lo = mid + 1
+            ty2 = lo
+            th = max(1, ty2 - ty1)
+            lo, hi = 0, bw - 1
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if _opp_minus_floor_px(0, ty1, mid + 1, th) > 0:
+                    hi = mid
+                else:
+                    lo = mid + 1
+            tx1 = lo
+            lo, hi = tx1 + 1, bw
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if _opp_minus_floor_px(tx1, ty1, mid - tx1, th) >= total_opp_px:
+                    hi = mid
+                else:
+                    lo = mid + 1
+            tx2 = lo
+            ox1, oy1, ox2, oy2 = bx + tx1, by + ty1, bx + tx2, by + ty2
+        ow = max(1, ox2 - ox1)
+        oh = max(1, oy2 - oy1)
+        return Blob("opponent", ox1, oy1, ow, oh, total_opp_px, min(1.0, total_opp_px / float(ow * oh)))
 
     # Fallback using find_blobs: intersect opponent ROI with non-floor pixels so plain floor never triggers.
     non_floor = img.find_blobs(
@@ -1110,50 +1087,133 @@ def _filter_opponent_excluding_floor(
     return Blob("opponent", nx1, ny1, ow, oh, kept_px, min(1.0, kept_px / float(ow * oh)))
 
 
+def _min_area_for_label(label: str, cfg: RescueVisionConfig) -> int:
+    if label.endswith("_zone"):
+        return cfg.min_zone_pixels
+    if label == "cyan":
+        return cfg.min_hazard_pixels
+    if label == "purple_ramp":
+        return cfg.min_ramp_pixels
+    if label == "opponent":
+        return cfg.min_opponent_pixels
+    return cfg.min_block_pixels
+
+
+def _is_verified_blob_for_label(b: Blob, cfg: RescueVisionConfig) -> bool:
+    if b.label in _SURFACE_LABELS:
+        return b.pixels >= _min_area_for_label(b.label, cfg)
+    if b.label in _OBJECT_LABELS:
+        return _is_verified_object_blob(b, cfg.min_hazard_pixels, cfg)
+    return False
+
+
+def _merge_adjacent_unknowns(cands: Sequence[Blob]) -> List[Blob]:
+    """Merge touching/1-px-adjacent unexplained blobs without merging distant regions."""
+    clusters = [[b.x, b.y, b.x2, b.y2, b.pixels] for b in cands if b.pixels > 0]
+    changed = True
+    while changed and len(clusters) > 1:
+        changed = False
+        next_clusters: List[List[int]] = []
+        while clusters:
+            ax1, ay1, ax2, ay2, apx = clusters.pop(0)
+            i = 0
+            while i < len(clusters):
+                bx1, by1, bx2, by2, bpx = clusters[i]
+                # 1-pixel adjacency: touching edges merge; separated regions stay strictly separate.
+                if ax1 <= bx2 and ax2 >= bx1 and ay1 <= by2 and ay2 >= by1:
+                    nx1 = min(ax1, bx1)
+                    ny1 = min(ay1, by1)
+                    nx2 = max(ax2, bx2)
+                    ny2 = max(ay2, by2)
+                    area = max(1, (nx2 - nx1) * (ny2 - ny1))
+                    ax1, ay1, ax2, ay2, apx = nx1, ny1, nx2, ny2, min(area, apx + bpx)
+                    clusters.pop(i)
+                    changed = True
+                else:
+                    i += 1
+            next_clusters.append([ax1, ay1, ax2, ay2, apx])
+        clusters = next_clusters
+    out: List[Blob] = []
+    for x1, y1, x2, y2, px in clusters:
+        w = max(1, x2 - x1)
+        h = max(1, y2 - y1)
+        out.append(Blob("unknown", x1, y1, w, h, px, min(1.0, px / float(w * h))))
+    return out
+
+
 def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_near: bool = False) -> List[Blob]:
-    """Run LAB blob detection on a MaixPy image object, plus fail-closed unknown foreground scan."""
+    """Run LAB blob detection on a MaixPy image object, plus component-exact unknown foreground scan."""
     blobs: List[Blob] = []
-    for label, thresh in cfg.lab_thresholds.items():
-        min_area = cfg.min_zone_pixels if label.endswith("_zone") else cfg.min_block_pixels
-        if label == "cyan":
-            min_area = cfg.min_hazard_pixels
-        elif label == "purple_ramp":
-            min_area = cfg.min_ramp_pixels
-        elif label == "opponent":
-            min_area = cfg.min_opponent_pixels
-        merge_label = label in ("red_zone", "blue_zone", "opponent")
-        found = img.find_blobs([tuple(thresh)], pixels_threshold=min_area, area_threshold=min_area, merge=merge_label)
-        for item in found:
-            if label == "opponent":
+    verified_by_label: dict[str, List[Blob]] = {lbl: [] for lbl in (_SURFACE_LABELS + _OBJECT_LABELS)}
+    unverified_by_label: dict[str, List[Blob]] = {lbl: [] for lbl in (_SURFACE_LABELS + _OBJECT_LABELS)}
+
+    # Extract surfaces first so custom overlapping LAB bands (e.g. red_zone vs orange) can resolve
+    # exact-component surface/object ambiguity without ever suppressing genuine cyan hazards.
+    ordered_labels = [lbl for lbl in (_SURFACE_LABELS + _OBJECT_LABELS) if lbl in cfg.lab_thresholds]
+    for lbl in cfg.lab_thresholds:
+        if lbl not in ordered_labels:
+            ordered_labels.append(lbl)
+
+    verified_surface_geoms = set()
+    emitted_rejected_object_rects = set()
+
+    for label in ordered_labels:
+        thresh = cfg.lab_thresholds[label]
+        min_area = _min_area_for_label(label, cfg)
+        if label == "opponent":
+            found = img.find_blobs([tuple(thresh)], pixels_threshold=min_area, area_threshold=min_area, merge=True)
+            for item in found:
                 filtered = _filter_opponent_excluding_floor(img, item, thresh, cfg)
                 if filtered is not None:
                     blobs.append(filtered)
-                continue
+            continue
+
+        # In NEAR mode, capture all connected components (merge=False) so detached unverified patches
+        # inside concave verified components (e.g. a C-shaped ramp) are separated directly by component!
+        px_thr = 1 if (scan_unknown_near and label in (_SURFACE_LABELS + _OBJECT_LABELS)) else min_area
+        found = img.find_blobs([tuple(thresh)], pixels_threshold=px_thr, area_threshold=px_thr, merge=False)
+        for item in found:
             w = max(1, int(item.w()))
             h = max(1, int(item.h()))
             px = int(item.pixels())
-            blobs.append(
-                Blob(
-                    label=label,
-                    x=int(item.x()),
-                    y=int(item.y()),
-                    w=w,
-                    h=h,
-                    pixels=px,
-                    density=px / float(w * h),
-                )
-            )
+            b = Blob(label=label, x=int(item.x()), y=int(item.y()), w=w, h=h, pixels=px, density=px / float(w * h))
 
-    # In NEAR view, detect non-floor foreground across ALL fixed near ROIs PLUS the dynamic
-    # home zone, ramp band, and projected push-corridor geometry used to authorize drops.
+            # If a custom overlapping band classifies an entire verified surface identically as an
+            # oversized non-cyan object, suppress the duplicate surface shadow (never suppress cyan!).
+            if (
+                label in ("green", "black", "orange")
+                and px > cfg.max_block_pixels
+                and (b.x, b.y, b.w, b.h, b.pixels) in verified_surface_geoms
+            ):
+                continue
+
+            if label in _SURFACE_LABELS:
+                if px >= min_area:
+                    blobs.append(b)
+                    verified_by_label[label].append(b)
+                    verified_surface_geoms.add((b.x, b.y, b.w, b.h, b.pixels))
+                elif scan_unknown_near:
+                    unverified_by_label[label].append(b)
+            elif label in _OBJECT_LABELS:
+                if px >= min_area:
+                    blobs.append(b)
+                    if _is_verified_object_blob(b, cfg.min_hazard_pixels, cfg):
+                        verified_by_label[label].append(b)
+                    else:
+                        emitted_rejected_object_rects.add((b.x, b.y, b.w, b.h))
+                        if scan_unknown_near:
+                            unverified_by_label[label].append(b)
+                elif scan_unknown_near:
+                    unverified_by_label[label].append(b)
+            elif px >= min_area:
+                blobs.append(b)
+
+    # In NEAR view, detect unexplained non-floor foreground across ALL fixed near ROIs PLUS the dynamic
+    # home zone, ramp band, and projected push-corridor geometry, masking ONLY verified connected
+    # components (never full AABBs) and emitting tight unexplained bounds (never whole connected surfaces).
     if scan_unknown_near:
-        verified_full_objects = [
-            b
-            for b in blobs
-            if b.label in _OBJECT_LABELS and _is_verified_object_blob(b, cfg.min_hazard_pixels, cfg)
-        ]
-        verified_full_surfaces = [b for b in blobs if b.label in _SURFACE_LABELS]
-        verified_all = verified_full_objects + verified_full_surfaces
+        verified_full_objects = [b for lbl in _OBJECT_LABELS for b in verified_by_label[lbl]]
+        verified_full_surfaces = [b for lbl in _SURFACE_LABELS for b in verified_by_label[lbl]]
         get_lab = _get_lab_pixel_accessor(img)
         use_maix_binary = get_lab is None and hasattr(img, "crop") and hasattr(img, "binary")
 
@@ -1190,7 +1250,210 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                 seen_scan_rois.add(key)
                 scan_rois.append((clipped, merge_fg))
 
-        emitted_unknown_rects = set()
+        emitted_unknown_rects = set(emitted_rejected_object_rects)
+
+        # Tier 1: Exact per-pixel verified connected-component mask + tight unexplained connected components!
+        if get_lab is not None:
+            fw, fh = cfg.frame_width, cfg.frame_height
+            explained = [[False] * fw for _ in range(fh)]
+            for label in (_SURFACE_LABELS + _OBJECT_LABELS):
+                vlist = verified_by_label[label]
+                if not vlist or label not in cfg.lab_thresholds:
+                    continue
+                thresh = cfg.lab_thresholds[label]
+                ux1 = max(0, min(b.x for b in vlist))
+                uy1 = max(0, min(b.y for b in vlist))
+                ux2 = min(fw, max(b.x2 for b in vlist))
+                uy2 = min(fh, max(b.y2 for b in vlist))
+                vis_c = [[False] * (ux2 - ux1) for _ in range(uy2 - uy1)]
+                for yy in range(uy1, uy2):
+                    for xx in range(ux1, ux2):
+                        if vis_c[yy - uy1][xx - ux1] or not _lab_in_thresh(get_lab(xx, yy), thresh):
+                            continue
+                        stack = [(xx, yy)]
+                        vis_c[yy - uy1][xx - ux1] = True
+                        comp_pts: List[Tuple[int, int]] = []
+                        min_x = max_x = xx
+                        min_y = max_y = yy
+                        while stack:
+                            cx, cy = stack.pop()
+                            comp_pts.append((cx, cy))
+                            if cx < min_x:
+                                min_x = cx
+                            if cx > max_x:
+                                max_x = cx
+                            if cy < min_y:
+                                min_y = cy
+                            if cy > max_y:
+                                max_y = cy
+                            for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+                                if ux1 <= nx < ux2 and uy1 <= ny < uy2 and not vis_c[ny - uy1][nx - ux1]:
+                                    if _lab_in_thresh(get_lab(nx, ny), thresh):
+                                        vis_c[ny - uy1][nx - ux1] = True
+                                        stack.append((nx, ny))
+                        cw = max_x - min_x + 1
+                        ch = max_y - min_y + 1
+                        cnt = len(comp_pts)
+                        cand_blob = Blob(label, min_x, min_y, cw, ch, cnt, cnt / float(cw * ch))
+                        if _is_verified_blob_for_label(cand_blob, cfg):
+                            for px_x, px_y in comp_pts:
+                                explained[px_y][px_x] = True
+
+            for roi, merge_small in scan_rois:
+                rx, ry, rw, rh = roi
+                x1, y1, x2, y2 = rx, ry, rx + rw, ry + rh
+                vis_u = [[False] * rw for _ in range(rh)]
+                small_comps: List[Tuple[int, int, int, int, int]] = []
+                for yy in range(y1, y2):
+                    for xx in range(x1, x2):
+                        if vis_u[yy - y1][xx - x1] or explained[yy][xx]:
+                            continue
+                        if _lab_in_thresh(get_lab(xx, yy), cfg.arena_floor_lab):
+                            continue
+                        stack = [(xx, yy)]
+                        vis_u[yy - y1][xx - x1] = True
+                        min_x = max_x = xx
+                        min_y = max_y = yy
+                        cnt = 0
+                        while stack:
+                            cx, cy = stack.pop()
+                            cnt += 1
+                            if cx < min_x:
+                                min_x = cx
+                            if cx > max_x:
+                                max_x = cx
+                            if cy < min_y:
+                                min_y = cy
+                            if cy > max_y:
+                                max_y = cy
+                            for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+                                if x1 <= nx < x2 and y1 <= ny < y2 and not vis_u[ny - y1][nx - x1]:
+                                    if not explained[ny][nx] and not _lab_in_thresh(get_lab(nx, ny), cfg.arena_floor_lab):
+                                        vis_u[ny - y1][nx - x1] = True
+                                        stack.append((nx, ny))
+                        cw = max_x - min_x + 1
+                        ch = max_y - min_y + 1
+                        if cnt >= cfg.min_hazard_pixels:
+                            rect = (min_x, min_y, cw, ch)
+                            if rect not in emitted_unknown_rects:
+                                emitted_unknown_rects.add(rect)
+                                blobs.append(Blob("unknown", min_x, min_y, cw, ch, cnt, cnt / float(cw * ch)))
+                        elif merge_small:
+                            small_comps.append((min_x, min_y, max_x + 1, max_y + 1, cnt))
+                if merge_small and small_comps:
+                    tot = sum(c[4] for c in small_comps)
+                    if tot >= cfg.min_hazard_pixels:
+                        mx1 = min(c[0] for c in small_comps)
+                        my1 = min(c[1] for c in small_comps)
+                        mx2 = max(c[2] for c in small_comps)
+                        my2 = max(c[3] for c in small_comps)
+                        mw, mh = max(1, mx2 - mx1), max(1, my2 - my1)
+                        rect = (mx1, my1, mw, mh)
+                        if rect not in emitted_unknown_rects:
+                            emitted_unknown_rects.add(rect)
+                            blobs.append(Blob("unknown", mx1, my1, mw, mh, tot, min(1.0, tot / float(mw * mh))))
+            return blobs
+
+        # Tier 2: Real MaixPy Image exact component-level unknown detection using ONLY crop/binary/find_blobs!
+        # Set A: pixels matching NEITHER floor NOR any calibrated class (exact tight connected components).
+        # Set B: connected components of calibrated classes that FAILED verification (e.g. 81-px detached
+        #        purple patch inside a C-shaped ramp), checked against overlapping verified classes.
+        if use_maix_binary:
+            all_known_thresholds = [list(cfg.arena_floor_lab)] + [
+                list(cfg.lab_thresholds[lbl])
+                for lbl in (_SURFACE_LABELS + _OBJECT_LABELS)
+                if lbl in cfg.lab_thresholds
+            ]
+            black = [(0, 40, -128, 127, -128, 127)]
+            white = [(50, 100, -128, 127, -128, 127)]
+
+            # Filter Set B against verified components of OTHER classes whose LAB bands overlap.
+            unverified_set_b: List[Blob] = []
+            for label in (_SURFACE_LABELS + _OBJECT_LABELS):
+                if label not in cfg.lab_thresholds:
+                    continue
+                thresh = cfg.lab_thresholds[label]
+                overlapping_other = [
+                    other
+                    for other in (_SURFACE_LABELS + _OBJECT_LABELS)
+                    if other != label
+                    and other in cfg.lab_thresholds
+                    and verified_by_label[other]
+                    and _lab_ranges_overlap(thresh, cfg.lab_thresholds[other])
+                ]
+                for c in unverified_by_label[label]:
+                    covered_by_other = False
+                    for other in overlapping_other:
+                        oth_thresh = cfg.lab_thresholds[other]
+                        if any(
+                            _rects_intersect(c.x, c.y, c.w, c.h, u.x, u.y, u.w, u.h)
+                            for u in unverified_by_label[other]
+                        ):
+                            continue
+                        for v in verified_by_label[other]:
+                            if not _rects_intersect(c.x, c.y, c.w, c.h, v.x, v.y, v.w, v.h):
+                                continue
+                            sub_c = img.crop(c.x, c.y, c.w, c.h)
+                            oth_m = sub_c.binary([list(oth_thresh)], invert=False, copy=True)
+                            both_m = sub_c.binary([list(oth_thresh), list(thresh)], invert=False, copy=True)
+                            oth_px = sum(int(b.pixels()) for b in oth_m.find_blobs(white, pixels_threshold=1, area_threshold=1, merge=True))
+                            both_px = sum(int(b.pixels()) for b in both_m.find_blobs(white, pixels_threshold=1, area_threshold=1, merge=True))
+                            if max(0, both_px - oth_px) == 0:
+                                covered_by_other = True
+                                break
+                        if covered_by_other:
+                            break
+                    if not covered_by_other:
+                        unverified_set_b.append(c)
+
+            for roi, merge_small in scan_rois:
+                rx, ry, rw, rh = roi
+                roi_img = img.crop(rx, ry, rw, rh)
+                matched_mask = roi_img.binary(all_known_thresholds, invert=False, copy=True)
+                uncal_raw = matched_mask.find_blobs(black, pixels_threshold=1, area_threshold=1, merge=False)
+                roi_cands: List[Blob] = []
+                for item in uncal_raw:
+                    w = max(1, int(item.w()))
+                    h = max(1, int(item.h()))
+                    px = int(item.pixels())
+                    roi_cands.append(Blob("unknown", rx + int(item.x()), ry + int(item.y()), w, h, px, px / float(w * h)))
+                for c in unverified_set_b:
+                    inter = _rect_intersection(rx, ry, rw, rh, c.x, c.y, c.w, c.h)
+                    if inter is None:
+                        continue
+                    ix1, iy1, ix2, iy2 = inter
+                    iw, ih = max(1, ix2 - ix1), max(1, iy2 - iy1)
+                    if ix1 == c.x and iy1 == c.y and iw == c.w and ih == c.h:
+                        roi_cands.append(Blob("unknown", c.x, c.y, c.w, c.h, c.pixels, c.density))
+                    else:
+                        clipped_px = min(c.pixels, iw * ih)
+                        roi_cands.append(Blob("unknown", ix1, iy1, iw, ih, clipped_px, min(1.0, clipped_px / float(iw * ih))))
+
+                merged_cands = _merge_adjacent_unknowns(roi_cands)
+                small_cands: List[Blob] = []
+                for unk in merged_cands:
+                    if unk.pixels >= cfg.min_hazard_pixels:
+                        rect = (unk.x, unk.y, unk.w, unk.h)
+                        if rect not in emitted_unknown_rects:
+                            emitted_unknown_rects.add(rect)
+                            blobs.append(unk)
+                    elif merge_small:
+                        small_cands.append(unk)
+                if merge_small and small_cands:
+                    tot = sum(b.pixels for b in small_cands)
+                    if tot >= cfg.min_hazard_pixels:
+                        mx1 = min(b.x for b in small_cands)
+                        my1 = min(b.y for b in small_cands)
+                        mx2 = max(b.x2 for b in small_cands)
+                        my2 = max(b.y2 for b in small_cands)
+                        mw, mh = max(1, mx2 - mx1), max(1, my2 - my1)
+                        rect = (mx1, my1, mw, mh)
+                        if rect not in emitted_unknown_rects:
+                            emitted_unknown_rects.add(rect)
+                            blobs.append(Blob("unknown", mx1, my1, mw, mh, tot, min(1.0, tot / float(mw * mh))))
+            return blobs
+
+        # Tier 3: Fallback for find_blobs-only mocks without pixel access or binary().
         for roi, merge_fg in scan_rois:
             fg_blobs = img.find_blobs(
                 [tuple(cfg.arena_floor_lab)],
@@ -1209,105 +1472,12 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                 fg_roi = (fx, fy, fw, fh)
                 if fg_roi in emitted_unknown_rects:
                     continue
-
-                # Tier 1: Exact per-pixel union when LAB pixel access is available (zero density/box error).
-                if get_lab is not None:
-                    active_verified = [
-                        (vb, cfg.lab_thresholds[vb.label])
-                        for vb in verified_all
-                        if vb.label in cfg.lab_thresholds
-                        and _rects_intersect(fx, fy, fw, fh, vb.x, vb.y, vb.w, vb.h)
-                    ]
-                    fg_exact_px = 0
-                    explained_exact_px = 0
-                    for yy in range(fy, fy + fh):
-                        for xx in range(fx, fx + fw):
-                            lab = get_lab(xx, yy)
-                            if _lab_in_thresh(lab, cfg.arena_floor_lab):
-                                continue
-                            fg_exact_px += 1
-                            for vb, vthresh in active_verified:
-                                if (
-                                    vb.x <= xx < vb.x2
-                                    and vb.y <= yy < vb.y2
-                                    and _lab_in_thresh(lab, vthresh)
-                                ):
-                                    explained_exact_px += 1
-                                    break
-                    unexplained_px = max(0, fg_exact_px - explained_exact_px)
-                    if fg_exact_px >= cfg.min_hazard_pixels and (
-                        unexplained_px >= cfg.min_hazard_pixels
-                        or (explained_exact_px / float(max(1, fg_exact_px))) < 0.70
-                    ):
-                        emitted_unknown_rects.add(fg_roi)
-                        blobs.append(fg)
-                    continue
-
-                # Tier 2: Exact C-accelerated per-verified-box elementary-cell binary union on real MaixPy
-                # Image objects: only enables a class threshold inside cells covered by verified blobs of
-                # that class so separate unverified patches of the same color outside verified boxes are caught!
-                if use_maix_binary:
-                    active_verified = [
-                        vb
-                        for vb in verified_all
-                        if vb.label in cfg.lab_thresholds
-                        and _rects_intersect(fx, fy, fw, fh, vb.x, vb.y, vb.w, vb.h)
-                    ]
-                    if not active_verified:
-                        emitted_unknown_rects.add(fg_roi)
-                        blobs.append(fg)
-                        continue
-                    xs = {fx, fx + fw}
-                    ys = {fy, fy + fh}
-                    for vb in active_verified:
-                        xs.add(max(fx, vb.x))
-                        xs.add(min(fx + fw, vb.x2))
-                        ys.add(max(fy, vb.y))
-                        ys.add(min(fy + fh, vb.y2))
-                    sorted_xs = sorted(xs)
-                    sorted_ys = sorted(ys)
-
-                    black = [(0, 40, -128, 127, -128, 127)]
-                    total_unexplained_px = 0
-                    for xi in range(len(sorted_xs) - 1):
-                        cx1, cx2 = sorted_xs[xi], sorted_xs[xi + 1]
-                        if cx2 <= cx1:
-                            continue
-                        for yi in range(len(sorted_ys) - 1):
-                            cy1, cy2 = sorted_ys[yi], sorted_ys[yi + 1]
-                            if cy2 <= cy1:
-                                continue
-                            cell_thresholds = [list(cfg.arena_floor_lab)]
-                            seen_labels = set()
-                            for vb in active_verified:
-                                if (
-                                    vb.label not in seen_labels
-                                    and vb.x <= cx1
-                                    and vb.x2 >= cx2
-                                    and vb.y <= cy1
-                                    and vb.y2 >= cy2
-                                ):
-                                    seen_labels.add(vb.label)
-                                    cell_thresholds.append(list(cfg.lab_thresholds[vb.label]))
-                            cell_img = img.crop(cx1, cy1, cx2 - cx1, cy2 - cy1)
-                            matched_mask = cell_img.binary(cell_thresholds, invert=False, copy=True)
-                            unmatched = matched_mask.find_blobs(
-                                black, pixels_threshold=1, area_threshold=1, merge=True
-                            )
-                            total_unexplained_px += sum(int(u.pixels()) for u in unmatched)
-                    explained_px = max(0, px - total_unexplained_px)
-                    if total_unexplained_px >= cfg.min_hazard_pixels or (explained_px / float(max(1, px))) < 0.70:
-                        emitted_unknown_rects.add(fg_roi)
-                        blobs.append(fg)
-                    continue
-
-                # Tier 3: Fallback for find_blobs-only mocks without pixel access or binary().
                 roi_surfaces: List[Blob] = []
                 for surface_label in _SURFACE_LABELS:
                     thresh = cfg.lab_thresholds.get(surface_label)
                     if thresh is None:
                         continue
-                    parent_surfaces = [b for b in verified_full_surfaces if b.label == surface_label]
+                    parent_surfaces = verified_by_label[surface_label]
                     if not parent_surfaces:
                         continue
                     for sub in _extract_roi_blobs_for_label(img, surface_label, thresh, fg_roi):
@@ -1322,7 +1492,7 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                     thresh = cfg.lab_thresholds.get(obj_label)
                     if thresh is None:
                         continue
-                    parent_objs = [b for b in verified_full_objects if b.label == obj_label]
+                    parent_objs = verified_by_label[obj_label]
                     if not parent_objs:
                         continue
                     for sub in _extract_roi_blobs_for_label(img, obj_label, thresh, fg_roi):

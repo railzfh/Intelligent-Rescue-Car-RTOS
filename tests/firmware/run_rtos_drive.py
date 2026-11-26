@@ -71,6 +71,7 @@ struct Class_PWM_Servo {
 struct UART_HandleTypeDef {
     bool rx_healthy = true;
     bool rx_fault_latched = false;
+    uint32_t rx_epoch = 0U;
     int service_rx_calls = 0;
 };
 UART_HandleTypeDef huart1;
@@ -80,6 +81,7 @@ bool UART_Service_Rx_Recovery(UART_HandleTypeDef *h) {
 }
 bool UART_Is_Rx_Healthy(UART_HandleTypeDef *h) { return h->rx_healthy && !h->rx_fault_latched; }
 bool UART_Is_Rx_Fault_Latched(UART_HandleTypeDef *h) { return h->rx_fault_latched; }
+uint32_t UART_Get_Rx_Epoch(UART_HandleTypeDef *h) { return h->rx_epoch; }
 struct FDCAN_HandleTypeDef { bool pending = false, fail = false; int tx_calls = 0; };
 FDCAN_HandleTypeDef hfdcan1, hfdcan2;
 uint8_t CAN1_0x200_Tx_Data[8], CAN2_0x200_Tx_Data[8];
@@ -126,6 +128,8 @@ void Step(uint32_t t, bool pressed, bool imu = true, bool update_battery = true)
     }
     M2006_Feedback_Received[0] = M2006_Feedback_Received[1] = true;
     M2006_Last_Feedback_Ms[0] = M2006_Last_Feedback_Ms[1] = t;
+    M2006_Feedback_Seq[0] = M2006_Feedback_Seq[0] + 1U;
+    M2006_Feedback_Seq[1] = M2006_Feedback_Seq[1] + 1U;
     Attitude_Valid = imu; Attitude_Sample_Ms = t; Imu_Quiet = true;
     Drive_Control();
     assert(irq_mask == 0);
@@ -173,10 +177,23 @@ int main(int argc, char **argv) {
         assert((Telemetry_Snapshot.status_flags & TEL_FLAG_VISION_FRESH) == 0U);
         Stopped();
 
-        // Release button, restore RX health -> launch now succeeds cleanly.
+        // Release button, restore RX health WITHOUT a new vision frame ->
+        // cached pre-fault vision MUST remain invalidated (TEL_FLAG_VISION_FRESH == 0, launch blocked)!
         Step(t += 10U, false);
         Step(t += 30U, false);
+        // Queue a pre-recovery vision frame while RX is STILL unhealthy -> must be flushed on recovery!
+        Feed_Vision(fseq++);
+        Step(t += 5U, false);
         huart1.rx_healthy = true;
+        Step(t += 5U, true);
+        Step(t += 30U, true);
+        assert(Rescue_Mission.Get_State() == MISSION_PRE_MATCH);
+        assert((Telemetry_Snapshot.status_flags & TEL_FLAG_VISION_FRESH) == 0U);
+        Stopped();
+
+        // Release button and deliver a brand-new post-recovery vision frame -> launch now succeeds cleanly!
+        Step(t += 10U, false);
+        Step(t += 30U, false);
         Feed_Vision(fseq++);
         Step(t += 10U, true);
         Step(t += 30U, true);
@@ -185,16 +202,32 @@ int main(int argc, char **argv) {
         assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_UART_RX) == 0U);
         assert((Telemetry_Snapshot.status_flags & TEL_FLAG_VISION_FRESH) != 0U);
 
+        // Sub-millisecond recovery epoch bump (rx_healthy stayed true between Drive_Control ticks!)
+        // with pre-recovery bytes queued in ring buffer -> MUST flush ring, invalidate vision, and inhibit motion!
+        Feed_Vision(fseq++);
+        ++huart1.rx_epoch;
+        Step(t += 5U, false);
+        assert((Telemetry_Snapshot.status_flags & TEL_FLAG_VISION_FRESH) == 0U);
+        assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_STOPPING || Chassis_Drive.Get_Mode() == CHASSIS_MODE_IDLE);
+        for (int k = 0; k < 100 && Chassis_Drive.Is_Active(); ++k) {
+            Step(++t, false);
+        }
+        Stopped();
+
+        // New post-epoch frame restores VISION_FRESH cleanly.
+        Feed_Vision(fseq++);
+        Step(t += 5U, false);
+        assert((Telemetry_Snapshot.status_flags & TEL_FLAG_VISION_FRESH) != 0U);
+
         // RX becomes transiently unhealthy mid-run -> motion MUST inhibit immediately (even while latest frame is < 50 ms old)!
         huart1.rx_healthy = false;
         Step(t += 5U, false);
         assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_UART_RX) != 0U);
         assert((Telemetry_Snapshot.status_flags & TEL_FLAG_VISION_FRESH) == 0U);
-        assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_STOPPING || Chassis_Drive.Get_Mode() == CHASSIS_MODE_IDLE);
-        // Step soft-stop deceleration ramp cleanly to standstill / IDLE with zero torque.
-        for (int k = 0; k < 100 && Chassis_Drive.Is_Active(); ++k) {
-            Step(++t, false);
-        }
+        // Even after restoring rx_healthy=true with NO new frame, VISION_FRESH MUST stay 0 and motion stopped!
+        huart1.rx_healthy = true;
+        Step(t += 5U, false);
+        assert((Telemetry_Snapshot.status_flags & TEL_FLAG_VISION_FRESH) == 0U);
         Stopped();
 
         // Permanently latched RX fault -> immediately latches MISSION_FAULT_STOP.
@@ -204,7 +237,90 @@ int main(int argc, char **argv) {
         assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_UART_RX) != 0U);
         Stopped();
         assert(huart1.service_rx_calls == 0);
-        std::puts("PASS: non-blocking UART RX health gate blocks launch, inhibits motion immediately, and never blocks in Drive_Control");
+        std::puts("PASS: non-blocking UART RX health/epoch gate flushes pre-recovery bytes, invalidates vision, blocks motion until new frame");
+        return 0;
+    }
+
+    const bool standstill_can = argc > 1 && std::strcmp(argv[1], "standstill_can") == 0;
+    if (standstill_can) {
+        // Finding 1 (R6): Reverse stop interlock MUST NOT release on pre-stop cached CAN samples!
+        // Last zero-speed CAN sample at t=6 ms -> reverse accelerates t=7..95 ms with no CAN update ->
+        // clearance lost at t=96 ms -> t=97 ms (no new CAN) MUST stay IDLE (NOT TURN!) ->
+        // t=98 ms (only motor 0 updated) MUST STILL stay IDLE ->
+        // t=99 ms (BOTH motors deliver new standstill samples) releases cleanly to CHASSIS_MODE_TURN!
+        Feed_Config(RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION);
+        Struct_Vision_State vis{};
+        vis.frame_seq = 1U;
+        vis.camera_view = CAMERA_VIEW_FAR;
+        vis.target_type = TARGET_GREEN_MATERIAL;
+        vis.target_dist_mm = 190U;
+        vis.flags = VIS_FLAG_TARGET_VALID;
+        assert(Rescue_Mission.On_Vision_State(vis, 1U));
+        Step(0U, false);
+        Struct_Mission_Inputs min{};
+        min.can_launch = min.hardware_ready = min.button_pressed = min.wheels_still = min.camera_settled = true;
+        min.now_ms = 1U;
+        Rescue_Mission.Update(min);
+        min.button_pressed = false;
+        min.chassis_motion_done = true;
+        min.now_ms = 2U;
+        Rescue_Mission.Update(min);
+        min.chassis_motion_done = false;
+        min.now_ms = 3U;
+        Rescue_Mission.Update(min);
+        min.now_ms = 4U;
+        Rescue_Mission.Update(min);
+        assert(Rescue_Mission.Get_State() == MISSION_INSPECT_CORRAL);
+        vis.frame_seq++;
+        vis.camera_view = CAMERA_VIEW_NEAR;
+        vis.corral_cyan_cnt = 1U;
+        assert(Rescue_Mission.On_Vision_State(vis, 5U));
+        min.now_ms = 5U;
+        Rescue_Mission.Update(min);
+        assert(Rescue_Mission.Get_State() == MISSION_BACK_OUT_SEPARATE);
+        vis.frame_seq++;
+        vis.flags = VIS_FLAG_REAR_CLEAR;
+        assert(Rescue_Mission.On_Vision_State(vis, 6U));
+        Step(6U, false);
+        assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_DISTANCE);
+
+        auto drive_no_can = [&](uint32_t tm) {
+            now_ms = tm;
+            Battery.Update(24.0f, tm);
+            Attitude_Sample_Ms = tm;
+            Drive_Control();
+        };
+        float modeled_omega = 0.0f;
+        for (uint32_t tm = 7U; tm < 96U; ++tm) {
+            drive_no_can(tm);
+            modeled_omega += 40.0f * M2006_Direction[0] * M2006[0].torque * 0.001f;
+        }
+        assert(modeled_omega < -0.1f);
+        // Cancel reverse at t=96 ms while CAN feedback is still cached from t=6 ms (omega == 0)!
+        vis.frame_seq++;
+        vis.flags = 0U;
+        assert(Rescue_Mission.On_Vision_State(vis, 96U));
+        drive_no_can(96U);
+        assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_IDLE);
+        assert(M2006[0].torque == 0.0f && M2006[1].torque == 0.0f);
+
+        // Tick 97: NO new CAN sample -> MUST stay IDLE (never release on pre-stop t=6 ms sample!).
+        drive_no_can(97U);
+        assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_IDLE);
+        assert(M2006[0].torque == 0.0f && M2006[1].torque == 0.0f);
+
+        // Tick 98: ONLY motor 0 receives a fresh standstill CAN sample -> MUST STILL stay IDLE!
+        M2006_Last_Feedback_Ms[0] = 98U;
+        M2006_Feedback_Seq[0] = M2006_Feedback_Seq[0] + 1U;
+        drive_no_can(98U);
+        assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_IDLE);
+
+        // Tick 99: Motor 1 also delivers a fresh standstill CAN sample -> now cleanly releases to CHASSIS_MODE_TURN!
+        M2006_Last_Feedback_Ms[1] = 99U;
+        M2006_Feedback_Seq[1] = M2006_Feedback_Seq[1] + 1U;
+        drive_no_can(99U);
+        assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_TURN);
+        std::puts("PASS: reverse standstill interlock rejects pre-stop CAN samples and requires fresh post-stop standstill from EACH motor");
         return 0;
     }
 
@@ -532,5 +648,5 @@ cmd = ["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-Wno-unused-variable
 if os.name == "nt":
     cmd.append("-static")
 subprocess.run(cmd, check=True)
-for mode in ([], ["held"], ["comp"], ["can_fault"], ["frozen"], ["cold_boot"], ["servo_fail"], ["reverse_abort"], ["uart_unhealthy"]):
+for mode in ([], ["held"], ["comp"], ["can_fault"], ["frozen"], ["cold_boot"], ["servo_fail"], ["reverse_abort"], ["uart_unhealthy"], ["standstill_can"]):
     subprocess.run([str(exe), *mode], check=True)

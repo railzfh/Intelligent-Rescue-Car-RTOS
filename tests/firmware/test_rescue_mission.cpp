@@ -257,7 +257,7 @@ static void Test_Full_First_Green_Delivery_And_Proven_Rear_Corridor()
     assert(mission.Get_State() == MISSION_DROP_OPEN_AND_PUSH);
 
     const uint16_t safe_push = VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR | VIS_FLAG_HOME_HALF_MATCH |
-                               VIS_FLAG_DROP_PATH_CLEAR;
+                               VIS_FLAG_DROP_PATH_CLEAR | VIS_FLAG_DROP_BASELINE_READY;
     for (int k = 0; k < 3; ++k)
     {
         in.now_ms = (t += 50U);
@@ -449,7 +449,8 @@ static void Test_Cumulative_Yaw_Invalidates_Corridor_And_Active_Reverse_Stops()
 static void Test_Drop_Rechecks_Hazards_And_Alignment_While_Opening_And_Pushing()
 {
     const uint16_t safe_aligned =
-        VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR | VIS_FLAG_HOME_HALF_MATCH | VIS_FLAG_DROP_PATH_CLEAR;
+        VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR | VIS_FLAG_HOME_HALF_MATCH |
+        VIS_FLAG_DROP_PATH_CLEAR | VIS_FLAG_DROP_BASELINE_READY;
 
     auto advance_to_gate_opening = [&](Class_Rescue_Mission &m, Struct_Mission_Inputs &in, uint32_t &t, uint16_t &seq) {
         assert(m.On_Set_Config({RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION, 2U}));
@@ -615,7 +616,18 @@ static void Test_Drop_Rechecks_Hazards_And_Alignment_While_Opening_And_Pushing()
         in.wheels_still = false;
         in.forward_delta_m = 0.05f;
         in.now_ms = (t += 50U);
-        // Cyan enters ramp/push path (VIS_FLAG_DROP_PATH_CLEAR drops to 0) mid-push!
+        // Finding 7 (R6): During active push, VIS_FLAG_DROP_BASELINE_READY clearing (e.g. cargo sliding 1 px
+        // out of corral before TEL_FLAG_DROP_PUSHING arrives) MUST NOT abort as long as VIS_FLAG_DROP_PATH_CLEAR=1!
+        assert(m.On_Vision_State(
+            Make_Near_Vision(seq++, 0U, 0U, 0U, 0U, 0U,
+                             VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR | VIS_FLAG_HOME_HALF_MATCH | VIS_FLAG_DROP_PATH_CLEAR),
+            t));
+        out = m.Update(in);
+        assert(out.drive_action == DRIVE_ACTION_KEEP);
+        assert(m.Get_State() == MISSION_DROP_OPEN_AND_PUSH);
+
+        // Cyan enters ramp/push path (VIS_FLAG_DROP_PATH_CLEAR drops to 0) mid-push -> MUST abort immediately!
+        in.now_ms = (t += 50U);
         assert(m.On_Vision_State(
             Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U, VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR | VIS_FLAG_HOME_HALF_MATCH), t));
         out = m.Update(in);
@@ -714,7 +726,8 @@ static void Test_Active_Reverse_Abrupt_Clearance_Loss_Cancels_Immediately_And_Wa
         Class_Rescue_Mission dm;
         assert(dm.On_Set_Config({RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION, 1U}));
         const uint16_t safe_aligned =
-            VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR | VIS_FLAG_HOME_HALF_MATCH | VIS_FLAG_DROP_PATH_CLEAR;
+            VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR | VIS_FLAG_HOME_HALF_MATCH |
+            VIS_FLAG_DROP_PATH_CLEAR | VIS_FLAG_DROP_BASELINE_READY;
         uint32_t dt = 1000U;
         uint16_t dseq = 1U;
         assert(dm.On_Vision_State(Make_Far_Vision(dseq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), dt));
@@ -1091,13 +1104,15 @@ static void Test_Braking_Phase_Vision_Outage_And_Uart_Rx_Unhealthy()
         assert(em.Get_State() == MISSION_FAULT_STOP);
     }
 
-    // Part C: Finding 6 (R5) — in.uart_rx_healthy=false immediately inhibits motion even while frame timestamp is fresh.
+    // Part C: Finding 6 (R5) & Finding 2 (R6) — in.uart_rx_healthy=false immediately inhibits motion
+    // AND invalidates cached pre-fault vision so rearming UART without a newly accepted frame NEVER
+    // restores VISION_FRESH or forward motion!
     {
         Class_Rescue_Mission um;
         assert(um.On_Set_Config({RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION, 1U}));
-        uint32_t ut = 1000U;
+        uint32_t ut = 100U;
         uint16_t useq = 1U;
-        assert(um.On_Vision_State(Make_Far_Vision(useq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), ut));
+        assert(um.On_Vision_State(Make_Far_Vision(useq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 0, 500U), ut));
         Struct_Mission_Inputs uin{};
         uin.now_ms = ut;
         uin.hardware_ready = true;
@@ -1107,15 +1122,41 @@ static void Test_Braking_Phase_Vision_Outage_And_Uart_Rx_Unhealthy()
         uin.wheels_still = true;
         uin.gate_settled = true;
         uin.camera_settled = true;
-        um.Update(uin);
+        assert(um.Update(uin).drive_action == DRIVE_ACTION_START_DISTANCE);
         uin.button_pressed = false;
-        assert(um.Get_State() == MISSION_LAUNCH_CROSS_BUMPS);
+        uin.chassis_motion_done = true;
+        uin.now_ms = (ut = 101U);
+        um.Update(uin);
+        uin.chassis_motion_done = false;
+        uin.now_ms = (ut = 102U);
+        um.Update(uin);
+        assert(um.Get_State() == MISSION_APPROACH_TARGET);
 
-        // Only 10 ms later (vision timestamp still very fresh!), UART RX becomes unhealthy -> immediate stop!
+        // RX becomes unhealthy at 110 ms -> immediate stop and invalidates cached pre-fault vision.
         uin.uart_rx_healthy = false;
-        uin.now_ms = (ut += 10U);
+        uin.now_ms = (ut = 110U);
         auto uout = um.Update(uin);
         assert(uout.drive_action == DRIVE_ACTION_SOFT_STOP);
+        assert(!um.Is_Vision_Fresh(ut));
+
+        // RX rearms at 120 ms with NO new frame -> MUST remain stopped and NOT vision-fresh!
+        uin.uart_rx_healthy = true;
+        uin.now_ms = (ut = 120U);
+        uout = um.Update(uin);
+        assert(uout.drive_action == DRIVE_ACTION_SOFT_STOP);
+        assert(uout.linear_mps == 0.0f);
+        assert(!um.Is_Vision_Fresh(ut));
+
+        // Duplicate pre-fault frame_seq=1 MUST be rejected and keep vision invalidated!
+        assert(!um.On_Vision_State(Make_Far_Vision(1U, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 0, 500U), 125U));
+        assert(!um.Is_Vision_Fresh(125U));
+
+        // Brand-new post-recovery frame_seq=2 restores Is_Vision_Fresh and forward approach cleanly!
+        uin.now_ms = (ut = 130U);
+        assert(um.On_Vision_State(Make_Far_Vision(useq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 0, 500U), ut));
+        assert(um.Is_Vision_Fresh(ut));
+        uout = um.Update(uin);
+        assert(uout.drive_action == DRIVE_ACTION_VELOCITY && uout.linear_mps > 0.0f);
     }
 }
 

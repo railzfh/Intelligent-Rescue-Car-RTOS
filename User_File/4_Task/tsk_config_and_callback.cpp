@@ -55,6 +55,7 @@ static const uint32_t M2006_Feedback_Timeout_Ms = 100U;
 static Class_Motor_DJI_C610 M2006[2];
 static volatile uint32_t M2006_Last_Feedback_Ms[2] = {};
 static volatile bool M2006_Feedback_Received[2] = {};
+static volatile uint32_t M2006_Feedback_Seq[2] = {};
 
 // 驱动轮直径（mm）。0 表示未配置，禁止起步。
 static constexpr float Drive_Wheel_Diameter_Mm = 58.0f;
@@ -115,6 +116,8 @@ static uint8_t Vision_Rx_Ring[Vision_Rx_Ring_Size] = {};
 static volatile uint16_t Vision_Rx_Head = 0U;
 static volatile uint16_t Vision_Rx_Tail = 0U;
 static volatile uint32_t Vision_Rx_Overflow_Count = 0U;
+static uint32_t Last_Uart_Rx_Epoch = 0U;
+static bool Vision_Rx_Was_Healthy = true;
 
 static bool Drive_Prev_Odom_Valid = false;
 static std::array<float, 2> Drive_Prev_Angle = {};
@@ -168,6 +171,7 @@ static void M2006_RxCallback(uint8_t motor_index, const FDCAN_RxHeaderTypeDef &h
     M2006[motor_index].CAN_RxCpltCallback();
     M2006_Last_Feedback_Ms[motor_index] = HAL_GetTick();
     M2006_Feedback_Received[motor_index] = true;
+    M2006_Feedback_Seq[motor_index] = M2006_Feedback_Seq[motor_index] + 1U;
 }
 
 static void M2006_CAN1_RxCallback(FDCAN_RxHeaderTypeDef &header, uint8_t *)
@@ -263,6 +267,15 @@ static void Drive_Notify_Buzzer(bool can_start, bool reject_cue, uint32_t now_ms
         sounding = false;
         BSP_Buzzer.Set_Loudness(0.0f);
     }
+}
+
+static void Vision_Flush_Rx_Queue()
+{
+    const uint32_t mask = __get_PRIMASK();
+    __disable_irq();
+    Vision_Rx_Tail = Vision_Rx_Head;
+    __set_PRIMASK(mask);
+    Vision_Parser.Reset();
 }
 
 static void Vision_Drain_Rx(uint32_t now_ms)
@@ -363,6 +376,8 @@ static void Drive_Control()
 {
     std::array<float, 2> angle;
     std::array<float, 2> speed;
+    std::array<uint32_t, 2> fb_seq = {};
+    std::array<uint32_t, 2> fb_ms = {};
     bool feedback_fresh = true;
     // CAN 中断可以抢占该任务，确保同一轮转角、速度和时间戳来自同一帧。
     const uint32_t primask = __get_PRIMASK();
@@ -372,8 +387,10 @@ static void Drive_Control()
     {
         angle[i] = M2006_Direction[i] * M2006[i].Get_Now_Angle();
         speed[i] = M2006_Direction[i] * M2006[i].Get_Now_Omega();
+        fb_seq[i] = M2006_Feedback_Seq[i];
+        fb_ms[i] = M2006_Last_Feedback_Ms[i];
         feedback_fresh &= M2006_Feedback_Received[i] &&
-                          (uint32_t)(now_ms - M2006_Last_Feedback_Ms[i]) < M2006_Feedback_Timeout_Ms;
+                          (uint32_t)(now_ms - fb_ms[i]) < M2006_Feedback_Timeout_Ms;
     }
     const bool attitude_fresh = Attitude_Valid && (uint32_t)(now_ms - Attitude_Sample_Ms) < 30U;
     const bool imu_quiet = Imu_Quiet;
@@ -384,11 +401,28 @@ static void Drive_Control()
     const float pack_voltage = Battery.Get_Pack_Voltage();
     __set_PRIMASK(primask);
 
-    // 1 ms 控制任务仅做非阻塞 RX 健康检查，绝不阻塞调用 HAL DMA 中止/重初始化；
-    // 阻塞恢复移交至 10 ms statusTask 执行，RX 异常期间立即抑制运动。
+    // 1 ms 控制任务仅做非阻塞 RX 健康与纪元检查，绝不阻塞调用 HAL DMA 中止/重初始化；
+    // 任一 RX 异常或跨周期恢复均清空旧环缓冲、复位协议解析器并失效故障前缓存视觉帧，
+    // 强制收到恢复后的新有效帧后才允许恢复 VISION_FRESH 与运动。
     const bool uart_rx_healthy = UART_Is_Rx_Healthy(&huart1);
     const bool uart_rx_fault = UART_Is_Rx_Fault_Latched(&huart1);
-    Vision_Drain_Rx(now_ms);
+    const uint32_t uart_rx_epoch = UART_Get_Rx_Epoch(&huart1);
+    if (!uart_rx_healthy || uart_rx_fault || uart_rx_epoch != Last_Uart_Rx_Epoch)
+    {
+        Last_Uart_Rx_Epoch = uart_rx_epoch;
+        Vision_Flush_Rx_Queue();
+        Rescue_Mission.On_Uart_Rx_Fault();
+        Vision_Rx_Was_Healthy = uart_rx_healthy && !uart_rx_fault;
+    }
+    else
+    {
+        if (!Vision_Rx_Was_Healthy)
+        {
+            Vision_Flush_Rx_Queue();
+            Vision_Rx_Was_Healthy = true;
+        }
+        Vision_Drain_Rx(now_ms);
+    }
 
     // 舵机控制：等待首帧有效电池采样后再启动 PWM；真实电池故障或 PWM 启动失败则永久锁停。
     if (battery_fault || Servos_Fault_Latched)
@@ -471,6 +505,11 @@ static void Drive_Control()
     mission_in.camera_settled = Pitch_Servo.Is_Settled();
     mission_in.forward_delta_m = forward_delta_m;
     mission_in.yaw_delta_rad = yaw_delta_rad;
+    mission_in.motor_feedback_seq[0] = fb_seq[0];
+    mission_in.motor_feedback_seq[1] = fb_seq[1];
+    mission_in.motor_feedback_ms[0] = fb_ms[0];
+    mission_in.motor_feedback_ms[1] = fb_ms[1];
+    mission_in.use_motor_feedback_seq = true;
 
     const Struct_Mission_Output cmd = Rescue_Mission.Update(mission_in);
     Drive_Notify_Buzzer(mission_in.can_launch, cmd.launch_rejected_cue, now_ms);

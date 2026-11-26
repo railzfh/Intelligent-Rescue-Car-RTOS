@@ -115,6 +115,7 @@ void UART_Init(UART_HandleTypeDef *huart, UART_Callback Callback_Function)
     obj->Rx_Buffer_Ready = nullptr;
     obj->Rx_Recovery_Pending = false;
     obj->Rx_Recovery_Fault_Latched = false;
+    obj->Rx_Recovery_Epoch = 0U;
     obj->Rx_Recovery_Fail_Count = 0U;
     (void)UART_Start_Rx_DMA(obj);
 }
@@ -135,6 +136,7 @@ void UART_Reinit(UART_HandleTypeDef *huart)
     {
         obj->UART_Handler = huart;
     }
+    obj->Rx_Recovery_Epoch = obj->Rx_Recovery_Epoch + 1U;
     obj->Rx_Recovery_Pending = true;
     (void)UART_Service_Rx_Recovery(huart);
 }
@@ -164,6 +166,19 @@ bool UART_Is_Rx_Fault_Latched(UART_HandleTypeDef *huart)
 {
     const Struct_UART_Manage_Object *obj = UART_Get_Manage_Object(huart);
     return (obj != nullptr && obj->UART_Handler == huart && obj->Rx_Recovery_Fault_Latched);
+}
+
+/**
+ * @brief 读取 RX 错误/恢复单调纪元计数，便于 1 ms 控制任务捕捉跨周期恢复并失效旧视觉帧
+ */
+uint32_t UART_Get_Rx_Epoch(UART_HandleTypeDef *huart)
+{
+    const Struct_UART_Manage_Object *obj = UART_Get_Manage_Object(huart);
+    if (obj == nullptr || obj->UART_Handler != huart)
+    {
+        return 0U;
+    }
+    return obj->Rx_Recovery_Epoch;
 }
 
 /**
@@ -224,6 +239,8 @@ bool UART_Service_Rx_Recovery(UART_HandleTypeDef *huart)
     }
 
     obj->Rx_Buffer_Active = obj->Rx_Buffer_0;
+    obj->Rx_Recovery_Epoch = obj->Rx_Recovery_Epoch + 1U;
+    __DMB();
     if (!UART_Start_Rx_DMA(obj))
     {
         UART_Record_Recovery_Failure(obj);
@@ -302,6 +319,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
     // cleared RxState to READY while leaving hdmarx BUSY). Preserve active RX on non-stopping errors.
     if (huart->RxState == HAL_UART_STATE_READY)
     {
+        obj->Rx_Recovery_Epoch = obj->Rx_Recovery_Epoch + 1U;
         obj->Rx_Recovery_Pending = true;
     }
 }

@@ -97,6 +97,9 @@ struct Struct_Mission_Inputs
     bool camera_settled = false;
     float forward_delta_m = 0.0f;
     float yaw_delta_rad = 0.0f;
+    uint32_t motor_feedback_seq[2] = {};
+    uint32_t motor_feedback_ms[2] = {};
+    bool use_motor_feedback_seq = false;
 };
 
 struct Struct_Mission_Output
@@ -123,6 +126,7 @@ public:
     bool On_Set_Config(const Struct_Match_Config_Cmd &cfg);
     bool On_Vision_State(const Struct_Vision_State &vis, uint32_t now_ms);
     bool On_Bench_Actuator(const Struct_Bench_Actuator_Cmd &cmd);
+    void On_Uart_Rx_Fault();
     void Fault_Stop(uint32_t now_ms);
 
     Struct_Mission_Output Update(const Struct_Mission_Inputs &in);
@@ -158,9 +162,9 @@ private:
                               bool opponent_alert, float requested_abs_m) const;
     bool Is_Reverse_Clearance_Lost(bool rear_sensor_clear) const;
     bool Is_Active_Reverse_State() const;
-    void Engage_Standstill_Gate(uint32_t now_ms);
-    void Start_Escape(uint32_t now_ms, float reverse_abs_m, bool chassis_active,
-                      bool wheels_still, Struct_Mission_Output &out);
+    bool Is_Fresh_Standstill(const Struct_Mission_Inputs &in) const;
+    void Engage_Standstill_Gate(uint32_t now_ms, const Struct_Mission_Inputs &in);
+    void Start_Escape(const Struct_Mission_Inputs &in, float reverse_abs_m, Struct_Mission_Output &out);
 
     const Struct_Mission_Config Config;
 
@@ -192,6 +196,7 @@ private:
     bool Vision_Outage_Active = false;
     uint32_t Vision_Outage_Start_Ms = 0U;
     bool Interrupted_By_Stale_Vision = false;
+    bool Vision_Invalidated_By_Rx_Fault = false;
 
     bool Has_Confirm_Frame = false;
     uint16_t Last_Confirm_Frame_Seq = 0U;
@@ -218,6 +223,8 @@ private:
     bool Reverse_Motion_In_Flight = false;
     bool Require_Standstill_Gate = false;
     uint32_t Standstill_Gate_Start_Ms = 0U;
+    uint32_t Standstill_Gate_Motor_Seq[2] = {};
+    uint32_t Standstill_Gate_Motor_Ms[2] = {};
 
     // Cargo locked upon gate closure for safe-zone half matching and score counting.
     bool Cargo_Already_Confirmed = false;

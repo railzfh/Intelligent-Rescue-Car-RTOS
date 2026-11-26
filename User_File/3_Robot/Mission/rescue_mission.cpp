@@ -58,7 +58,13 @@ bool Class_Rescue_Mission::On_Vision_State(const Struct_Vision_State &vis, uint3
     Last_Vision_Frame_Seq = vis.frame_seq;
     Last_Vision_Ms = now_ms;
     Vision_Received = true;
+    Vision_Invalidated_By_Rx_Fault = false;
     return true;
+}
+
+void Class_Rescue_Mission::On_Uart_Rx_Fault()
+{
+    Vision_Invalidated_By_Rx_Fault = true;
 }
 
 bool Class_Rescue_Mission::On_Bench_Actuator(const Struct_Bench_Actuator_Cmd &cmd)
@@ -114,7 +120,8 @@ void Class_Rescue_Mission::Fault_Stop(uint32_t now_ms)
 
 bool Class_Rescue_Mission::Is_Vision_Fresh(uint32_t now_ms) const
 {
-    return Vision_Received && (uint32_t)(now_ms - Last_Vision_Ms) < Config.vision_timeout_ms;
+    return Vision_Received && !Vision_Invalidated_By_Rx_Fault &&
+           (uint32_t)(now_ms - Last_Vision_Ms) < Config.vision_timeout_ms;
 }
 
 bool Class_Rescue_Mission::Is_Link_Alive(uint32_t now_ms) const
@@ -269,32 +276,58 @@ bool Class_Rescue_Mission::Is_Active_Reverse_State() const
            (State == MISSION_ESCAPE_RECOVERY && (Sub_Phase == 0U || Sub_Phase == 1U));
 }
 
-void Class_Rescue_Mission::Engage_Standstill_Gate(uint32_t now_ms)
+bool Class_Rescue_Mission::Is_Fresh_Standstill(const Struct_Mission_Inputs &in) const
+{
+    if (in.chassis_active || !in.wheels_still)
+    {
+        return false;
+    }
+    if (!in.use_motor_feedback_seq)
+    {
+        return true;
+    }
+    const bool m0_fresh = (in.motor_feedback_seq[0] != Standstill_Gate_Motor_Seq[0]) ||
+                          (in.motor_feedback_ms[0] != Standstill_Gate_Motor_Ms[0]);
+    const bool m1_fresh = (in.motor_feedback_seq[1] != Standstill_Gate_Motor_Seq[1]) ||
+                          (in.motor_feedback_ms[1] != Standstill_Gate_Motor_Ms[1]);
+    return m0_fresh && m1_fresh;
+}
+
+void Class_Rescue_Mission::Engage_Standstill_Gate(uint32_t now_ms, const Struct_Mission_Inputs &in)
 {
     if (!Require_Standstill_Gate)
     {
         Require_Standstill_Gate = true;
         Standstill_Gate_Start_Ms = now_ms;
+        Standstill_Gate_Motor_Seq[0] = in.motor_feedback_seq[0];
+        Standstill_Gate_Motor_Seq[1] = in.motor_feedback_seq[1];
+        Standstill_Gate_Motor_Ms[0] = in.motor_feedback_ms[0];
+        Standstill_Gate_Motor_Ms[1] = in.motor_feedback_ms[1];
     }
 }
 
-void Class_Rescue_Mission::Start_Escape(uint32_t now_ms, float reverse_abs_m, bool chassis_active,
-                                        bool wheels_still, Struct_Mission_Output &out)
+void Class_Rescue_Mission::Start_Escape(const Struct_Mission_Inputs &in, float reverse_abs_m,
+                                        Struct_Mission_Output &out)
 {
     if (++Consecutive_Escapes > Config.max_consecutive_escapes)
     {
-        Fault_Stop(now_ms);
+        Fault_Stop(in.now_ms);
         out.drive_action = DRIVE_ACTION_EMERGENCY_STOP;
         out.gate_closed = Gate_Closed_Cmd;
         out.camera_near = Camera_Near_Cmd;
         return;
     }
 
-    Enter_State(MISSION_ESCAPE_RECOVERY, now_ms);
+    const bool was_reversing = Is_Active_Reverse_State();
+    Enter_State(MISSION_ESCAPE_RECOVERY, in.now_ms);
     Pending_Escape_Reverse_M = (reverse_abs_m >= Config.min_proven_reverse_m) ? reverse_abs_m : 0.0f;
-    if (chassis_active || !wheels_still)
+    if (was_reversing || in.chassis_active || !in.wheels_still)
     {
-        // Cancel active motion immediately and confirm standstill before reversing or turning.
+        // Cancel active motion immediately and confirm fresh standstill before reversing or turning.
+        if (was_reversing || in.use_motor_feedback_seq)
+        {
+            Engage_Standstill_Gate(in.now_ms, in);
+        }
         Sub_Phase = (Pending_Escape_Reverse_M > 0.0f) ? 3U : 1U;
         Standstill_Abrupt_Stop = true;
         out.drive_action = DRIVE_ACTION_EMERGENCY_STOP;
@@ -372,16 +405,25 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         return out;
     }
 
-    if (Reverse_Motion_In_Flight && !in.chassis_active && in.wheels_still)
+    // Any UART RX fault/unhealthy observation invalidates cached pre-fault vision so rearming
+    // the UART can never resume motion or VISION_FRESH until a newly accepted frame arrives.
+    if (!in.uart_rx_healthy)
+    {
+        Vision_Invalidated_By_Rx_Fault = true;
+    }
+
+    if (Reverse_Motion_In_Flight && !Require_Standstill_Gate && !in.use_motor_feedback_seq &&
+        !in.chassis_active && in.wheels_still)
     {
         Reverse_Motion_In_Flight = false;
     }
 
-    // Global standstill interlock after any cancelled/interrupted reverse or braking transition:
-    // inhibit ALL motion across ALL states until fresh feedback confirms standstill, or latch a fault.
+    // Global standstill interlock after any cancelled/interrupted/completed reverse transition:
+    // inhibit ALL motion across ALL states until fresh post-stop feedback from EACH motor confirms
+    // standstill, or latch a fault.
     if (Require_Standstill_Gate && is_competition_active)
     {
-        if (!in.chassis_active && in.wheels_still)
+        if (Is_Fresh_Standstill(in))
         {
             Require_Standstill_Gate = false;
             Reverse_Motion_In_Flight = false;
@@ -493,7 +535,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             const bool in_active_reverse = Is_Active_Reverse_State();
             if (in_active_reverse)
             {
-                Engage_Standstill_Gate(in.now_ms);
+                Engage_Standstill_Gate(in.now_ms, in);
             }
             out.drive_action = in_active_reverse ? DRIVE_ACTION_EMERGENCY_STOP : DRIVE_ACTION_SOFT_STOP;
             return out;
@@ -505,13 +547,13 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             Interrupted_By_Stale_Vision = false;
             const bool need_standstill = Is_Active_Reverse_State() || in.chassis_active || !in.wheels_still;
             // After pausing an open-loop motion due to stale vision, re-evaluate safely instead of resuming blind,
-            // and retain the global standstill interlock until fresh feedback confirms wheels have stopped.
+            // and retain the global standstill interlock until fresh post-stop feedback confirms wheels have stopped.
             if (State == MISSION_LAUNCH_CROSS_BUMPS || State == MISSION_BACK_OUT_SEPARATE ||
                 State == MISSION_ESCAPE_RECOVERY)
             {
                 if (need_standstill)
                 {
-                    Engage_Standstill_Gate(in.now_ms);
+                    Engage_Standstill_Gate(in.now_ms, in);
                 }
                 if (Gate_Closed_Cmd)
                 {
@@ -532,7 +574,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             {
                 if (need_standstill)
                 {
-                    Engage_Standstill_Gate(in.now_ms);
+                    Engage_Standstill_Gate(in.now_ms, in);
                 }
                 // Verify in place after interrupted push without blind reversing.
                 Enter_State(MISSION_DROP_BACKOUT_VERIFY, in.now_ms);
@@ -547,7 +589,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             {
                 if (need_standstill)
                 {
-                    Engage_Standstill_Gate(in.now_ms);
+                    Engage_Standstill_Gate(in.now_ms, in);
                 }
                 Sub_Phase = 2U;
                 State_Enter_Ms = in.now_ms;
@@ -565,7 +607,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         if (opponent_alert && forward_motion_state)
         {
             // Never reverse blindly on opponent alert unless explicit rear sensor clears it (Available_Reverse_M returns 0).
-            Start_Escape(in.now_ms, 0.0f, in.chassis_active, in.wheels_still, out);
+            Start_Escape(in, 0.0f, out);
             out.gate_closed = Gate_Closed_Cmd;
             out.camera_near = Camera_Near_Cmd;
             return out;
@@ -591,7 +633,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             {
                 const float rev_m = Available_Reverse_M(
                     vision_fresh, rear_sensor_clear, opponent_alert, std::fabs(Config.escape_backout_m));
-                Start_Escape(in.now_ms, rev_m, in.chassis_active, in.wheels_still, out);
+                Start_Escape(in, rev_m, out);
                 out.gate_closed = Gate_Closed_Cmd;
                 out.camera_near = Camera_Near_Cmd;
                 return out;
@@ -660,7 +702,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         {
             const float rev_m = Available_Reverse_M(
                 vision_fresh, rear_sensor_clear, opponent_alert, std::fabs(Config.escape_backout_m));
-            Start_Escape(in.now_ms, rev_m, in.chassis_active, in.wheels_still, out);
+            Start_Escape(in, rev_m, out);
         }
         else
         {
@@ -821,13 +863,14 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                 Sub_Phase = 2U;
                 State_Enter_Ms = in.now_ms;
                 Standstill_Abrupt_Stop = true;
-                Engage_Standstill_Gate(in.now_ms);
+                Engage_Standstill_Gate(in.now_ms, in);
                 out.drive_action = DRIVE_ACTION_EMERGENCY_STOP;
             }
             else if (in.chassis_motion_done)
             {
-                if (!in.chassis_active && in.wheels_still)
+                if (!in.use_motor_feedback_seq && !in.chassis_active && in.wheels_still)
                 {
+                    Reverse_Motion_In_Flight = false;
                     Sub_Phase = 3U;
                     State_Enter_Ms = in.now_ms;
                     out.drive_action = DRIVE_ACTION_START_TURN;
@@ -841,12 +884,16 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                     Sub_Phase = 2U;
                     State_Enter_Ms = in.now_ms;
                     Standstill_Abrupt_Stop = false;
-                    out.drive_action = DRIVE_ACTION_SOFT_STOP;
+                    if (in.use_motor_feedback_seq)
+                    {
+                        Engage_Standstill_Gate(in.now_ms, in);
+                    }
+                    out.drive_action = in.use_motor_feedback_seq ? DRIVE_ACTION_EMERGENCY_STOP : DRIVE_ACTION_SOFT_STOP;
                 }
             }
             else if (!in.chassis_active)
             {
-                Start_Escape(in.now_ms, 0.0f, in.chassis_active, in.wheels_still, out);
+                Start_Escape(in, 0.0f, out);
             }
             else
             {
@@ -890,7 +937,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             }
             else if (in.chassis_stalled || in.chassis_motion_aborted || !in.chassis_active)
             {
-                Start_Escape(in.now_ms, 0.0f, in.chassis_active, in.wheels_still, out);
+                Start_Escape(in, 0.0f, out);
             }
             else
             {
@@ -1056,6 +1103,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                                        (!Cargo_Is_Casualty && verdict == CORRAL_VALID_MATERIALS);
             const bool half_ok = (Latest_Vision.flags & VIS_FLAG_HOME_HALF_MATCH) != 0U;
             const bool path_ok = (Latest_Vision.flags & VIS_FLAG_DROP_PATH_CLEAR) != 0U;
+            const bool baseline_ready = (Latest_Vision.flags & VIS_FLAG_DROP_BASELINE_READY) != 0U;
             if (!cargo_matches)
             {
                 Clear_Cargo();
@@ -1064,9 +1112,9 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                 Enter_State(MISSION_BACK_OUT_SEPARATE, in.now_ms);
                 break;
             }
-            if (!path_ok)
+            if (!path_ok || !baseline_ready)
             {
-                Start_Escape(in.now_ms, 0.0f, in.chassis_active, in.wheels_still, out);
+                Start_Escape(in, 0.0f, out);
                 break;
             }
             if (!half_ok)
@@ -1113,7 +1161,8 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                                             (!Cargo_Is_Casualty && verdict == CORRAL_VALID_MATERIALS));
                 const bool half_ok = (Latest_Vision.flags & VIS_FLAG_HOME_HALF_MATCH) != 0U;
                 const bool path_ok = (Latest_Vision.flags & VIS_FLAG_DROP_PATH_CLEAR) != 0U;
-                if (verdict == CORRAL_ILLEGAL_HAZARD_OR_EXCESS || !cargo_matches || !path_ok)
+                const bool baseline_ready = (Latest_Vision.flags & VIS_FLAG_DROP_BASELINE_READY) != 0U;
+                if (verdict == CORRAL_ILLEGAL_HAZARD_OR_EXCESS || !cargo_matches || !path_ok || !baseline_ready)
                 {
                     Clear_Cargo();
                     Gate_Closed_Cmd = false;
@@ -1211,7 +1260,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             }
             else if (in.chassis_motion_aborted || !in.chassis_active)
             {
-                Start_Escape(in.now_ms, 0.0f, in.chassis_active, in.wheels_still, out);
+                Start_Escape(in, 0.0f, out);
             }
             else
             {
@@ -1272,7 +1321,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                 Confirm_Count = 0U;
                 Has_Confirm_Frame = false;
                 Last_Confirm_Frame_Seq = 0U;
-                Engage_Standstill_Gate(in.now_ms);
+                Engage_Standstill_Gate(in.now_ms, in);
                 out.drive_action = DRIVE_ACTION_EMERGENCY_STOP;
             }
             else if (in.chassis_motion_done || !in.chassis_active)
@@ -1283,7 +1332,11 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                 Confirm_Count = 0U;
                 Has_Confirm_Frame = false;
                 Last_Confirm_Frame_Seq = 0U;
-                out.drive_action = DRIVE_ACTION_SOFT_STOP;
+                if (in.use_motor_feedback_seq)
+                {
+                    Engage_Standstill_Gate(in.now_ms, in);
+                }
+                out.drive_action = in.use_motor_feedback_seq ? DRIVE_ACTION_EMERGENCY_STOP : DRIVE_ACTION_SOFT_STOP;
             }
             else
             {
@@ -1399,13 +1452,14 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                 Sub_Phase = 1U;
                 State_Enter_Ms = in.now_ms;
                 Standstill_Abrupt_Stop = true;
-                Engage_Standstill_Gate(in.now_ms);
+                Engage_Standstill_Gate(in.now_ms, in);
                 out.drive_action = DRIVE_ACTION_EMERGENCY_STOP;
             }
             else if (in.chassis_motion_done || !in.chassis_active)
             {
-                if (!in.chassis_active && in.wheels_still)
+                if (!in.use_motor_feedback_seq && !in.chassis_active && in.wheels_still)
                 {
+                    Reverse_Motion_In_Flight = false;
                     Sub_Phase = 2U;
                     State_Enter_Ms = in.now_ms;
                     out.drive_action = DRIVE_ACTION_START_TURN;
@@ -1419,7 +1473,11 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                     Sub_Phase = 1U;
                     State_Enter_Ms = in.now_ms;
                     Standstill_Abrupt_Stop = false;
-                    out.drive_action = DRIVE_ACTION_SOFT_STOP;
+                    if (in.use_motor_feedback_seq)
+                    {
+                        Engage_Standstill_Gate(in.now_ms, in);
+                    }
+                    out.drive_action = in.use_motor_feedback_seq ? DRIVE_ACTION_EMERGENCY_STOP : DRIVE_ACTION_SOFT_STOP;
                 }
             }
             else
@@ -1474,7 +1532,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             else if (in.chassis_stalled || in.chassis_motion_aborted || !in.chassis_active)
             {
                 // Turn failed/stalled/timed out: consume escape budget rather than treating as success.
-                Start_Escape(in.now_ms, 0.0f, in.chassis_active, in.wheels_still, out);
+                Start_Escape(in, 0.0f, out);
             }
             else
             {
