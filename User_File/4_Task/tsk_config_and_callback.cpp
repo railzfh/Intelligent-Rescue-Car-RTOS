@@ -384,8 +384,9 @@ static void Drive_Control()
     const float pack_voltage = Battery.Get_Pack_Voltage();
     __set_PRIMASK(primask);
 
-    // 任务上下文恢复任何被 TX/RX DMA 或 UART 错误中断停止的 RX DMA 接收流。
-    (void)UART_Service_Rx_Recovery(&huart1);
+    // 1 ms 控制任务仅做非阻塞 RX 健康检查，绝不阻塞调用 HAL DMA 中止/重初始化；
+    // 阻塞恢复移交至 10 ms statusTask 执行，RX 异常期间立即抑制运动。
+    const bool uart_rx_healthy = UART_Is_Rx_Healthy(&huart1);
     const bool uart_rx_fault = UART_Is_Rx_Fault_Latched(&huart1);
     Vision_Drain_Rx(now_ms);
 
@@ -456,7 +457,8 @@ static void Drive_Control()
     Struct_Mission_Inputs mission_in{};
     mission_in.now_ms = now_ms;
     mission_in.hardware_ready = ready;
-    mission_in.can_launch = can_start;
+    mission_in.can_launch = can_start && (is_bench_mode || uart_rx_healthy);
+    mission_in.uart_rx_healthy = is_bench_mode || uart_rx_healthy;
     mission_in.button_pressed = button_pressed;
     mission_in.chassis_active = (prev_state == MISSION_BENCH_STRAIGHT)
                                     ? Straight_Drive.Is_Running()
@@ -471,7 +473,7 @@ static void Drive_Control()
     mission_in.yaw_delta_rad = yaw_delta_rad;
 
     const Struct_Mission_Output cmd = Rescue_Mission.Update(mission_in);
-    Drive_Notify_Buzzer(can_start, cmd.launch_rejected_cue, now_ms);
+    Drive_Notify_Buzzer(mission_in.can_launch, cmd.launch_rejected_cue, now_ms);
 
     if (servos_ready)
     {
@@ -576,7 +578,7 @@ static void Drive_Control()
     if (battery_ready) { status_flags |= TEL_FLAG_BATTERY_OK; }
     if (attitude_fresh) { status_flags |= TEL_FLAG_IMU_OK; }
     if (feedback_fresh) { status_flags |= TEL_FLAG_MOTORS_OK; }
-    if (Rescue_Mission.Is_Vision_Fresh(now_ms)) { status_flags |= TEL_FLAG_VISION_FRESH; }
+    if (Rescue_Mission.Is_Vision_Fresh(now_ms) && uart_rx_healthy) { status_flags |= TEL_FLAG_VISION_FRESH; }
     if (Rescue_Mission.Is_First_Green_Unlocked()) { status_flags |= TEL_FLAG_FIRST_GREEN_UNLOCKED; }
     if (Rescue_Mission.Is_Gate_Closed_Cmd()) { status_flags |= TEL_FLAG_GATE_CLOSED; }
     if (Gate_Servo.Is_Settled()) { status_flags |= TEL_FLAG_GATE_SETTLED; }
@@ -585,6 +587,7 @@ static void Drive_Control()
     if (Chassis_Drive.Is_Stalled()) { status_flags |= TEL_FLAG_STALLED; }
     if (Rescue_Mission.Is_Link_Alive(now_ms)) { status_flags |= TEL_FLAG_LINK_ALIVE; }
     if (Rescue_Mission.Is_Carrying_Casualty()) { status_flags |= TEL_FLAG_CARRYING_CASUALTY; }
+    if (Rescue_Mission.Is_Drop_Pushing()) { status_flags |= TEL_FLAG_DROP_PUSHING; }
     tel.status_flags = status_flags;
 
     uint16_t fault_flags = 0U;
@@ -594,7 +597,7 @@ static void Drive_Control()
     if (!can1_ready || !can2_ready || !can_tx_ok) { fault_flags |= FAULT_FLAG_CAN_TX; }
     if (!Rescue_Mission.Is_Vision_Fresh(now_ms)) { fault_flags |= FAULT_FLAG_VISION_TIMEOUT; }
     if (Servos_Fault_Latched) { fault_flags |= FAULT_FLAG_SERVO; }
-    if (uart_rx_fault) { fault_flags |= FAULT_FLAG_UART_RX; }
+    if (uart_rx_fault || !uart_rx_healthy) { fault_flags |= FAULT_FLAG_UART_RX; }
     tel.fault_flags = fault_flags;
 
     tel.battery_mv = (pack_voltage > 0.0f && std::isfinite(pack_voltage))
@@ -610,7 +613,8 @@ static void Drive_Control()
     tel.delivered_orange = Rescue_Mission.Get_Delivered_Orange();
     tel.max_materials_per_trip = Rescue_Mission.Get_Max_Materials_Per_Trip();
 
-    const Struct_WS2812_Color led = Compute_Status_LED(battery_ready, ready, now_ms);
+    const Struct_WS2812_Color led =
+        Compute_Status_LED(battery_ready, ready && (is_bench_mode || uart_rx_healthy), now_ms);
     const uint32_t pub_mask = __get_PRIMASK();
     __disable_irq();
     Status_LED_Color = led;
@@ -733,6 +737,9 @@ void Task_Status_Run()
 
         BSP_WS2812.Set_RGB(led.Red, led.Green, led.Blue);
         BSP_WS2812.TIM_10ms_Write_PeriodElapsedCallback();
+
+        // 在非实时 10 ms 状态任务中执行 UART1 RX DMA 阻塞恢复，避免拖慢 1 ms 电机控制周期。
+        (void)UART_Service_Rx_Recovery(&huart1);
 
         // 每 50 ms (20 Hz) 发送遥测帧至 MaixCAM，仅在 DMA 空闲时发送静态缓冲区。
         if (++telemetry_div >= 5U)

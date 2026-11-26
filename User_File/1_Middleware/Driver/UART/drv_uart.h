@@ -82,6 +82,8 @@ void UART_Reinit(UART_HandleTypeDef * huart);
 
 bool UART_Service_Rx_Recovery(UART_HandleTypeDef *huart);
 
+bool UART_Is_Rx_Healthy(UART_HandleTypeDef *huart);
+
 bool UART_Is_Rx_Fault_Latched(UART_HandleTypeDef *huart);
 
 uint8_t UART_Transmit_Data(UART_HandleTypeDef *huart, uint8_t *Data, uint16_t Length);

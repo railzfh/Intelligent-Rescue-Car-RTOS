@@ -87,6 +87,7 @@ static constexpr uint16_t TEL_FLAG_CAMERA_SETTLED = (1U << 9);
 static constexpr uint16_t TEL_FLAG_STALLED = (1U << 10);
 static constexpr uint16_t TEL_FLAG_LINK_ALIVE = (1U << 11);
 static constexpr uint16_t TEL_FLAG_CARRYING_CASUALTY = (1U << 12);
+static constexpr uint16_t TEL_FLAG_DROP_PUSHING = (1U << 13);
 
 // Bitmask for Struct_Rescue_Telemetry::fault_flags
 static constexpr uint16_t FAULT_FLAG_BATTERY = (1U << 0);

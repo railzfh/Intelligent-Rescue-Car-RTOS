@@ -100,11 +100,13 @@ void Class_Rescue_Mission::Fault_Stop(uint32_t now_ms)
     if (is_competition_active)
     {
         Match_Final_Elapsed_Ms = now_ms - Match_Start_Ms;
+        Reverse_Motion_In_Flight = false;
         Require_Standstill_Gate = false;
         Enter_State(MISSION_FAULT_STOP, now_ms);
     }
     else if (State == MISSION_BENCH_STRAIGHT)
     {
+        Reverse_Motion_In_Flight = false;
         Require_Standstill_Gate = false;
         Enter_State(MISSION_PRE_MATCH, now_ms);
     }
@@ -261,9 +263,10 @@ bool Class_Rescue_Mission::Is_Reverse_Clearance_Lost(bool rear_sensor_clear) con
 
 bool Class_Rescue_Mission::Is_Active_Reverse_State() const
 {
-    return (State == MISSION_BACK_OUT_SEPARATE && Sub_Phase == 1U) ||
+    return Reverse_Motion_In_Flight ||
+           (State == MISSION_BACK_OUT_SEPARATE && (Sub_Phase == 1U || Sub_Phase == 2U)) ||
            (State == MISSION_DROP_BACKOUT_VERIFY && Sub_Phase == 1U) ||
-           (State == MISSION_ESCAPE_RECOVERY && Sub_Phase == 0U);
+           (State == MISSION_ESCAPE_RECOVERY && (Sub_Phase == 0U || Sub_Phase == 1U));
 }
 
 void Class_Rescue_Mission::Engage_Standstill_Gate(uint32_t now_ms)
@@ -341,6 +344,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         const bool was_reversing = Is_Active_Reverse_State() || Require_Standstill_Gate;
         Match_Final_Elapsed_Ms = Config.match_duration_ms;
         Clear_Cargo();
+        Reverse_Motion_In_Flight = false;
         Require_Standstill_Gate = false;
         Gate_Closed_Cmd = false;
         Camera_Near_Cmd = false;
@@ -357,6 +361,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         const bool was_reversing = Is_Active_Reverse_State() || Require_Standstill_Gate;
         Match_Final_Elapsed_Ms = in.now_ms - Match_Start_Ms;
         Clear_Cargo();
+        Reverse_Motion_In_Flight = false;
         Require_Standstill_Gate = false;
         Gate_Closed_Cmd = false;
         Camera_Near_Cmd = false;
@@ -367,13 +372,19 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         return out;
     }
 
-    // Global standstill interlock after any cancelled reverse: inhibit ALL motion across ALL states
-    // until fresh feedback confirms standstill (!chassis_active && wheels_still), or latch a fault.
+    if (Reverse_Motion_In_Flight && !in.chassis_active && in.wheels_still)
+    {
+        Reverse_Motion_In_Flight = false;
+    }
+
+    // Global standstill interlock after any cancelled/interrupted reverse or braking transition:
+    // inhibit ALL motion across ALL states until fresh feedback confirms standstill, or latch a fault.
     if (Require_Standstill_Gate && is_competition_active)
     {
         if (!in.chassis_active && in.wheels_still)
         {
             Require_Standstill_Gate = false;
+            Reverse_Motion_In_Flight = false;
         }
         else
         {
@@ -388,7 +399,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         }
     }
 
-    const bool vision_fresh = Is_Vision_Fresh(in.now_ms);
+    const bool vision_fresh = Is_Vision_Fresh(in.now_ms) && in.uart_rx_healthy;
     const bool rear_sensor_clear = vision_fresh && ((Latest_Vision.flags & VIS_FLAG_REAR_CLEAR) != 0U);
     const bool opponent_alert =
         vision_fresh && ((Latest_Vision.flags & (VIS_FLAG_OPPONENT_NEAR | VIS_FLAG_OPPONENT_ZONE_NEAR)) != 0U);
@@ -492,10 +503,16 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         if (Interrupted_By_Stale_Vision)
         {
             Interrupted_By_Stale_Vision = false;
-            // After pausing an open-loop motion due to stale vision, re-evaluate safely instead of resuming blind.
+            const bool need_standstill = Is_Active_Reverse_State() || in.chassis_active || !in.wheels_still;
+            // After pausing an open-loop motion due to stale vision, re-evaluate safely instead of resuming blind,
+            // and retain the global standstill interlock until fresh feedback confirms wheels have stopped.
             if (State == MISSION_LAUNCH_CROSS_BUMPS || State == MISSION_BACK_OUT_SEPARATE ||
                 State == MISSION_ESCAPE_RECOVERY)
             {
+                if (need_standstill)
+                {
+                    Engage_Standstill_Gate(in.now_ms);
+                }
                 if (Gate_Closed_Cmd)
                 {
                     Camera_Near_Cmd = true;
@@ -513,6 +530,10 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             }
             if (State == MISSION_DROP_OPEN_AND_PUSH && Sub_Phase == 2U)
             {
+                if (need_standstill)
+                {
+                    Engage_Standstill_Gate(in.now_ms);
+                }
                 // Verify in place after interrupted push without blind reversing.
                 Enter_State(MISSION_DROP_BACKOUT_VERIFY, in.now_ms);
                 Sub_Phase = 2U;
@@ -522,8 +543,12 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                 out.drive_action = DRIVE_ACTION_EMERGENCY_STOP;
                 return out;
             }
-            if (State == MISSION_DROP_BACKOUT_VERIFY && (Sub_Phase == 0U || Sub_Phase == 1U))
+            if (State == MISSION_DROP_BACKOUT_VERIFY && (Sub_Phase == 0U || Sub_Phase == 1U || need_standstill))
             {
+                if (need_standstill)
+                {
+                    Engage_Standstill_Gate(in.now_ms);
+                }
                 Sub_Phase = 2U;
                 State_Enter_Ms = in.now_ms;
                 Standstill_Abrupt_Stop = true;
@@ -1467,6 +1492,10 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         break;
     }
 
+    if (out.drive_action == DRIVE_ACTION_START_DISTANCE && out.distance_m < 0.0f)
+    {
+        Reverse_Motion_In_Flight = true;
+    }
     out.gate_closed = Gate_Closed_Cmd;
     out.camera_near = Camera_Near_Cmd;
     return out;

@@ -26,6 +26,7 @@ from maixcam.protocol import (
     TEAM_BLUE,
     TEAM_RED,
     TEL_FLAG_CONFIG_LOCKED,
+    TEL_FLAG_DROP_PUSHING,
     Telemetry,
     VIS_FLAG_CORRAL_SAFE,
     VIS_FLAG_DROP_CONFIRMED,
@@ -154,6 +155,131 @@ class _FakeMaixImage:
             if cnt >= pixels_threshold and (bw * bh) >= area_threshold:
                 out.append(_FakeMaixBlob(bx, by, bw, bh, cnt))
         return out
+
+
+class _FakeMaixBinaryImage:
+    """Real-MaixPy-faithful Tier-2 Image mock: exposes ONLY find_blobs(), crop(), binary() (no pixel accessor!)."""
+
+    def __init__(self, width: int, height: int, fill_lab: tuple[int, int, int]) -> None:
+        self.width = width
+        self.height = height
+        # Deliberately NOT named _grid and NO get_lab_pixel() so extract_blobs_from_maix_image uses Tier 2!
+        self._lab_rows = [[fill_lab for _ in range(width)] for _ in range(height)]
+
+    def fill_rect(self, x: int, y: int, w: int, h: int, lab: tuple[int, int, int]) -> None:
+        for yy in range(max(0, y), min(self.height, y + h)):
+            row = self._lab_rows[yy]
+            for xx in range(max(0, x), min(self.width, x + w)):
+                row[xx] = lab
+
+    def crop(self, x: int, y: int, w: int, h: int) -> "_FakeMaixBinaryImage":
+        x1, y1 = max(0, x), max(0, y)
+        x2, y2 = min(self.width, x + w), min(self.height, y + h)
+        sub = _FakeMaixBinaryImage(max(1, x2 - x1), max(1, y2 - y1), (0, 0, 0))
+        sub._lab_rows = [row[x1:x2] for row in self._lab_rows[y1:y2]]
+        return sub
+
+    def binary(
+        self,
+        thresholds: list[list[int] | tuple[int, int, int, int, int, int]],
+        invert: bool = False,
+        copy: bool = True,
+    ) -> "_FakeMaixBinaryImage":
+        white = (100, 0, 0)
+        black = (0, 0, 0)
+        out = _FakeMaixBinaryImage(self.width, self.height, black) if copy else self
+        new_rows: list[list[tuple[int, int, int]]] = []
+        for row in self._lab_rows:
+            out_row: list[tuple[int, int, int]] = []
+            for px in row:
+                matched = any(
+                    (t[0] <= px[0] <= t[1]) and (t[2] <= px[1] <= t[3]) and (t[4] <= px[2] <= t[5])
+                    for t in thresholds
+                )
+                if invert:
+                    matched = not matched
+                out_row.append(white if matched else black)
+            new_rows.append(out_row)
+        out._lab_rows = new_rows
+        return out
+
+    def find_blobs(
+        self,
+        thresholds: list[tuple[int, int, int, int, int, int]],
+        roi: tuple[int, int, int, int] | None = None,
+        pixels_threshold: int = 1,
+        area_threshold: int = 1,
+        invert: bool = False,
+        merge: bool = False,
+    ) -> list[_FakeMaixBlob]:
+        rx, ry, rw, rh = roi if roi is not None else (0, 0, self.width, self.height)
+        x1, y1 = max(0, rx), max(0, ry)
+        x2, y2 = min(self.width, rx + rw), min(self.height, ry + rh)
+        t = thresholds[0]
+
+        def matches(px: tuple[int, int, int]) -> bool:
+            inside = (t[0] <= px[0] <= t[1]) and (t[2] <= px[1] <= t[3]) and (t[4] <= px[2] <= t[5])
+            return (not inside) if invert else inside
+
+        visited = [[False] * (x2 - x1) for _ in range(y2 - y1)]
+        comps: list[tuple[int, int, int, int, int]] = []
+        for yy in range(y1, y2):
+            for xx in range(x1, x2):
+                if visited[yy - y1][xx - x1] or not matches(self._lab_rows[yy][xx]):
+                    continue
+                stack = [(xx, yy)]
+                visited[yy - y1][xx - x1] = True
+                min_x = max_x = xx
+                min_y = max_y = yy
+                cnt = 0
+                while stack:
+                    cx, cy = stack.pop()
+                    cnt += 1
+                    if cx < min_x:
+                        min_x = cx
+                    if cx > max_x:
+                        max_x = cx
+                    if cy < min_y:
+                        min_y = cy
+                    if cy > max_y:
+                        max_y = cy
+                    for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+                        if x1 <= nx < x2 and y1 <= ny < y2 and not visited[ny - y1][nx - x1]:
+                            if matches(self._lab_rows[ny][nx]):
+                                visited[ny - y1][nx - x1] = True
+                                stack.append((nx, ny))
+                bw = max_x - min_x + 1
+                bh = max_y - min_y + 1
+                if cnt >= pixels_threshold and (bw * bh) >= area_threshold:
+                    comps.append((min_x, min_y, bw, bh, cnt))
+
+        if merge and len(comps) > 1:
+            # OpenMV/MaixPy merge=True (margin=0) merges overlapping bounding boxes.
+            merged = list(comps)
+            changed = True
+            while changed:
+                changed = False
+                next_list: list[tuple[int, int, int, int, int]] = []
+                while merged:
+                    ax, ay, aw, ah, apx = merged.pop(0)
+                    i = 0
+                    while i < len(merged):
+                        bx, by, bw, bh, bpx = merged[i]
+                        if ax < bx + bw and ax + aw > bx and ay < by + bh and ay + ah > by:
+                            nx1 = min(ax, bx)
+                            ny1 = min(ay, by)
+                            nx2 = max(ax + aw, bx + bw)
+                            ny2 = max(ay + ah, by + bh)
+                            ax, ay, aw, ah, apx = nx1, ny1, nx2 - nx1, ny2 - ny1, apx + bpx
+                            merged.pop(i)
+                            changed = True
+                        else:
+                            i += 1
+                    next_list.append((ax, ay, aw, ah, apx))
+                merged = next_list
+            comps = merged
+
+        return [_FakeMaixBlob(bx, by, bw, bh, cnt) for bx, by, bw, bh, cnt in comps]
 
 
 class MaixcamProtocolTest(unittest.TestCase):
@@ -794,6 +920,205 @@ class MaixcamVisionAndUITest(unittest.TestCase):
             blobs_opp, camera_near_cmd=False, camera_settled=True, team=TEAM_RED, first_green_unlocked=False
         )
         self.assertTrue(st_opp.flags & VIS_FLAG_OPPONENT_NEAR)
+
+    def test_round5_dynamic_roi_frozen_baseline_and_tier2_binary_paths(self) -> None:
+        from maixcam.vision import _get_lab_pixel_accessor
+
+        floor_lab = (85, 0, 0)
+        red_lab = (50, 45, 30)
+        blue_lab = (40, 0, -45)
+        ramp_lab = (45, 40, -35)
+        green_lab = (55, -35, 30)
+        unknown_lab = (55, 0, 45)
+
+        # 1. Finding 2 (R5): Unknown at (145, 4) (224 px, 16x14) inside aligned home extending to y=0
+        #    (OUTSIDE default near_drop_roi y=20..128) MUST be detected in BOTH Tier 1 and Tier 2,
+        #    MUST NOT falsely contaminate corral_unknown_cnt, and MUST clear DROP_PATH_CLEAR & GATE_OPEN_SETTLED_ACK!
+        for img_cls in (_FakeMaixImage, _FakeMaixBinaryImage):
+            img_top = img_cls(320, 240, floor_lab)
+            img_top.fill_rect(100, 0, 220, 96, red_lab)        # aligned home extending above near_drop_roi.y=20!
+            img_top.fill_rect(100, 96, 220, 24, ramp_lab)
+            img_top.fill_rect(148, 150, 24, 24, green_lab)     # valid green block in corral
+            img_top.fill_rect(145, 4, 16, 14, unknown_lab)     # 224 px unknown at y=4..18!
+            if img_cls is _FakeMaixBinaryImage:
+                self.assertIsNone(_get_lab_pixel_accessor(img_top))
+            blobs_top = extract_blobs_from_maix_image(img_top, self.cfg, scan_unknown_near=True)
+            self.assertTrue(any(b.label == "unknown" for b in blobs_top))
+            self.proc.reset_drop_baseline()
+            st_top = self.proc.process(
+                blobs_top,
+                camera_near_cmd=True,
+                camera_settled=True,
+                team=TEAM_RED,
+                first_green_unlocked=False,
+                mission_state=MISSION_DROP_OPEN_AND_PUSH,
+                gate_closed=False,
+                gate_settled=True,
+                drop_pushing=False,
+            )
+            self.assertEqual(st_top.corral_unknown_cnt, 0)
+            self.assertTrue(st_top.flags & VIS_FLAG_CORRAL_SAFE)
+            self.assertFalse(st_top.flags & VIS_FLAG_DROP_PATH_CLEAR)
+            self.assertFalse(st_top.flags & VIS_FLAG_GATE_OPEN_SETTLED_ACK)
+
+        # 2. Finding 3 (R5): Freeze baseline on gate open, bind to MCU-authorized trip, and use explicit drop_pushing!
+        #    Low-speed push (drop_pushing=False, wheels_moving=False) changing visible corral from (1,1,0) to (0,1,0)
+        #    while home total changes MUST NOT rewrite baseline to (0,1,0) or confirm black alone!
+        home = Blob("red_zone", 100, 20, 220, 80, 17600)
+        ramp = Blob("purple_ramp", 100, 100, 220, 26, 5720)
+        corral_green = Blob("green", 140, 150, 24, 24, 500)
+        corral_black = Blob("black", 170, 150, 24, 24, 480, density=0.83)
+        self.proc.reset_drop_baseline()
+        # Gate closed pre-push snapshot: (1, 1, 0)
+        st_pre = self.proc.process(
+            [home, ramp, corral_green, corral_black],
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=True,
+            max_materials_per_trip=2,
+            mission_state=MISSION_DROP_OPEN_AND_PUSH,
+            gate_closed=True,
+            gate_settled=True,
+            drop_pushing=False,
+        )
+        self.assertTrue(st_pre.flags & VIS_FLAG_DROP_PATH_CLEAR)
+        # Gate open + settled ACK on exact (1, 1, 0)
+        st_ack = self.proc.process(
+            [home, ramp, corral_green, corral_black],
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=True,
+            max_materials_per_trip=2,
+            mission_state=MISSION_DROP_OPEN_AND_PUSH,
+            gate_closed=False,
+            gate_settled=True,
+            drop_pushing=False,
+            wheels_moving=False,
+        )
+        self.assertTrue(st_ack.flags & VIS_FLAG_GATE_OPEN_SETTLED_ACK)
+        # Low-speed push begins before telemetry updates (wheels_moving=False, drop_pushing=False):
+        # green exits corral into home (home total changes!) leaving (0, 1, 0) in corral.
+        # Baseline MUST remain frozen at (1, 1, 0), NOT rewritten to (0, 1, 0)!
+        st_low_speed = self.proc.process(
+            [home, ramp, Blob("green", 140, 50, 24, 24, 500), corral_black],
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=True,
+            max_materials_per_trip=2,
+            mission_state=MISSION_DROP_OPEN_AND_PUSH,
+            gate_closed=False,
+            gate_settled=True,
+            drop_pushing=False,
+            wheels_moving=False,
+        )
+        self.assertFalse(st_low_speed.flags & VIS_FLAG_GATE_OPEN_SETTLED_ACK)
+        # Explicit push phase (TEL_FLAG_DROP_PUSHING): cargo crossing ramp keeps DROP_PATH_CLEAR while cyan blocks it.
+        st_push_ok = self.proc.process(
+            [home, ramp, Blob("green", 140, 96, 24, 24, 500), corral_black],
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=True,
+            max_materials_per_trip=2,
+            mission_state=MISSION_DROP_OPEN_AND_PUSH,
+            gate_closed=False,
+            gate_settled=True,
+            drop_pushing=True,
+        )
+        self.assertTrue(st_push_ok.flags & VIS_FLAG_DROP_PATH_CLEAR)
+        self.assertFalse(st_push_ok.flags & VIS_FLAG_GATE_OPEN_SETTLED_ACK)
+        st_push_cyan = self.proc.process(
+            [home, ramp, Blob("cyan", 140, 96, 24, 24, 500), corral_black],
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=True,
+            max_materials_per_trip=2,
+            mission_state=MISSION_DROP_OPEN_AND_PUSH,
+            gate_closed=False,
+            gate_settled=True,
+            drop_pushing=True,
+        )
+        self.assertFalse(st_push_cyan.flags & VIS_FLAG_DROP_PATH_CLEAR)
+        # Verify: black alone in target half (0, 1, 0) MUST NOT confirm against frozen (1, 1, 0) baseline!
+        st_black_only = self.proc.process(
+            [home, ramp, Blob("black", 140, 50, 24, 24, 480, density=0.83)],
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=True,
+            max_materials_per_trip=2,
+            mission_state=MISSION_DROP_BACKOUT_VERIFY,
+        )
+        self.assertFalse(st_black_only.flags & VIS_FLAG_DROP_CONFIRMED)
+        # Both green + black in target half (1, 1, 0) DOES confirm!
+        st_both_ok = self.proc.process(
+            [home, ramp, Blob("green", 120, 50, 24, 24, 500), Blob("black", 155, 50, 24, 24, 480, density=0.83)],
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=True,
+            max_materials_per_trip=2,
+            mission_state=MISSION_DROP_BACKOUT_VERIFY,
+        )
+        self.assertTrue(st_both_ok.flags & VIS_FLAG_DROP_CONFIRMED)
+        # Verify TEL_FLAG_DROP_PUSHING round-trips cleanly.
+        tel = Telemetry(status_flags=TEL_FLAG_DROP_PUSHING)
+        parser = RescueProtocolParser()
+        decoded_tel = decode_telemetry(parser.feed(encode_telemetry(1, tel))[0])
+        self.assertEqual(decoded_tel.status_flags, TEL_FLAG_DROP_PUSHING)
+
+        # 3. Finding 4 (R5): Direct Tier-2 MaixPy binary() test — verified purple_ramp at y=100..126
+        #    MUST NOT mask a separate unverified 100-px (10x10) purple patch inside red_zone at y=40..50!
+        img_bin_purple = _FakeMaixBinaryImage(320, 240, floor_lab)
+        self.assertIsNone(_get_lab_pixel_accessor(img_bin_purple))
+        img_bin_purple.fill_rect(40, 20, 240, 80, red_lab)
+        img_bin_purple.fill_rect(40, 100, 240, 26, ramp_lab)
+        img_bin_purple.fill_rect(100, 40, 10, 10, ramp_lab)  # 100 px unverified purple patch outside ramp!
+        blobs_bp = extract_blobs_from_maix_image(img_bin_purple, self.cfg, scan_unknown_near=True)
+        self.assertTrue(any(b.label == "purple_ramp" for b in blobs_bp))
+        self.assertTrue(any(b.label == "unknown" for b in blobs_bp))
+
+        # Tier-2 nested blue_zone + purple_ramp with overlapping LAB thresholds MUST still produce ZERO unknown!
+        overlap_cfg = RescueVisionConfig()
+        overlap_cfg.lab_thresholds["blue_zone"] = [20, 62, -10, 30, -68, -22]
+        img_bin_nested = _FakeMaixBinaryImage(320, 240, floor_lab)
+        img_bin_nested.fill_rect(90, 130, 120, 80, blue_lab)
+        img_bin_nested.fill_rect(120, 145, 60, 40, ramp_lab)
+        blobs_bn = extract_blobs_from_maix_image(img_bin_nested, overlap_cfg, scan_unknown_near=True)
+        self.assertEqual([b for b in blobs_bn if b.label == "unknown"], [])
+
+        # 4. Finding 5 (R5): Direct Tier-2 MaixPy binary() opponent floor-exclusion test —
+        #    distant opponent ending at y2=67 with floor-overlapping custom opponent LAB MUST keep tight y2==67
+        #    (NOT y2=240!) and MUST NOT raise VIS_FLAG_OPPONENT_NEAR — even when touching a lower green block!
+        overlap_opp_cfg = RescueVisionConfig()
+        overlap_opp_cfg.lab_thresholds["opponent"] = [35, 95, -15, 15, -15, 15]
+        img_bin_opp = _FakeMaixBinaryImage(320, 240, floor_lab)
+        self.assertIsNone(_get_lab_pixel_accessor(img_bin_opp))
+        img_bin_opp.fill_rect(120, 10, 60, 57, (50, 0, 0))  # 3420 px distant opponent, y2=67 < opponent_near_y=145
+        blobs_bo = extract_blobs_from_maix_image(img_bin_opp, overlap_opp_cfg, scan_unknown_near=False)
+        opp_blobs = [b for b in blobs_bo if b.label == "opponent"]
+        self.assertEqual(len(opp_blobs), 1)
+        self.assertEqual(opp_blobs[0].y2, 67)
+        st_bo = self.proc.process(
+            blobs_bo, camera_near_cmd=False, camera_settled=True, team=TEAM_RED, first_green_unlocked=False
+        )
+        self.assertFalse(st_bo.flags & VIS_FLAG_OPPONENT_NEAR)
+
+        # Even if a green block touches the bottom edge of the distant opponent down to y2=157,
+        # Tier-2 binary search MUST STILL report exact opponent y2==67 and VIS_FLAG_OPPONENT_NEAR==0!
+        img_bin_opp.fill_rect(120, 67, 25, 90, green_lab)
+        blobs_bo_touch = extract_blobs_from_maix_image(img_bin_opp, overlap_opp_cfg, scan_unknown_near=False)
+        opp_blobs_t = [b for b in blobs_bo_touch if b.label == "opponent"]
+        self.assertEqual(len(opp_blobs_t), 1)
+        self.assertEqual(opp_blobs_t[0].y2, 67)
+        st_bo_t = self.proc.process(
+            blobs_bo_touch, camera_near_cmd=False, camera_settled=True, team=TEAM_RED, first_green_unlocked=False
+        )
+        self.assertFalse(st_bo_t.flags & VIS_FLAG_OPPONENT_NEAR)
 
     def test_home_half_match_checks_full_corral_width_and_opponent_zone(self) -> None:
         # Home x=100..320 (cx=210, left material half=[100, 192]).

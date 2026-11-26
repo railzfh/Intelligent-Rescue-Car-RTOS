@@ -140,6 +140,24 @@ void UART_Reinit(UART_HandleTypeDef *huart)
 }
 
 /**
+ * @brief 非阻塞查询 UART RX DMA 当前是否处于健康运行态（适用于 1 ms 实时控制任务）
+ */
+bool UART_Is_Rx_Healthy(UART_HandleTypeDef *huart)
+{
+    const Struct_UART_Manage_Object *obj = UART_Get_Manage_Object(huart);
+    if (obj == nullptr || obj->UART_Handler != huart)
+    {
+        return false;
+    }
+    if (obj->Rx_Recovery_Fault_Latched || obj->Rx_Recovery_Pending)
+    {
+        return false;
+    }
+    const bool dma_running_ok = (huart->hdmarx == nullptr) || (huart->hdmarx->State == HAL_DMA_STATE_BUSY);
+    return (huart->RxState == HAL_UART_STATE_BUSY_RX) && dma_running_ok;
+}
+
+/**
  * @brief 查询该 UART 的 RX DMA 恢复是否已锁存永久故障
  */
 bool UART_Is_Rx_Fault_Latched(UART_HandleTypeDef *huart)

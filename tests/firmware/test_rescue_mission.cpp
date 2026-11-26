@@ -935,6 +935,190 @@ static void Test_Same_Cargo_Reverify_After_Escape_Cannot_Bypass_Recovery_Budget(
     assert(mission.Get_State() == MISSION_FAULT_STOP);
 }
 
+static void Test_Braking_Phase_Vision_Outage_And_Uart_Rx_Unhealthy()
+{
+    // Finding 1 (R5): Vision outage & recovery AFTER reverse completes into braking
+    // (BOTH BACK_OUT_SEPARATE Sub_Phase 2 AND ESCAPE_RECOVERY Sub_Phase 1) MUST retain
+    // the global standstill interlock until fresh feedback confirms wheels_still=true,
+    // NEVER commanding search velocity (0.45 rad/s) while wheels_still=false!
+    {
+        Class_Rescue_Mission m;
+        assert(m.On_Set_Config({RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION, 1U}));
+        uint32_t t = 1000U;
+        uint16_t seq = 1U;
+        assert(m.On_Vision_State(Make_Far_Vision(seq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), t));
+        Struct_Mission_Inputs in{};
+        in.now_ms = t;
+        in.hardware_ready = true;
+        in.can_launch = true;
+        in.button_pressed = true;
+        in.wheels_still = true;
+        in.gate_settled = true;
+        in.camera_settled = true;
+        m.Update(in);
+        in.button_pressed = false;
+        in.forward_delta_m = 0.16f;
+        in.chassis_motion_done = true;
+        in.now_ms = (t += 50U);
+        assert(m.On_Vision_State(Make_Far_Vision(seq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 0, 190U), t));
+        m.Update(in);
+        in.forward_delta_m = 0.0f;
+        in.chassis_motion_done = false;
+        for (int i = 0; i < 2; ++i)
+        {
+            in.now_ms = (t += 50U);
+            assert(m.On_Vision_State(Make_Far_Vision(seq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 0, 190U), t));
+            m.Update(in);
+        }
+        // Cyan in inspect -> BACK_OUT_SEPARATE -> start reverse (Sub_Phase 1).
+        in.now_ms = (t += 50U);
+        assert(m.On_Vision_State(Make_Near_Vision(seq++, 0U, 0U, 0U, 1U, 0U, 0U), t));
+        m.Update(in);
+        assert(m.Get_State() == MISSION_BACK_OUT_SEPARATE);
+        in.now_ms = (t += 20U);
+        assert(m.On_Vision_State(Make_Far_Vision(seq++, TARGET_NONE, 0U), t));
+        auto out = m.Update(in);
+        assert(out.drive_action == DRIVE_ACTION_START_DISTANCE && out.distance_m < 0.0f);
+
+        // Reverse finishes distance into braking Sub_Phase 2 while wheels are STILL moving!
+        in.chassis_motion_done = true;
+        in.chassis_active = false;
+        in.wheels_still = false;
+        in.now_ms = (t += 40U);
+        assert(m.On_Vision_State(Make_Far_Vision(seq++, TARGET_NONE, 0U), t));
+        out = m.Update(in);
+        assert(m.Get_State() == MISSION_BACK_OUT_SEPARATE);
+        assert(out.drive_action == DRIVE_ACTION_SOFT_STOP);
+        in.chassis_motion_done = false;
+
+        // Vision outage (> 300 ms) during braking Sub_Phase 2 -> MUST engage standstill gate + EMERGENCY_STOP!
+        in.now_ms = (t += 350U);
+        out = m.Update(in);
+        assert(out.drive_action == DRIVE_ACTION_EMERGENCY_STOP);
+
+        // Vision recovers with fresh FAR frame while wheels_still is STILL false ->
+        // MUST NEVER command 0.45 rad/s search velocity! Must stay EMERGENCY_STOP until wheels_still=true!
+        in.now_ms = (t += 50U);
+        assert(m.On_Vision_State(Make_Far_Vision(seq++, TARGET_NONE, 0U), t));
+        out = m.Update(in);
+        assert(out.drive_action == DRIVE_ACTION_EMERGENCY_STOP);
+
+        for (int k = 0; k < 5; ++k)
+        {
+            in.now_ms = (t += 40U);
+            assert(m.On_Vision_State(Make_Far_Vision(seq++, TARGET_NONE, 0U), t));
+            out = m.Update(in);
+            assert(out.drive_action == DRIVE_ACTION_EMERGENCY_STOP);
+            assert(out.angular_rad_s == 0.0f && out.linear_mps == 0.0f);
+        }
+
+        // Fresh feedback confirms standstill -> first tick transitions cleanly to SEARCH_TARGET with EMERGENCY_STOP,
+        // and the next tick in SEARCH_TARGET cleanly resumes search spin!
+        in.wheels_still = true;
+        in.now_ms = (t += 40U);
+        assert(m.On_Vision_State(Make_Far_Vision(seq++, TARGET_NONE, 0U), t));
+        out = m.Update(in);
+        assert(m.Get_State() == MISSION_SEARCH_TARGET);
+        assert(out.drive_action == DRIVE_ACTION_EMERGENCY_STOP);
+
+        in.now_ms = (t += 40U);
+        assert(m.On_Vision_State(Make_Far_Vision(seq++, TARGET_NONE, 0U), t));
+        out = m.Update(in);
+        assert(m.Get_State() == MISSION_SEARCH_TARGET);
+        assert(out.drive_action == DRIVE_ACTION_VELOCITY && out.angular_rad_s > 0.1f);
+    }
+
+    // Part B: Same braking-phase outage/recovery probe in MISSION_ESCAPE_RECOVERY Sub_Phase 1!
+    {
+        Class_Rescue_Mission em;
+        assert(em.On_Set_Config({RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION, 1U}));
+        uint32_t et = 1000U;
+        uint16_t eseq = 1U;
+        assert(em.On_Vision_State(Make_Far_Vision(eseq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), et));
+        Struct_Mission_Inputs ein{};
+        ein.now_ms = et;
+        ein.hardware_ready = true;
+        ein.can_launch = true;
+        ein.button_pressed = true;
+        ein.wheels_still = true;
+        ein.gate_settled = true;
+        ein.camera_settled = true;
+        em.Update(ein);
+        ein.button_pressed = false;
+        ein.forward_delta_m = 0.20f;
+        ein.chassis_motion_done = true;
+        ein.now_ms = (et += 50U);
+        assert(em.On_Vision_State(Make_Far_Vision(eseq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), et));
+        em.Update(ein);
+        ein.forward_delta_m = 0.0f;
+        ein.chassis_motion_done = false;
+        assert(em.Get_State() == MISSION_SEARCH_TARGET);
+
+        // Trigger stall escape with explicit rear clearance -> starts escape reverse (Sub_Phase 0).
+        ein.chassis_stalled = true;
+        ein.now_ms = (et += 40U);
+        assert(em.On_Vision_State(Make_Far_Vision(eseq++, TARGET_NONE, VIS_FLAG_REAR_CLEAR), et));
+        auto eout = em.Update(ein);
+        assert(em.Get_State() == MISSION_ESCAPE_RECOVERY);
+        assert(eout.drive_action == DRIVE_ACTION_START_DISTANCE && eout.distance_m < 0.0f);
+        ein.chassis_stalled = false;
+
+        // Escape reverse completes into braking Sub_Phase 1 while wheels_still=false!
+        ein.chassis_motion_done = true;
+        ein.chassis_active = false;
+        ein.wheels_still = false;
+        ein.now_ms = (et += 40U);
+        assert(em.On_Vision_State(Make_Far_Vision(eseq++, TARGET_NONE, VIS_FLAG_REAR_CLEAR), et));
+        eout = em.Update(ein);
+        assert(em.Get_State() == MISSION_ESCAPE_RECOVERY);
+        assert(eout.drive_action == DRIVE_ACTION_SOFT_STOP);
+        ein.chassis_motion_done = false;
+
+        // Vision outage (> 300 ms) during escape braking Sub_Phase 1, then recovery while wheels_still=false!
+        ein.now_ms = (et += 350U);
+        eout = em.Update(ein);
+        assert(eout.drive_action == DRIVE_ACTION_EMERGENCY_STOP);
+
+        // Even across recovery + 1500 ms with wheels never stopping, MUST stay EMERGENCY_STOP and latch FAULT_STOP!
+        for (int k = 0; k < 20 && em.Get_State() != MISSION_FAULT_STOP; ++k)
+        {
+            ein.now_ms = (et += 100U);
+            assert(em.On_Vision_State(Make_Far_Vision(eseq++, TARGET_NONE, 0U), et));
+            eout = em.Update(ein);
+            assert(eout.drive_action == DRIVE_ACTION_EMERGENCY_STOP);
+            assert(eout.angular_rad_s == 0.0f && eout.linear_mps == 0.0f);
+        }
+        assert(em.Get_State() == MISSION_FAULT_STOP);
+    }
+
+    // Part C: Finding 6 (R5) — in.uart_rx_healthy=false immediately inhibits motion even while frame timestamp is fresh.
+    {
+        Class_Rescue_Mission um;
+        assert(um.On_Set_Config({RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION, 1U}));
+        uint32_t ut = 1000U;
+        uint16_t useq = 1U;
+        assert(um.On_Vision_State(Make_Far_Vision(useq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), ut));
+        Struct_Mission_Inputs uin{};
+        uin.now_ms = ut;
+        uin.hardware_ready = true;
+        uin.can_launch = true;
+        uin.uart_rx_healthy = true;
+        uin.button_pressed = true;
+        uin.wheels_still = true;
+        uin.gate_settled = true;
+        uin.camera_settled = true;
+        um.Update(uin);
+        uin.button_pressed = false;
+        assert(um.Get_State() == MISSION_LAUNCH_CROSS_BUMPS);
+
+        // Only 10 ms later (vision timestamp still very fresh!), UART RX becomes unhealthy -> immediate stop!
+        uin.uart_rx_healthy = false;
+        uin.now_ms = (ut += 10U);
+        auto uout = um.Update(uin);
+        assert(uout.drive_action == DRIVE_ACTION_SOFT_STOP);
+    }
+}
+
 int main()
 {
     Test_Freshness_Nonconsecutive_Replay_Wrap_And_Restart();
@@ -946,5 +1130,6 @@ int main()
     Test_Drop_Rechecks_Hazards_And_Alignment_While_Opening_And_Pushing();
     Test_Active_Reverse_Abrupt_Clearance_Loss_Cancels_Immediately_And_Waits_Standstill();
     Test_Same_Cargo_Reverify_After_Escape_Cannot_Bypass_Recovery_Budget();
-    std::puts("PASS: rescue mission replay/wrap, stale/opponent interlock, gate/push hazard abort, margin reverse + standstill, bounded recovery");
+    Test_Braking_Phase_Vision_Outage_And_Uart_Rx_Unhealthy();
+    std::puts("PASS: rescue mission replay/wrap, stale/opponent interlock, gate/push hazard abort, margin reverse + standstill, braking outage gate, bounded recovery");
 }

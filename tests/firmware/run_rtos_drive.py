@@ -68,9 +68,17 @@ struct Class_PWM_Servo {
     bool Is_Settled() const { return ctrl.Is_Settled(); }
     uint16_t Get_Current_Us() const { return ctrl.Get_Current_Us(); }
 };
-struct UART_HandleTypeDef { bool rx_fault_latched = false; };
+struct UART_HandleTypeDef {
+    bool rx_healthy = true;
+    bool rx_fault_latched = false;
+    int service_rx_calls = 0;
+};
 UART_HandleTypeDef huart1;
-bool UART_Service_Rx_Recovery(UART_HandleTypeDef *h) { return !h->rx_fault_latched; }
+bool UART_Service_Rx_Recovery(UART_HandleTypeDef *h) {
+    ++h->service_rx_calls;
+    return !h->rx_fault_latched;
+}
+bool UART_Is_Rx_Healthy(UART_HandleTypeDef *h) { return h->rx_healthy && !h->rx_fault_latched; }
 bool UART_Is_Rx_Fault_Latched(UART_HandleTypeDef *h) { return h->rx_fault_latched; }
 struct FDCAN_HandleTypeDef { bool pending = false, fail = false; int tx_calls = 0; };
 FDCAN_HandleTypeDef hfdcan1, hfdcan2;
@@ -121,6 +129,8 @@ void Step(uint32_t t, bool pressed, bool imu = true, bool update_battery = true)
     Attitude_Valid = imu; Attitude_Sample_Ms = t; Imu_Quiet = true;
     Drive_Control();
     assert(irq_mask == 0);
+    // 1 ms Drive_Control() MUST NEVER invoke blocking UART_Service_Rx_Recovery().
+    assert(huart1.service_rx_calls == 0);
 }
 void Stopped() {
     assert(!Straight_Drive.Is_Running());
@@ -138,6 +148,65 @@ int main(int argc, char **argv) {
     const bool cold_boot = argc > 1 && std::strcmp(argv[1], "cold_boot") == 0;
     const bool servo_fail = argc > 1 && std::strcmp(argv[1], "servo_fail") == 0;
     const bool reverse_abort = argc > 1 && std::strcmp(argv[1], "reverse_abort") == 0;
+    const bool uart_unhealthy = argc > 1 && std::strcmp(argv[1], "uart_unhealthy") == 0;
+
+    if (uart_unhealthy) {
+        // Finding 6 (R5): 1 ms Drive_Control() uses non-blocking UART_Is_Rx_Healthy(),
+        // NEVER calls blocking UART_Service_Rx_Recovery(), blocks pre-match launch while RX is unhealthy,
+        // immediately inhibits motion during active competition when RX goes unhealthy, and latches
+        // MISSION_FAULT_STOP if RX recovery permanently faults.
+        Feed_Config(RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION);
+        uint16_t fseq = 1U;
+        uint32_t t = 0U;
+        for (; t < 200U; ++t) {
+            if ((t % 40U) == 0U) { Feed_Vision(fseq++); }
+            Step(t, false);
+        }
+        assert(Servos_Started && Gate_Servo.Is_Settled() && Pitch_Servo.Is_Settled());
+
+        // Transient RX recovery pending (not yet fault-latched) MUST block competition launch immediately.
+        huart1.rx_healthy = false;
+        Step(t += 10U, true);
+        Step(t += 30U, true);
+        assert(Rescue_Mission.Get_State() == MISSION_PRE_MATCH);
+        assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_UART_RX) != 0U);
+        assert((Telemetry_Snapshot.status_flags & TEL_FLAG_VISION_FRESH) == 0U);
+        Stopped();
+
+        // Release button, restore RX health -> launch now succeeds cleanly.
+        Step(t += 10U, false);
+        Step(t += 30U, false);
+        huart1.rx_healthy = true;
+        Feed_Vision(fseq++);
+        Step(t += 10U, true);
+        Step(t += 30U, true);
+        assert(Rescue_Mission.Get_State() == MISSION_LAUNCH_CROSS_BUMPS);
+        assert(M2006[0].torque < 0.0f && M2006[1].torque > 0.0f);
+        assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_UART_RX) == 0U);
+        assert((Telemetry_Snapshot.status_flags & TEL_FLAG_VISION_FRESH) != 0U);
+
+        // RX becomes transiently unhealthy mid-run -> motion MUST inhibit immediately (even while latest frame is < 50 ms old)!
+        huart1.rx_healthy = false;
+        Step(t += 5U, false);
+        assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_UART_RX) != 0U);
+        assert((Telemetry_Snapshot.status_flags & TEL_FLAG_VISION_FRESH) == 0U);
+        assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_STOPPING || Chassis_Drive.Get_Mode() == CHASSIS_MODE_IDLE);
+        // Step soft-stop deceleration ramp cleanly to standstill / IDLE with zero torque.
+        for (int k = 0; k < 100 && Chassis_Drive.Is_Active(); ++k) {
+            Step(++t, false);
+        }
+        Stopped();
+
+        // Permanently latched RX fault -> immediately latches MISSION_FAULT_STOP.
+        huart1.rx_fault_latched = true;
+        Step(t += 5U, false);
+        assert(Rescue_Mission.Get_State() == MISSION_FAULT_STOP);
+        assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_UART_RX) != 0U);
+        Stopped();
+        assert(huart1.service_rx_calls == 0);
+        std::puts("PASS: non-blocking UART RX health gate blocks launch, inhibits motion immediately, and never blocks in Drive_Control");
+        return 0;
+    }
 
     if (reverse_abort) {
         // Coupled Drive_Control + Rescue_Mission + Chassis_Drive probe:
@@ -463,5 +532,5 @@ cmd = ["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-Wno-unused-variable
 if os.name == "nt":
     cmd.append("-static")
 subprocess.run(cmd, check=True)
-for mode in ([], ["held"], ["comp"], ["can_fault"], ["frozen"], ["cold_boot"], ["servo_fail"], ["reverse_abort"]):
+for mode in ([], ["held"], ["comp"], ["can_fault"], ["frozen"], ["cold_boot"], ["servo_fail"], ["reverse_abort"], ["uart_unhealthy"]):
     subprocess.run([str(exe), *mode], check=True)

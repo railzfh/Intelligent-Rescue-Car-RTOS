@@ -86,6 +86,7 @@ struct Struct_Mission_Inputs
     uint32_t now_ms = 0U;
     bool hardware_ready = false;
     bool can_launch = false;
+    bool uart_rx_healthy = true;
     bool button_pressed = false;
     bool chassis_active = false;
     bool wheels_still = false;
@@ -141,6 +142,7 @@ public:
     bool Is_Carrying_Casualty() const { return Cargo_Is_Casualty; }
     bool Is_Gate_Closed_Cmd() const { return Gate_Closed_Cmd; }
     bool Is_Camera_Near_Cmd() const { return Camera_Near_Cmd; }
+    bool Is_Drop_Pushing() const { return State == MISSION_DROP_OPEN_AND_PUSH && Sub_Phase == 2U; }
     uint32_t Get_Match_Elapsed_Ms(uint32_t now_ms) const;
     uint8_t Get_Delivered_Green() const { return Delivered_Green; }
     uint8_t Get_Delivered_Black() const { return Delivered_Black; }
@@ -210,9 +212,10 @@ private:
     float Pending_Escape_Reverse_M = 0.0f;
     bool Standstill_Abrupt_Stop = false;
 
-    // Post-settle gate check latch (Finding 1) & global standstill interlock after reverse abort (Finding 3).
+    // Post-settle gate check latch & global standstill interlock tracking reverse through braking.
     bool Gate_Open_Settled_Latched = false;
     uint16_t Gate_Settled_Frame_Seq = 0U;
+    bool Reverse_Motion_In_Flight = false;
     bool Require_Standstill_Gate = false;
     uint32_t Standstill_Gate_Start_Ms = 0U;
 

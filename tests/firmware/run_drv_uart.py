@@ -260,6 +260,7 @@ int main() {
     UART_Init(&huart1, On_Rx);
     assert(huart1.arm_calls == 1U);
     assert((hdmarx.disabled_it_mask & DMA_IT_HT) != 0U);
+    assert(UART_Is_Rx_Healthy(&huart1));
     assert(!UART_Is_Rx_Fault_Latched(&huart1));
 
     // 1. Mid-transfer HT event ignored; IDLE delivers Rx_Buffer_0 cleanly.
@@ -277,16 +278,20 @@ int main() {
     uint8_t tx_dummy[4] = {1, 2, 3, 4};
     UART_Transmit_Data(&huart1, tx_dummy, 4U);
     Simulate_Bundled_HAL_Tx_DMA_Error(&huart1);
+    assert(!UART_Is_Rx_Healthy(&huart1));
     assert(UART1_Manage_Object.Rx_Recovery_Pending && huart1.arm_failures == 0U);
     assert(UART_Service_Rx_Recovery(&huart1));
+    assert(UART_Is_Rx_Healthy(&huart1));
     assert(huart1.RxState == HAL_UART_STATE_BUSY_RX && hdmarx.State == HAL_DMA_STATE_BUSY);
     assert(!UART_Is_Rx_Fault_Latched(&huart1));
 
     // 3. REAL HAL DMA abort timeout -> hdmarx transitions to HAL_DMA_STATE_ERROR!
     //    Driver MUST explicitly handle ERROR via HAL_DMA_DeInit + HAL_DMA_Init (NOT loop HAL_DMA_Abort!).
     Simulate_Bundled_HAL_Tx_DMA_Error(&huart1);
+    assert(!UART_Is_Rx_Healthy(&huart1));
     hdmarx.timeout_abort_once = true;
     assert(UART_Service_Rx_Recovery(&huart1));
+    assert(UART_Is_Rx_Healthy(&huart1));
     assert(hdmarx.deinit_calls == 1U && hdmarx.init_calls == 1U);
     assert(huart1.RxState == HAL_UART_STATE_BUSY_RX && hdmarx.State == HAL_DMA_STATE_BUSY);
     assert(!UART1_Manage_Object.Rx_Recovery_Pending && !UART_Is_Rx_Fault_Latched(&huart1));
@@ -295,8 +300,10 @@ int main() {
     Simulate_Bundled_HAL_Tx_DMA_Error(&huart1);
     huart1.fail_rearm_once = true;
     assert(!UART_Service_Rx_Recovery(&huart1));
+    assert(!UART_Is_Rx_Healthy(&huart1));
     assert(UART1_Manage_Object.Rx_Recovery_Pending && !UART_Is_Rx_Fault_Latched(&huart1));
     assert(UART_Service_Rx_Recovery(&huart1));
+    assert(UART_Is_Rx_Healthy(&huart1));
     assert(!UART1_Manage_Object.Rx_Recovery_Pending && !UART_Is_Rx_Fault_Latched(&huart1));
 
     // 5. Permanently wedged DMA stream (HAL_DMA_Init stays in HAL_DMA_STATE_ERROR) MUST latch fault!
@@ -304,11 +311,11 @@ int main() {
     hdmarx.timeout_abort_once = true;
     hdmarx.wedge_init_always = true;
     assert(!UART_Service_Rx_Recovery(&huart1));
-    assert(!UART_Is_Rx_Fault_Latched(&huart1));
+    assert(!UART_Is_Rx_Healthy(&huart1) && !UART_Is_Rx_Fault_Latched(&huart1));
     assert(!UART_Service_Rx_Recovery(&huart1));
-    assert(!UART_Is_Rx_Fault_Latched(&huart1));
+    assert(!UART_Is_Rx_Healthy(&huart1) && !UART_Is_Rx_Fault_Latched(&huart1));
     assert(!UART_Service_Rx_Recovery(&huart1));
-    assert(UART_Is_Rx_Fault_Latched(&huart1));
+    assert(!UART_Is_Rx_Healthy(&huart1) && UART_Is_Rx_Fault_Latched(&huart1));
     const uint32_t init_before = hdmarx.init_calls;
     assert(!UART_Service_Rx_Recovery(&huart1));
     assert(hdmarx.init_calls == init_before); // Latched fault stops retrying wedged stream!

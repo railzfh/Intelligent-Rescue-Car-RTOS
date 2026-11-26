@@ -47,9 +47,9 @@
 
 | 任务 | 优先级 / 周期 | 职责 |
 | --- | --- | --- |
-| `controlTask` | `High` / `1 ms` | ADC 超时与供电联锁、消费 `USART1` 无锁字节环缓冲并解析帧、按键消抖、任务状态机与底盘差速/定距/定角/堵转控制、双舵机 1 ms 缓动插补输出、双路 CAN 发送、遥测快照发布、喂 IWDG |
+| `controlTask` | `High` / `1 ms` | ADC 超时与供电联锁、非阻塞查询 `USART1` RX 健康状态（异常立即抑制运动）、消费 `USART1` 无锁字节环缓冲并解析帧、按键消抖、任务状态机与底盘差速/定距/定角/堵转控制、电池校验通过后启动双舵机并执行 1 ms 缓动插补、双路 CAN 发送、遥测快照发布、喂 IWDG |
 | `imuTask` | `AboveNormal` / `1 ms` | `BMI088` 静止校准、SPI2 采样、EKF 姿态与相对航向发布 |
-| `statusTask` | `Normal` / `10 ms` | 初始化 USB CDC、10 ms 刷新 WS2812 灯光、每 50 ms（`20 Hz`）在 `huart1` DMA 空闲时发送遥测帧（静态缓冲区） |
+| `statusTask` | `Normal` / `10 ms` | 初始化 USB CDC、10 ms 刷新 WS2812 灯光、执行 `USART1` RX DMA 阻塞恢复（含 `HAL_DMA_STATE_ERROR` 显式 DeInit/Init 与上限锁存）、每 50 ms（`20 Hz`）在 `huart1` DMA 空闲时发送遥测帧（静态缓冲区） |
 | 硬件中断 | 抢占优先级 `5` | CAN 接收解码、ADC DMA 半缓冲处理、`USART1` DMA-to-Idle 接收并将字节快速压入无锁环缓冲、TIM5 时间戳溢出 |
 
 ## 4. MaixCAM ↔ STM32 二进制串口协议 v1
@@ -76,12 +76,14 @@
    - `frame_seq(u16)`：相机单调递增帧号（16 位回绕安全）；**重复或倒退的旧 `frame_seq` 绝不刷新视觉新鲜度**（仅在视觉真实断联 `>= 1000 ms` 后允许相机重启从 `0..5` 重新同步）。
    - `camera_view(u8)`：`0=TRANSITION`, `1=FAR`, `2=NEAR`；舵机切换期间 STM32 强制丢弃不匹配视角的观测。
    - `target_type(u8)`：`0=NONE`, `1=GREEN`, `2=BLACK`, `3=ORANGE`, `4=CYAN`。
-   - `flags(u16)`：位掩码涵盖目标有效、本方区有效、半区匹配、紫坡可见、框内无危险块、右杆扫掠区清空、卸货完整入区确认、对手临近、对方安全区临近、后方清空、视觉停滞打滑。
+   - `flags(u16)`：位掩码涵盖目标有效（bit 0）、本方区有效（bit 1）、半区匹配（bit 2）、紫坡可见（bit 3）、框内无危险块（bit 4）、右杆扫掠区清空（bit 5）、卸货完整入区确认（bit 6）、对手临近（bit 7）、对方安全区临近（bit 8）、后方清空（bit 9）、视觉停滞打滑（bit 10）、推进路径与目标区清空（`VIS_FLAG_DROP_PATH_CLEAR`，bit 11）、开杆到位遥测回执（`VIS_FLAG_GATE_OPEN_SETTLED_ACK`，bit 12）。
+     - `VIS_FLAG_DROP_PATH_CLEAR`：确认本方区、关联紫坡、卸货区及前向推进走廊内无浅蓝危险块或未知前景，且推进前紫坡/中线无存量压线物块。
+     - `VIS_FLAG_GATE_OPEN_SETTLED_ACK`：**证明内容**：MaixCAM 已收到 MCU 遥测 `TEL_FLAG_GATE_CLOSED=0 && TEL_FLAG_GATE_SETTLED=1`，且当前冻结的本趟基线无危险/无压线/货型与开杆前完全一致；MCU 另在 `gate_settled` 上升沿锁存 `Gate_Settled_Frame_Seq`，仅接受严格晚于该帧号且携带该 ACK 的近视帧才启动推进。**失效条件**：任一危险/未知物出现、货型变化、进入显式推进态（`TEL_FLAG_DROP_PUSHING`）、关杆/未到位、切回远视、离开卸货状态或超过 `vision_timeout_ms (300 ms)` 即刻失效。
    - `target_err_x_mrad(i16)`、`target_dist_mm(u16)`、`home_err_x_mrad(i16)`、`home_dist_mm(u16)`（左偏为正，与车体 `+omega` 左转一致）。
    - `corral_{green,black,orange,cyan,unknown}_cnt(u8 × 5)`、`confidence(u8: 0..100)`。
    - **超时保护**：视觉有效超时默认 `300 ms`，超时即降速/停车，禁止盲跑。
 4. `0x04 MSG_BENCH_ACTUATOR`（MaixCAM → STM32，4 B）：`gate_cmd(u8)`, `pitch_cmd(u8)`, `reserved(u16)`。仅在 `PRE_MATCH` 且 `run_mode == BENCH_STRAIGHT` 下生效，用于赛前单舵机端点台架标定。
-5. `0x81 MSG_TELEMETRY`（STM32 → MaixCAM，28 B，`20 Hz`）：回传运行时间、比赛计时、状态机状态、已确认队色/出发区/模式、状态位、故障位、电池毫伏、相对航向 `0.01 deg`、当前速度与角速度、已交付各类计数及每趟上限。
+5. `0x81 MSG_TELEMETRY`（STM32 → MaixCAM，28 B，`20 Hz`）：回传运行时间、比赛计时、状态机状态、已确认队色/出发区/模式、状态位（含 `TEL_FLAG_DROP_PUSHING` bit 13 显式标识卸货推进阶段，供视觉冻结本趟卸货基线）、故障位（bit 0 电池、`bit 1` 电机超时、`bit 2` IMU 超时、`bit 3` CAN 发送、`bit 4` 视觉超时、`bit 5 FAULT_FLAG_SERVO` 舵机 PWM 启动/锁存故障、`bit 6 FAULT_FLAG_UART_RX` UART1 RX DMA 异常或恢复锁存故障）、电池毫伏、相对航向 `0.01 deg`、当前速度与角速度、已交付各类计数及每趟上限。
 
 ## 5. 比赛状态机与脱困流程
 
