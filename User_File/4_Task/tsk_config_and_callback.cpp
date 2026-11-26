@@ -386,6 +386,7 @@ static void Drive_Control()
 
     // 任务上下文恢复任何被 TX/RX DMA 或 UART 错误中断停止的 RX DMA 接收流。
     (void)UART_Service_Rx_Recovery(&huart1);
+    const bool uart_rx_fault = UART_Is_Rx_Fault_Latched(&huart1);
     Vision_Drain_Rx(now_ms);
 
     // 舵机控制：等待首帧有效电池采样后再启动 PWM；真实电池故障或 PWM 启动失败则永久锁停。
@@ -427,7 +428,8 @@ static void Drive_Control()
     const bool can2_ready = Drive_Tx_Ready(hfdcan2);
     const bool is_bench_mode = (Rescue_Mission.Get_Run_Mode() == RESCUE_MODE_BENCH_STRAIGHT);
     const bool ready =
-        battery_ready && feedback_fresh && attitude_fresh && can1_ready && can2_ready && (is_bench_mode || servos_ready);
+        battery_ready && feedback_fresh && attitude_fresh && can1_ready && can2_ready &&
+        (is_bench_mode || (servos_ready && !uart_rx_fault));
     const bool can_start = ready && wheels_still && imu_quiet;
     const bool button_pressed = Drive_Button_Pressed(now_ms);
 
@@ -591,6 +593,8 @@ static void Drive_Control()
     if (!attitude_fresh) { fault_flags |= FAULT_FLAG_IMU_TIMEOUT; }
     if (!can1_ready || !can2_ready || !can_tx_ok) { fault_flags |= FAULT_FLAG_CAN_TX; }
     if (!Rescue_Mission.Is_Vision_Fresh(now_ms)) { fault_flags |= FAULT_FLAG_VISION_TIMEOUT; }
+    if (Servos_Fault_Latched) { fault_flags |= FAULT_FLAG_SERVO; }
+    if (uart_rx_fault) { fault_flags |= FAULT_FLAG_UART_RX; }
     tel.fault_flags = fault_flags;
 
     tel.battery_mv = (pack_voltage > 0.0f && std::isfinite(pack_voltage))

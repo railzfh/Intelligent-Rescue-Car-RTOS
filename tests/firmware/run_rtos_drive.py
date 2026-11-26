@@ -68,9 +68,10 @@ struct Class_PWM_Servo {
     bool Is_Settled() const { return ctrl.Is_Settled(); }
     uint16_t Get_Current_Us() const { return ctrl.Get_Current_Us(); }
 };
-struct UART_HandleTypeDef {};
+struct UART_HandleTypeDef { bool rx_fault_latched = false; };
 UART_HandleTypeDef huart1;
-bool UART_Service_Rx_Recovery(UART_HandleTypeDef *) { return true; }
+bool UART_Service_Rx_Recovery(UART_HandleTypeDef *h) { return !h->rx_fault_latched; }
+bool UART_Is_Rx_Fault_Latched(UART_HandleTypeDef *h) { return h->rx_fault_latched; }
 struct FDCAN_HandleTypeDef { bool pending = false, fail = false; int tx_calls = 0; };
 FDCAN_HandleTypeDef hfdcan1, hfdcan2;
 uint8_t CAN1_0x200_Tx_Data[8], CAN2_0x200_Tx_Data[8];
@@ -292,19 +293,21 @@ int main(int argc, char **argv) {
     }
 
     if (servo_fail) {
-        // If either servo fails to start PWM, both servos stay disabled and competition launch is blocked.
+        // If either servo fails to start PWM, both servos stay disabled, FAULT_FLAG_SERVO is exposed,
+        // and competition launch is blocked.
         Pitch_Servo.fail_enable = true;
         Feed_Config(RESCUE_TEAM_BLUE, 3U, RESCUE_MODE_COMPETITION);
         Feed_Vision(1U);
         Step(0U, false);
         assert(Servos_Fault_Latched && !Servos_Started);
         assert(!Gate_Servo.Is_Enabled() && !Pitch_Servo.Is_Enabled());
+        assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_SERVO) != 0U);
         Step(30U, false);
         Step(40U, true);
         Step(70U, true);
         assert(Rescue_Mission.Get_State() == MISSION_PRE_MATCH);
         Stopped();
-        std::puts("PASS: servo PWM start failure latches fault and blocks competition launch");
+        std::puts("PASS: servo PWM start failure latches fault, exposes FAULT_FLAG_SERVO, and blocks competition launch");
         return 0;
     }
 

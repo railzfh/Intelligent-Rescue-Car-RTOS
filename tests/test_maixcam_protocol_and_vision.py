@@ -29,9 +29,12 @@ from maixcam.protocol import (
     Telemetry,
     VIS_FLAG_CORRAL_SAFE,
     VIS_FLAG_DROP_CONFIRMED,
+    VIS_FLAG_DROP_PATH_CLEAR,
+    VIS_FLAG_GATE_OPEN_SETTLED_ACK,
     VIS_FLAG_HOME_HALF_MATCH,
     VIS_FLAG_HOME_VALID,
     VIS_FLAG_MOTION_STALLED,
+    VIS_FLAG_OPPONENT_NEAR,
     VIS_FLAG_OPPONENT_ZONE_NEAR,
     VIS_FLAG_REAR_CLEAR,
     VIS_FLAG_SWEEP_CLEAR,
@@ -85,6 +88,9 @@ class _FakeMaixImage:
             row = self._grid[yy]
             for xx in range(max(0, x), min(self.width, x + w)):
                 row[xx] = lab
+
+    def get_lab_pixel(self, x: int, y: int) -> tuple[int, int, int]:
+        return self._grid[y][x]
 
     def find_blobs(
         self,
@@ -634,6 +640,160 @@ class MaixcamVisionAndUITest(unittest.TestCase):
         img_small_purple.fill_rect(140, 150, 14, 14, ramp_lab)  # 196 px >= 60, < 350
         blobs_sp = extract_blobs_from_maix_image(img_small_purple, self.cfg, scan_unknown_near=True)
         self.assertTrue(any(b.label == "unknown" for b in blobs_sp))
+
+        # 4. Finding 2 (R4): Cyan on aligned ramp inhibits VIS_FLAG_DROP_PATH_CLEAR, AND a 324-px unknown
+        #    inside near_drop_roi IS detected by extract_blobs_from_maix_image and blocks drop!
+        home = Blob("red_zone", 40, 20, 240, 100, 15000)
+        ramp = Blob("purple_ramp", 40, 100, 240, 26, 3000)
+        corral_green = Blob("green", 140, 150, 24, 24, 500)
+        cyan_on_ramp = Blob("cyan", 110, 102, 22, 22, 420)
+        st_cyan_path = self.proc.process(
+            [home, ramp, corral_green, cyan_on_ramp],
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=False,
+            mission_state=MISSION_DROP_OPEN_AND_PUSH,
+            gate_closed=False,
+            gate_settled=True,
+        )
+        self.assertTrue(st_cyan_path.flags & VIS_FLAG_CORRAL_SAFE)
+        self.assertTrue(st_cyan_path.flags & VIS_FLAG_SWEEP_CLEAR)
+        self.assertFalse(st_cyan_path.flags & VIS_FLAG_DROP_PATH_CLEAR)
+
+        # 324-pixel (18x18) unknown inside near_drop_roi ([40, 20, 240, 108]) detected through extraction path!
+        red_lab = (50, 45, 30)
+        img_dest_unk = _FakeMaixImage(320, 240, floor_lab)
+        img_dest_unk.fill_rect(40, 20, 240, 80, red_lab)
+        img_dest_unk.fill_rect(40, 100, 240, 26, ramp_lab)
+        img_dest_unk.fill_rect(70, 45, 24, 24, green_lab)     # delivered green in left half
+        img_dest_unk.fill_rect(110, 50, 18, 18, unknown_lab)  # 324 px unknown in destination ROI!
+        blobs_du = extract_blobs_from_maix_image(img_dest_unk, self.cfg, scan_unknown_near=True)
+        self.assertTrue(any(b.label == "unknown" for b in blobs_du))
+        self.proc.reset_drop_baseline()
+        self.proc.process(
+            [home, ramp, corral_green],
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=False,
+            mission_state=MISSION_DROP_OPEN_AND_PUSH,
+            gate_closed=True,
+        )
+        st_du = self.proc.process(
+            blobs_du,
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=False,
+            mission_state=MISSION_DROP_BACKOUT_VERIFY,
+        )
+        self.assertFalse(st_du.flags & VIS_FLAG_DROP_PATH_CLEAR)
+        self.assertFalse(st_du.flags & VIS_FLAG_DROP_CONFIRMED)
+
+        # 5. Finding 4 (R4): Mutated cargo (1g -> 1g+1b) at gate-open-settled invalidates baseline;
+        #    and preexisting ramp block rejects baseline so sliding it into target half never confirms drop!
+        self.proc.reset_drop_baseline()
+        self.proc.process(
+            [home, ramp, corral_green],
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=True,
+            max_materials_per_trip=2,
+            mission_state=MISSION_DROP_OPEN_AND_PUSH,
+            gate_closed=True,
+            gate_settled=True,
+        )
+        st_mut = self.proc.process(
+            [home, ramp, corral_green, Blob("black", 170, 150, 24, 24, 480, density=0.83)],
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=True,
+            max_materials_per_trip=2,
+            mission_state=MISSION_DROP_OPEN_AND_PUSH,
+            gate_closed=False,
+            gate_settled=True,
+            wheels_moving=False,
+        )
+        self.assertFalse(st_mut.flags & VIS_FLAG_DROP_PATH_CLEAR)
+        self.assertFalse(st_mut.flags & VIS_FLAG_GATE_OPEN_SETTLED_ACK)
+        st_mut_drop = self.proc.process(
+            [home, ramp, Blob("green", 80, 50, 24, 24, 500)],
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=True,
+            max_materials_per_trip=2,
+            mission_state=MISSION_DROP_BACKOUT_VERIFY,
+        )
+        self.assertFalse(st_mut_drop.flags & VIS_FLAG_DROP_CONFIRMED)
+
+        # Preexisting block sitting on purple ramp before push MUST reject baseline!
+        self.proc.reset_drop_baseline()
+        pre_ramp_green = Blob("green", 80, 96, 24, 24, 500)  # straddles ramp y=100..126
+        st_pre_ramp = self.proc.process(
+            [home, ramp, pre_ramp_green, corral_green],
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=False,
+            mission_state=MISSION_DROP_OPEN_AND_PUSH,
+            gate_closed=True,
+        )
+        self.assertFalse(st_pre_ramp.flags & VIS_FLAG_DROP_PATH_CLEAR)
+        st_ramp_moved = self.proc.process(
+            [home, ramp, Blob("green", 80, 50, 24, 24, 500)],
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=False,
+            mission_state=MISSION_DROP_BACKOUT_VERIFY,
+        )
+        self.assertFalse(st_ramp_moved.flags & VIS_FLAG_DROP_CONFIRMED)
+
+        # 6. Finding 6 (R4): Disjoint calibrated blue_zone + purple_ramp with NESTED bounding boxes
+        #    (even with intentionally overlapping LAB ranges!) MUST produce ZERO unknown detections,
+        #    while adding a real unknown object on top of them DOES produce unknown!
+        overlap_cfg = RescueVisionConfig()
+        overlap_cfg.lab_thresholds["blue_zone"] = [20, 62, -10, 30, -68, -22]  # intentionally overlaps purple_ramp
+        blue_lab = (40, 0, -45)
+        img_nested = _FakeMaixImage(320, 240, floor_lab)
+        # C-shaped blue_zone wrapping around a nested purple_ramp inside near_corral_roi ([88, 128, 144, 96])!
+        img_nested.fill_rect(90, 130, 120, 80, blue_lab)
+        img_nested.fill_rect(120, 145, 60, 40, ramp_lab)  # nested inside blue_zone's bounding box
+        blobs_nested = extract_blobs_from_maix_image(img_nested, overlap_cfg, scan_unknown_near=True)
+        self.assertEqual([b for b in blobs_nested if b.label == "unknown"], [])
+
+        img_nested.fill_rect(140, 155, 14, 14, unknown_lab)  # 196 px uncalibrated object on nested surface
+        blobs_nested_unk = extract_blobs_from_maix_image(img_nested, overlap_cfg, scan_unknown_near=True)
+        self.assertTrue(any(b.label == "unknown" for b in blobs_nested_unk))
+
+        # 7. Finding 7 (R4): Plain floor at (85, 0, 0) MUST NEVER produce opponent or VIS_FLAG_OPPONENT_NEAR,
+        #    both with default config AND even if custom opponent LAB overlaps floor!
+        img_floor_only = _FakeMaixImage(320, 240, floor_lab)
+        blobs_floor = extract_blobs_from_maix_image(img_floor_only, self.cfg, scan_unknown_near=True)
+        self.assertEqual([b for b in blobs_floor if b.label == "opponent"], [])
+        st_floor = self.proc.process(
+            blobs_floor, camera_near_cmd=False, camera_settled=True, team=TEAM_RED, first_green_unlocked=False
+        )
+        self.assertFalse(st_floor.flags & VIS_FLAG_OPPONENT_NEAR)
+
+        overlap_opp_cfg = RescueVisionConfig()
+        overlap_opp_cfg.lab_thresholds["opponent"] = [35, 95, -15, 15, -15, 15]
+        blobs_floor_ov = extract_blobs_from_maix_image(img_floor_only, overlap_opp_cfg, scan_unknown_near=True)
+        self.assertEqual([b for b in blobs_floor_ov if b.label == "opponent"], [])
+
+        # Real dark-grey opponent robot (50, 0, 0) on plain floor IS still detected!
+        img_real_opp = _FakeMaixImage(320, 240, floor_lab)
+        img_real_opp.fill_rect(100, 100, 60, 60, (50, 0, 0))  # 3600 px >= min_opponent_pixels (2200), y2=160 >= 145
+        blobs_opp = extract_blobs_from_maix_image(img_real_opp, self.cfg, scan_unknown_near=False)
+        self.assertEqual(len([b for b in blobs_opp if b.label == "opponent"]), 1)
+        st_opp = self.proc.process(
+            blobs_opp, camera_near_cmd=False, camera_settled=True, team=TEAM_RED, first_green_unlocked=False
+        )
+        self.assertTrue(st_opp.flags & VIS_FLAG_OPPONENT_NEAR)
 
     def test_home_half_match_checks_full_corral_width_and_opponent_zone(self) -> None:
         # Home x=100..320 (cx=210, left material half=[100, 192]).

@@ -155,6 +155,8 @@ private:
     float Available_Reverse_M(bool vision_fresh, bool rear_sensor_clear,
                               bool opponent_alert, float requested_abs_m) const;
     bool Is_Reverse_Clearance_Lost(bool rear_sensor_clear) const;
+    bool Is_Active_Reverse_State() const;
+    void Engage_Standstill_Gate(uint32_t now_ms);
     void Start_Escape(uint32_t now_ms, float reverse_abs_m, bool chassis_active,
                       bool wheels_still, Struct_Mission_Output &out);
 
@@ -207,6 +209,12 @@ private:
     uint32_t Last_Forward_Clear_Ms = 0U;
     float Pending_Escape_Reverse_M = 0.0f;
     bool Standstill_Abrupt_Stop = false;
+
+    // Post-settle gate check latch (Finding 1) & global standstill interlock after reverse abort (Finding 3).
+    bool Gate_Open_Settled_Latched = false;
+    uint16_t Gate_Settled_Frame_Seq = 0U;
+    bool Require_Standstill_Gate = false;
+    uint32_t Standstill_Gate_Start_Ms = 0U;
 
     // Cargo locked upon gate closure for safe-zone half matching and score counting.
     bool Cargo_Already_Confirmed = false;

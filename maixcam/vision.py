@@ -25,6 +25,8 @@ from .protocol import (
     TEAM_RED,
     VIS_FLAG_CORRAL_SAFE,
     VIS_FLAG_DROP_CONFIRMED,
+    VIS_FLAG_DROP_PATH_CLEAR,
+    VIS_FLAG_GATE_OPEN_SETTLED_ACK,
     VIS_FLAG_HOME_HALF_MATCH,
     VIS_FLAG_HOME_VALID,
     VIS_FLAG_MOTION_STALLED,
@@ -565,6 +567,29 @@ class RescueVisionProcessor:
 
         return home, assoc_ramp, half_matches, opp_near, home_err_mrad, home_dist_mm
 
+    def _is_drop_path_hazards_clear(
+        self,
+        home: Optional[Blob],
+        assoc_ramp: Optional[Blob],
+        hazards: List[Blob],
+        unknowns: List[Blob],
+    ) -> bool:
+        if home is None or assoc_ramp is None:
+            return False
+        corral_roi = self.cfg.near_corral_roi
+        drop_roi = self.cfg.near_drop_roi
+        top_y = min(home.y, corral_roi[1])
+        bot_y = max(home.y2, corral_roi[1] + corral_roi[3])
+        corridor_roi = [corral_roi[0], top_y, corral_roi[2], max(1, bot_y - top_y)]
+        ramp_inner_y = assoc_ramp.y
+        ramp_bot_y = assoc_ramp.y2
+        for bad in hazards + unknowns:
+            in_home = _rects_intersect(bad.x, bad.y, bad.w, bad.h, home.x, home.y, home.w, home.h)
+            on_ramp = bad.y < ramp_bot_y and bad.y2 > ramp_inner_y
+            if in_home or on_ramp or _blob_in_roi(bad, drop_roi) or _blob_in_roi(bad, corridor_roi):
+                return False
+        return True
+
     def _update_drop_baseline(
         self,
         home: Optional[Blob],
@@ -572,38 +597,57 @@ class RescueVisionProcessor:
         blocks: List[Blob],
         corral_cargo: Tuple[int, int, int],
         corral_safe: bool,
+        drop_path_hazards_clear: bool,
         team: int,
         first_green_unlocked: bool,
         carrying_casualty: bool,
         max_materials_per_trip: int,
         mission_state: Optional[int],
         gate_closed: Optional[bool],
-    ) -> None:
+        gate_settled: Optional[bool],
+        wheels_moving: bool,
+    ) -> Tuple[bool, Tuple[int, int, int]]:
         # Never capture a new pre-push baseline once backout verification has begun.
         if mission_state is not None and mission_state != MISSION_DROP_OPEN_AND_PUSH:
-            return
-        if not corral_safe or home is None or assoc_ramp is None:
-            return
-        if not self._is_valid_trip_cargo(corral_cargo, first_green_unlocked, carrying_casualty, max_materials_per_trip):
-            return
+            return self._drop_baseline is not None, (0, 0, 0)
+        if not corral_safe or not drop_path_hazards_clear or home is None or assoc_ramp is None:
+            return False, (0, 0, 0)
 
         target_bounds, other_bounds, _ = self._zone_half_bounds(home, team, carrying_casualty)
         if target_bounds[1] <= target_bounds[0]:
-            return
+            return False, (0, 0, 0)
         tgt_cnt, oth_cnt, mis_cnt = self._partition_home_blocks(home, assoc_ramp, blocks, target_bounds, other_bounds)
+
+        if not self._is_valid_trip_cargo(corral_cargo, first_green_unlocked, carrying_casualty, max_materials_per_trip):
+            return False, mis_cnt
+
+        # Reject any pre-push baseline that contains preexisting misplaced blocks on ramp/divider
+        # so a stray ramp block moving into the target half can never masquerade as trip cargo.
+        if mis_cnt != (0, 0, 0):
+            if not wheels_moving:
+                self._drop_baseline = None
+            return False, mis_cnt
 
         if self._drop_baseline is not None:
             prev = self._drop_baseline
             prev_home_total = sum(prev.target_half_counts) + sum(prev.other_half_counts) + sum(prev.misplaced_counts)
             cur_home_total = sum(tgt_cnt) + sum(oth_cnt) + sum(mis_cnt)
-            # Only refresh an existing baseline while the gate is still closed (pre-push)
-            # or in standalone mode before any cargo leaves the corral into the home zone.
             if gate_closed is True:
+                # Gate still closed before push: keep refreshing to the latest clean pre-open snapshot.
                 pass
-            elif gate_closed is None and sum(corral_cargo) >= sum(prev.expected_cargo) and cur_home_total == prev_home_total:
-                pass
+            elif gate_closed is False and not wheels_moving:
+                # Gate opened while stationary before push: cargo must still match pre-open baseline.
+                if cur_home_total == prev_home_total and corral_cargo != prev.expected_cargo:
+                    self._drop_baseline = None
+                    return False, mis_cnt
+                if gate_settled is not True:
+                    return True, mis_cnt
+            elif gate_closed is None and not wheels_moving and cur_home_total == prev_home_total:
+                # Standalone call without gate telemetry: update to latest pre-push cargo if home unchanged.
+                if sum(corral_cargo) < sum(prev.expected_cargo):
+                    return True, mis_cnt
             else:
-                return
+                return True, mis_cnt
 
         self._drop_baseline = DropBaseline(
             team=team,
@@ -614,6 +658,7 @@ class RescueVisionProcessor:
             other_half_counts=oth_cnt,
             misplaced_counts=mis_cnt,
         )
+        return True, mis_cnt
 
     def _verify_drop_inside_correct_half(
         self,
@@ -629,10 +674,10 @@ class RescueVisionProcessor:
         max_materials_per_trip: int,
         mission_state: Optional[int] = None,
     ) -> bool:
-        # Must have a recorded pre-push baseline for THIS trip, observe BOTH own team safe zone
-        # and its associated purple ramp, AND confirm the corral itself is empty.
+        # Must have a clean pre-push baseline for THIS trip (with zero misplaced ramp blocks),
+        # observe BOTH own team safe zone and its associated purple ramp, AND confirm corral is empty.
         base = self._drop_baseline
-        if base is None or not corral_empty or home is None or assoc_ramp is None:
+        if base is None or base.misplaced_counts != (0, 0, 0) or not corral_empty or home is None or assoc_ramp is None:
             return False
         if mission_state is not None and mission_state != MISSION_DROP_BACKOUT_VERIFY:
             return False
@@ -651,16 +696,9 @@ class RescueVisionProcessor:
         if target_bounds[1] <= target_bounds[0]:
             return False
 
-        ramp_inner_y = assoc_ramp.y
-        ramp_bot_y = assoc_ramp.y2
-        drop_roi = self.cfg.near_drop_roi
-
-        # Fail closed if ANY cyan hazard or unknown object is inside home, drop ROI, or ramp band.
-        for bad in hazards + unknowns:
-            in_home = _rects_intersect(bad.x, bad.y, bad.w, bad.h, home.x, home.y, home.w, home.h)
-            on_ramp = bad.y < ramp_bot_y and bad.y2 > ramp_inner_y
-            if in_home or on_ramp or _blob_in_roi(bad, drop_roi):
-                return False
+        # Fail closed if ANY cyan hazard or unknown object is inside home, push path, drop ROI, or ramp band.
+        if not self._is_drop_path_hazards_clear(home, assoc_ramp, hazards, unknowns):
+            return False
 
         tgt_now, oth_now, mis_now = self._partition_home_blocks(home, assoc_ramp, blocks, target_bounds, other_bounds)
 
@@ -700,6 +738,8 @@ class RescueVisionProcessor:
         rear_clear: bool = False,
         mission_state: Optional[int] = None,
         gate_closed: Optional[bool] = None,
+        gate_settled: Optional[bool] = None,
+        wheels_moving: bool = False,
     ) -> VisionState:
         self._frame_seq = (self._frame_seq + 1) & 0xFFFF
         view = CAMERA_VIEW_TRANSITION
@@ -806,23 +846,37 @@ class RescueVisionProcessor:
             if not sweep_occupied:
                 flags |= VIS_FLAG_SWEEP_CLEAR
 
-            self._update_drop_baseline(
+            drop_path_hazards_clear = self._is_drop_path_hazards_clear(home, assoc_ramp, hazards, unknowns)
+
+            baseline_ok, mis_cnt = self._update_drop_baseline(
                 home=home,
                 assoc_ramp=assoc_ramp,
                 blocks=blocks,
                 corral_cargo=(green_cnt, black_cnt, orange_cnt),
                 corral_safe=corral_safe,
+                drop_path_hazards_clear=drop_path_hazards_clear,
                 team=team,
                 first_green_unlocked=first_green_unlocked,
                 carrying_casualty=carrying_casualty,
                 max_materials_per_trip=max_materials_per_trip,
                 mission_state=mission_state,
                 gate_closed=gate_closed,
+                gate_settled=gate_settled,
+                wheels_moving=wheels_moving,
             )
 
             corral_empty = (
                 green_cnt == 0 and black_cnt == 0 and orange_cnt == 0 and cyan_cnt == 0 and unknown_cnt == 0
             )
+            # Before pushing (stationary with cargo in corral), also require zero preexisting ramp/divider
+            # blocks and a valid baseline; during active forward push, allow our own cargo to cross the ramp
+            # while still immediately inhibiting on any cyan hazard or unknown obstruction in path/destination.
+            if drop_path_hazards_clear and (wheels_moving or corral_empty or (baseline_ok and mis_cnt == (0, 0, 0))):
+                flags |= VIS_FLAG_DROP_PATH_CLEAR
+
+            if gate_closed is False and gate_settled is True and self._drop_baseline is not None:
+                flags |= VIS_FLAG_GATE_OPEN_SETTLED_ACK
+
             if self._verify_drop_inside_correct_half(
                 home=home,
                 assoc_ramp=assoc_ramp,
@@ -844,6 +898,23 @@ class RescueVisionProcessor:
         return state
 
 
+def _lab_in_thresh(px: Sequence[int], thresh: Sequence[int]) -> bool:
+    return (
+        thresh[0] <= px[0] <= thresh[1]
+        and thresh[2] <= px[1] <= thresh[3]
+        and thresh[4] <= px[2] <= thresh[5]
+    )
+
+
+def _get_lab_pixel_accessor(img):
+    if hasattr(img, "get_lab_pixel"):
+        return img.get_lab_pixel
+    if hasattr(img, "_grid"):
+        grid = img._grid
+        return lambda x, y: grid[y][x]
+    return None
+
+
 def _extract_roi_blobs_for_label(img, label: str, thresh: Sequence[int], roi: Tuple[int, int, int, int]) -> List[Blob]:
     found = img.find_blobs([tuple(thresh)], roi=roi, pixels_threshold=1, area_threshold=1, merge=False)
     out: List[Blob] = []
@@ -853,6 +924,77 @@ def _extract_roi_blobs_for_label(img, label: str, thresh: Sequence[int], roi: Tu
         px = int(item.pixels())
         out.append(Blob(label=label, x=int(item.x()), y=int(item.y()), w=w, h=h, pixels=px, density=px / float(w * h)))
     return out
+
+
+def _filter_opponent_excluding_floor(
+    img,
+    item,
+    opp_thresh: Sequence[int],
+    cfg: RescueVisionConfig,
+) -> Optional[Blob]:
+    bx, by, bw, bh = int(item.x()), int(item.y()), max(1, int(item.w())), max(1, int(item.h()))
+    px = int(item.pixels())
+    floor_thresh = cfg.arena_floor_lab
+
+    get_lab = _get_lab_pixel_accessor(img)
+    if get_lab is not None:
+        min_x, min_y = bx + bw, by + bh
+        max_x, max_y = bx - 1, by - 1
+        non_floor_opp = 0
+        for yy in range(by, by + bh):
+            for xx in range(bx, bx + bw):
+                lab = get_lab(xx, yy)
+                if _lab_in_thresh(lab, opp_thresh) and not _lab_in_thresh(lab, floor_thresh):
+                    non_floor_opp += 1
+                    if xx < min_x:
+                        min_x = xx
+                    if xx > max_x:
+                        max_x = xx
+                    if yy < min_y:
+                        min_y = yy
+                    if yy > max_y:
+                        max_y = yy
+        if non_floor_opp < cfg.min_opponent_pixels:
+            return None
+        ow = max_x - min_x + 1
+        oh = max_y - min_y + 1
+        return Blob("opponent", min_x, min_y, ow, oh, non_floor_opp, non_floor_opp / float(ow * oh))
+
+    # Tier 2: Real MaixPy Image binary() union (exact set difference |O \ F| = |F U O| - |F|).
+    if hasattr(img, "crop") and hasattr(img, "binary"):
+        sub = img.crop(bx, by, bw, bh)
+        floor_mask = sub.binary([list(floor_thresh)], invert=False, copy=True)
+        both_mask = sub.binary([list(floor_thresh), list(opp_thresh)], invert=False, copy=True)
+        white = [(50, 100, -128, 127, -128, 127)]
+        floor_px = sum(int(b.pixels()) for b in floor_mask.find_blobs(white, pixels_threshold=1, area_threshold=1, merge=True))
+        both_px = sum(int(b.pixels()) for b in both_mask.find_blobs(white, pixels_threshold=1, area_threshold=1, merge=True))
+        non_floor_opp = max(0, both_px - floor_px)
+        if non_floor_opp < cfg.min_opponent_pixels:
+            return None
+        return Blob("opponent", bx, by, bw, bh, non_floor_opp, min(1.0, non_floor_opp / float(bw * bh)))
+
+    # Fallback using find_blobs: intersect opponent ROI with non-floor pixels so plain floor never triggers.
+    non_floor = img.find_blobs(
+        [tuple(floor_thresh)],
+        roi=(bx, by, bw, bh),
+        pixels_threshold=1,
+        area_threshold=1,
+        invert=True,
+        merge=True,
+    )
+    if not non_floor:
+        return None
+    non_floor_px = sum(int(nf.pixels()) for nf in non_floor)
+    kept_px = min(px, non_floor_px)
+    if kept_px < cfg.min_opponent_pixels:
+        return None
+    nx1 = min(int(nf.x()) for nf in non_floor)
+    ny1 = min(int(nf.y()) for nf in non_floor)
+    nx2 = max(int(nf.x()) + max(1, int(nf.w())) for nf in non_floor)
+    ny2 = max(int(nf.y()) + max(1, int(nf.h())) for nf in non_floor)
+    ow = max(1, nx2 - nx1)
+    oh = max(1, ny2 - ny1)
+    return Blob("opponent", nx1, ny1, ow, oh, kept_px, min(1.0, kept_px / float(ow * oh)))
 
 
 def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_near: bool = False) -> List[Blob]:
@@ -868,6 +1010,11 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
             min_area = cfg.min_opponent_pixels
         found = img.find_blobs([tuple(thresh)], pixels_threshold=min_area, area_threshold=min_area, merge=True)
         for item in found:
+            if label == "opponent":
+                filtered = _filter_opponent_excluding_floor(img, item, thresh, cfg)
+                if filtered is not None:
+                    blobs.append(filtered)
+                continue
             w = max(1, int(item.w()))
             h = max(1, int(item.h()))
             px = int(item.pixels())
@@ -883,8 +1030,8 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                 )
             )
 
-    # In NEAR view, detect non-floor foreground inside corral/sweep ROIs not accounted for by
-    # unique verified object pixels or ROI-measured calibrated arena surface pixels.
+    # In NEAR view, detect non-floor foreground inside corral, sweep, AND destination/drop ROIs
+    # not accounted for by the exact union of verified object/surface pixels.
     if scan_unknown_near:
         verified_full_objects = [
             b
@@ -892,7 +1039,11 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
             if b.label in _OBJECT_LABELS and _is_verified_object_blob(b, cfg.min_hazard_pixels, cfg)
         ]
         verified_full_surfaces = [b for b in blobs if b.label in _SURFACE_LABELS]
-        for roi in (cfg.near_corral_roi, cfg.near_sweep_roi):
+        verified_all = verified_full_objects + verified_full_surfaces
+        get_lab = _get_lab_pixel_accessor(img)
+        use_maix_binary = get_lab is None and hasattr(img, "crop") and hasattr(img, "binary")
+
+        for roi in (cfg.near_corral_roi, cfg.near_sweep_roi, cfg.near_drop_roi):
             fg_blobs = img.find_blobs(
                 [tuple(cfg.arena_floor_lab)],
                 roi=tuple(roi),
@@ -904,12 +1055,69 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
             for item in fg_blobs:
                 fx, fy, fw, fh = int(item.x()), int(item.y()), max(1, int(item.w())), max(1, int(item.h()))
                 px = int(item.pixels())
+                if px < cfg.min_hazard_pixels:
+                    continue
                 fg = Blob("unknown", fx, fy, fw, fh, px, px / float(fw * fh))
                 fg_roi = (fx, fy, fw, fh)
 
-                # Measure actual calibrated surface pixels strictly inside this foreground ROI,
-                # keeping only components belonging to a full-frame verified ramp/zone surface so
-                # a calibrated ramp does not false-trigger while a small foreign object still fails closed.
+                # Tier 1: Exact per-pixel union when LAB pixel access is available (zero density/box error).
+                if get_lab is not None:
+                    active_verified = [
+                        (vb, cfg.lab_thresholds[vb.label])
+                        for vb in verified_all
+                        if vb.label in cfg.lab_thresholds
+                        and _rects_intersect(fx, fy, fw, fh, vb.x, vb.y, vb.w, vb.h)
+                    ]
+                    fg_exact_px = 0
+                    explained_exact_px = 0
+                    for yy in range(fy, fy + fh):
+                        for xx in range(fx, fx + fw):
+                            lab = get_lab(xx, yy)
+                            if _lab_in_thresh(lab, cfg.arena_floor_lab):
+                                continue
+                            fg_exact_px += 1
+                            for vb, vthresh in active_verified:
+                                if (
+                                    vb.x <= xx < vb.x2
+                                    and vb.y <= yy < vb.y2
+                                    and _lab_in_thresh(lab, vthresh)
+                                ):
+                                    explained_exact_px += 1
+                                    break
+                    unexplained_px = max(0, fg_exact_px - explained_exact_px)
+                    if fg_exact_px >= cfg.min_hazard_pixels and (
+                        unexplained_px >= cfg.min_hazard_pixels
+                        or (explained_exact_px / float(max(1, fg_exact_px))) < 0.70
+                    ):
+                        blobs.append(fg)
+                    continue
+
+                # Tier 2: Exact C-accelerated per-pixel binary union on real MaixPy Image objects
+                # (invert=False marks floor U verified classes as white; black pixels are strictly unmatched).
+                if use_maix_binary:
+                    allowed_thresholds = [list(cfg.arena_floor_lab)]
+                    seen_labels = set()
+                    for vb in verified_all:
+                        if (
+                            vb.label not in seen_labels
+                            and vb.label in cfg.lab_thresholds
+                            and _rects_intersect(fx, fy, fw, fh, vb.x, vb.y, vb.w, vb.h)
+                        ):
+                            seen_labels.add(vb.label)
+                            allowed_thresholds.append(list(cfg.lab_thresholds[vb.label]))
+                    sub_img = img.crop(fx, fy, fw, fh)
+                    matched_mask = sub_img.binary(allowed_thresholds, invert=False, copy=True)
+                    unmatched = matched_mask.find_blobs(
+                        [(0, 40, -128, 127, -128, 127)],
+                        pixels_threshold=cfg.min_hazard_pixels,
+                        area_threshold=cfg.min_hazard_pixels,
+                        merge=True,
+                    )
+                    if unmatched:
+                        blobs.append(fg)
+                    continue
+
+                # Tier 3: Fallback for find_blobs-only mocks without pixel access or binary().
                 roi_surfaces: List[Blob] = []
                 for surface_label in _SURFACE_LABELS:
                     thresh = cfg.lab_thresholds.get(surface_label)
@@ -925,8 +1133,6 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                         ):
                             roi_surfaces.append(sub)
 
-                # Measure verified object pixels strictly inside fg_roi, keeping only components
-                # that belong to a full-frame verified block/hazard detection.
                 roi_objects: List[Blob] = []
                 for obj_label in _OBJECT_LABELS:
                     thresh = cfg.lab_thresholds.get(obj_label)
@@ -941,18 +1147,14 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                         ):
                             roi_objects.append(sub)
 
-                # Evaluate fg against the ROI-measured verified object & surface pixels.
                 explained_px, union_area = _unique_explained_pixels(fg, roi_objects + roi_surfaces, cfg=cfg)
                 unexplained_px = max(0, fg.pixels - explained_px)
                 pixel_coverage = explained_px / float(max(1, fg.pixels))
                 area_coverage = union_area / float(max(1, fg.w * fg.h))
                 if (
-                    fg.pixels >= cfg.min_hazard_pixels
-                    and (
-                        unexplained_px >= cfg.min_hazard_pixels
-                        or pixel_coverage < 0.70
-                        or (area_coverage < 0.70 and explained_px < fg.pixels)
-                    )
+                    unexplained_px >= cfg.min_hazard_pixels
+                    or pixel_coverage < 0.70
+                    or (area_coverage < 0.70 and explained_px < fg.pixels)
                 ):
                     blobs.append(fg)
 

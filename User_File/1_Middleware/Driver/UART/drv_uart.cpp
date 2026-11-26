@@ -75,6 +75,25 @@ static bool UART_Start_Rx_DMA(Struct_UART_Manage_Object *obj)
     return true;
 }
 
+static constexpr uint8_t UART_Max_Rx_Recovery_Failures = 3U;
+
+static void UART_Record_Recovery_Failure(Struct_UART_Manage_Object *obj)
+{
+    if (obj->Rx_Recovery_Fail_Count < UART_Max_Rx_Recovery_Failures)
+    {
+        ++obj->Rx_Recovery_Fail_Count;
+    }
+    if (obj->Rx_Recovery_Fail_Count >= UART_Max_Rx_Recovery_Failures)
+    {
+        obj->Rx_Recovery_Fault_Latched = true;
+        obj->Rx_Recovery_Pending = false;
+    }
+    else
+    {
+        obj->Rx_Recovery_Pending = true;
+    }
+}
+
 /* function prototypes -------------------------------------------------------*/
 
 /**
@@ -95,6 +114,8 @@ void UART_Init(UART_HandleTypeDef *huart, UART_Callback Callback_Function)
     obj->Rx_Buffer_Active = obj->Rx_Buffer_0;
     obj->Rx_Buffer_Ready = nullptr;
     obj->Rx_Recovery_Pending = false;
+    obj->Rx_Recovery_Fault_Latched = false;
+    obj->Rx_Recovery_Fail_Count = 0U;
     (void)UART_Start_Rx_DMA(obj);
 }
 
@@ -119,10 +140,19 @@ void UART_Reinit(UART_HandleTypeDef *huart)
 }
 
 /**
+ * @brief 查询该 UART 的 RX DMA 恢复是否已锁存永久故障
+ */
+bool UART_Is_Rx_Fault_Latched(UART_HandleTypeDef *huart)
+{
+    const Struct_UART_Manage_Object *obj = UART_Get_Manage_Object(huart);
+    return (obj != nullptr && obj->UART_Handler == huart && obj->Rx_Recovery_Fault_Latched);
+}
+
+/**
  * @brief 在任务上下文中恢复因TX/RX DMA或UART错误而停止的RX接收流
  *
  * @param huart UART编号
- * @return true RX DMA 处于有效运行态；false 恢复失败并保持待重试标志
+ * @return true RX DMA 处于有效运行态；false 恢复失败并按预算重试或锁存故障
  */
 bool UART_Service_Rx_Recovery(UART_HandleTypeDef *huart)
 {
@@ -131,7 +161,12 @@ bool UART_Service_Rx_Recovery(UART_HandleTypeDef *huart)
     {
         return false;
     }
-    if (!obj->Rx_Recovery_Pending && huart->RxState == HAL_UART_STATE_BUSY_RX)
+    if (obj->Rx_Recovery_Fault_Latched)
+    {
+        return false;
+    }
+    const bool dma_running_ok = (huart->hdmarx == nullptr) || (huart->hdmarx->State == HAL_DMA_STATE_BUSY);
+    if (!obj->Rx_Recovery_Pending && huart->RxState == HAL_UART_STATE_BUSY_RX && dma_running_ok)
     {
         return true;
     }
@@ -141,23 +176,43 @@ bool UART_Service_Rx_Recovery(UART_HandleTypeDef *huart)
     __DMB();
 
     // Bundled STM32H7 HAL UART_DMAError can reset huart->RxState to READY on a TX DMA error
-    // while leaving hdmarx->State == HAL_DMA_STATE_BUSY. Stop the old RX stream completely first.
-    if (HAL_UART_AbortReceive(huart) != HAL_OK)
+    // while leaving hdmarx->State == HAL_DMA_STATE_BUSY, and a HAL_DMA_Abort timeout puts
+    // hdmarx->State into HAL_DMA_STATE_ERROR where subsequent HAL_DMA_Abort calls always fail.
+    HAL_StatusTypeDef abort_status = HAL_UART_AbortReceive(huart);
+    if (huart->hdmarx != nullptr)
     {
-        obj->Rx_Recovery_Pending = true;
-        return false;
-    }
-    if (huart->hdmarx != nullptr && huart->hdmarx->State != HAL_DMA_STATE_READY)
-    {
-        if (HAL_DMA_Abort(huart->hdmarx) != HAL_OK)
+        if (huart->hdmarx->State == HAL_DMA_STATE_BUSY)
         {
-            obj->Rx_Recovery_Pending = true;
-            return false;
+            (void)HAL_DMA_Abort(huart->hdmarx);
         }
+        if (huart->hdmarx->State != HAL_DMA_STATE_READY)
+        {
+            // Explicitly recover HAL_DMA_STATE_ERROR / non-ready stream via checked DeInit + Init.
+            const HAL_StatusTypeDef deinit_st = HAL_DMA_DeInit(huart->hdmarx);
+            const HAL_StatusTypeDef init_st = (deinit_st == HAL_OK) ? HAL_DMA_Init(huart->hdmarx) : deinit_st;
+            if (init_st != HAL_OK || huart->hdmarx->State != HAL_DMA_STATE_READY)
+            {
+                UART_Record_Recovery_Failure(obj);
+                return false;
+            }
+            // HAL_UART_AbortReceive returns early on DMA timeout before resetting huart->RxState.
+            abort_status = HAL_UART_AbortReceive(huart);
+        }
+    }
+    if (abort_status != HAL_OK || huart->RxState != HAL_UART_STATE_READY)
+    {
+        UART_Record_Recovery_Failure(obj);
+        return false;
     }
 
     obj->Rx_Buffer_Active = obj->Rx_Buffer_0;
-    return UART_Start_Rx_DMA(obj);
+    if (!UART_Start_Rx_DMA(obj))
+    {
+        UART_Record_Recovery_Failure(obj);
+        return false;
+    }
+    obj->Rx_Recovery_Fail_Count = 0U;
+    return true;
 }
 
 /**

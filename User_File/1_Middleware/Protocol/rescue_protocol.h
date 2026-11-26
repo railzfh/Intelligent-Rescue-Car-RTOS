@@ -70,6 +70,8 @@ static constexpr uint16_t VIS_FLAG_OPPONENT_NEAR = (1U << 7);
 static constexpr uint16_t VIS_FLAG_OPPONENT_ZONE_NEAR = (1U << 8);
 static constexpr uint16_t VIS_FLAG_REAR_CLEAR = (1U << 9);
 static constexpr uint16_t VIS_FLAG_MOTION_STALLED = (1U << 10);
+static constexpr uint16_t VIS_FLAG_DROP_PATH_CLEAR = (1U << 11);
+static constexpr uint16_t VIS_FLAG_GATE_OPEN_SETTLED_ACK = (1U << 12);
 
 // Bitmask for Struct_Rescue_Telemetry::status_flags
 static constexpr uint16_t TEL_FLAG_CONFIG_LOCKED = (1U << 0);
@@ -92,6 +94,8 @@ static constexpr uint16_t FAULT_FLAG_MOTOR_TIMEOUT = (1U << 1);
 static constexpr uint16_t FAULT_FLAG_IMU_TIMEOUT = (1U << 2);
 static constexpr uint16_t FAULT_FLAG_CAN_TX = (1U << 3);
 static constexpr uint16_t FAULT_FLAG_VISION_TIMEOUT = (1U << 4);
+static constexpr uint16_t FAULT_FLAG_SERVO = (1U << 5);
+static constexpr uint16_t FAULT_FLAG_UART_RX = (1U << 6);
 
 static constexpr uint8_t RESCUE_PAYLOAD_LEN_HEARTBEAT = 8U;
 static constexpr uint8_t RESCUE_PAYLOAD_LEN_SET_CONFIG = 4U;

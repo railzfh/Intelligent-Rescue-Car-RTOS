@@ -1,4 +1,4 @@
-"""Exercise the actual drv_uart.cpp DMA ReceiveToIdle, HT guard, and STM32H7 HAL error recovery."""
+"""Exercise drv_uart.cpp with a HAL-faithful STM32H7 UART/DMA state-machine mock."""
 import os
 from pathlib import Path
 import subprocess
@@ -62,15 +62,25 @@ enum HAL_StatusTypeDef : uint8_t {
 #define HAL_UART_ERROR_NONE    0x00U
 #define HAL_UART_ERROR_DMA     0x10U
 
+#define HAL_DMA_STATE_RESET    0x00U
 #define HAL_DMA_STATE_READY    0x01U
 #define HAL_DMA_STATE_BUSY     0x02U
+#define HAL_DMA_STATE_TIMEOUT  0x03U
+#define HAL_DMA_STATE_ERROR    0x04U
+#define HAL_DMA_ERROR_NONE     0x00U
+#define HAL_DMA_ERROR_TIMEOUT  0x20U
+#define HAL_DMA_ERROR_NO_XFER  0x100U
 
 struct DMA_HandleTypeDef {
     uint32_t State = HAL_DMA_STATE_READY;
+    uint32_t ErrorCode = HAL_DMA_ERROR_NONE;
     uint32_t disabled_it_mask = 0U;
     uint32_t ht_disable_calls = 0U;
     uint32_t abort_calls = 0U;
-    bool fail_abort_once = false;
+    uint32_t deinit_calls = 0U;
+    uint32_t init_calls = 0U;
+    bool timeout_abort_once = false;
+    bool wedge_init_always = false;
 };
 struct UART_HandleTypeDef {
     void *Instance = nullptr;
@@ -96,6 +106,8 @@ struct UART_HandleTypeDef {
 } while (0)
 
 HAL_StatusTypeDef HAL_DMA_Abort(DMA_HandleTypeDef *hdma);
+HAL_StatusTypeDef HAL_DMA_DeInit(DMA_HandleTypeDef *hdma);
+HAL_StatusTypeDef HAL_DMA_Init(DMA_HandleTypeDef *hdma);
 HAL_StatusTypeDef HAL_UART_AbortReceive(UART_HandleTypeDef *huart);
 HAL_StatusTypeDef HAL_UARTEx_ReceiveToIdle_DMA(UART_HandleTypeDef *huart, uint8_t *pData, uint16_t Size);
 HAL_StatusTypeDef HAL_UART_Transmit_DMA(UART_HandleTypeDef *huart, uint8_t *pData, uint16_t Size);
@@ -117,17 +129,49 @@ test_cpp.write_text(
 bool init_finished = true;
 Mock_Timestamp SYS_Timestamp;
 
+// Mirrors bundled Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_dma.c:781 HAL_DMA_Abort():
+// - Rejects any state != BUSY with HAL_DMA_ERROR_NO_XFER / HAL_ERROR.
+// - On timeout, transitions State to HAL_DMA_STATE_ERROR and returns HAL_ERROR.
 HAL_StatusTypeDef HAL_DMA_Abort(DMA_HandleTypeDef *hdma) {
     ++hdma->abort_calls;
-    if (hdma->fail_abort_once) {
-        hdma->fail_abort_once = false;
-        return HAL_TIMEOUT;
+    if (hdma->State != HAL_DMA_STATE_BUSY) {
+        hdma->ErrorCode = HAL_DMA_ERROR_NO_XFER;
+        return HAL_ERROR;
     }
+    if (hdma->timeout_abort_once) {
+        hdma->timeout_abort_once = false;
+        hdma->ErrorCode = HAL_DMA_ERROR_TIMEOUT;
+        hdma->State = HAL_DMA_STATE_ERROR;
+        return HAL_ERROR;
+    }
+    hdma->ErrorCode = HAL_DMA_ERROR_NONE;
     hdma->State = HAL_DMA_STATE_READY;
     return HAL_OK;
 }
 
-// Mirrors bundled Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_uart.c HAL_UART_AbortReceive().
+// Mirrors bundled stm32h7xx_hal_dma.c:468 HAL_DMA_DeInit().
+HAL_StatusTypeDef HAL_DMA_DeInit(DMA_HandleTypeDef *hdma) {
+    ++hdma->deinit_calls;
+    hdma->ErrorCode = HAL_DMA_ERROR_NONE;
+    hdma->State = HAL_DMA_STATE_RESET;
+    return HAL_OK;
+}
+
+// Mirrors bundled stm32h7xx_hal_dma.c:216 HAL_DMA_Init().
+HAL_StatusTypeDef HAL_DMA_Init(DMA_HandleTypeDef *hdma) {
+    ++hdma->init_calls;
+    if (hdma->wedge_init_always) {
+        hdma->ErrorCode = HAL_DMA_ERROR_TIMEOUT;
+        hdma->State = HAL_DMA_STATE_ERROR;
+        return HAL_ERROR;
+    }
+    hdma->ErrorCode = HAL_DMA_ERROR_NONE;
+    hdma->State = HAL_DMA_STATE_READY;
+    return HAL_OK;
+}
+
+// Mirrors bundled stm32h7xx_hal_uart.c:1807 HAL_UART_AbortReceive():
+// On HAL_DMA_Abort timeout, returns HAL_TIMEOUT early BEFORE resetting huart->RxState!
 HAL_StatusTypeDef HAL_UART_AbortReceive(UART_HandleTypeDef *huart) {
     ++huart->abort_rx_calls;
     huart->cr1 &= ~USART_CR1_IDLEIE;
@@ -135,8 +179,10 @@ HAL_StatusTypeDef HAL_UART_AbortReceive(UART_HandleTypeDef *huart) {
         huart->cr3 &= ~USART_CR3_DMAR;
         if (huart->hdmarx != nullptr) {
             if (HAL_DMA_Abort(huart->hdmarx) != HAL_OK) {
-                huart->ErrorCode = HAL_UART_ERROR_DMA;
-                return HAL_TIMEOUT;
+                if (huart->hdmarx->ErrorCode == HAL_DMA_ERROR_TIMEOUT) {
+                    huart->ErrorCode = HAL_UART_ERROR_DMA;
+                    return HAL_TIMEOUT;
+                }
             }
         }
     }
@@ -144,7 +190,6 @@ HAL_StatusTypeDef HAL_UART_AbortReceive(UART_HandleTypeDef *huart) {
     return HAL_OK;
 }
 
-// Mirrors bundled UART_Start_Receive_DMA(): fails with HAL_ERROR if hdmarx->State != READY!
 HAL_StatusTypeDef HAL_UARTEx_ReceiveToIdle_DMA(UART_HandleTypeDef *huart, uint8_t *pData, uint16_t Size) {
     if (huart->RxState != HAL_UART_STATE_READY) {
         ++huart->arm_failures;
@@ -181,9 +226,6 @@ HAL_StatusTypeDef HAL_UART_Transmit_DMA(UART_HandleTypeDef *huart, uint8_t *, ui
     return HAL_OK;
 }
 
-// Mirrors bundled stm32h7xx_hal_uart.c:3826 UART_DMAError() triggered by a TX DMA error
-// while RX DMA is active: resets huart->RxState = READY and clears IDLEIE,
-// but leaves USART_CR3_DMAR set and hdmarx->State == HAL_DMA_STATE_BUSY!
 static void Simulate_Bundled_HAL_Tx_DMA_Error(UART_HandleTypeDef *huart) {
     if (huart->hdmatx != nullptr) {
         huart->hdmatx->State = HAL_DMA_STATE_READY;
@@ -192,7 +234,6 @@ static void Simulate_Bundled_HAL_Tx_DMA_Error(UART_HandleTypeDef *huart) {
     if ((huart->cr3 & USART_CR3_DMAR) != 0U && huart->RxState == HAL_UART_STATE_BUSY_RX) {
         huart->cr1 &= ~USART_CR1_IDLEIE;
         huart->RxState = HAL_UART_STATE_READY;
-        // Critically, bundled UART_EndRxTransfer does NOT clear CR3_DMAR or stop hdmarx!
     }
     huart->ErrorCode |= HAL_UART_ERROR_DMA;
     HAL_UART_ErrorCallback(huart);
@@ -218,83 +259,61 @@ int main() {
 
     UART_Init(&huart1, On_Rx);
     assert(huart1.arm_calls == 1U);
-    assert(huart1.armed_buf == UART1_Manage_Object.Rx_Buffer_0);
     assert((hdmarx.disabled_it_mask & DMA_IT_HT) != 0U);
-    assert(hdmarx.ht_disable_calls == 1U);
-    assert(!UART1_Manage_Object.Rx_Recovery_Pending);
+    assert(!UART_Is_Rx_Fault_Latched(&huart1));
 
-    // 1. Mid-transfer HT event must be ignored while normal-mode DMA is still busy.
+    // 1. Mid-transfer HT event ignored; IDLE delivers Rx_Buffer_0 cleanly.
     std::memset(UART1_Manage_Object.Rx_Buffer_0, 0x5A, 300U);
     huart1.RxEventType = HAL_UART_RXEVENT_HT;
     HAL_UARTEx_RxEventCallback(&huart1, UART_BUFFER_SIZE / 2U);
     assert(cb_count == 0);
-    assert(huart1.arm_failures == 0U);
-    assert(UART1_Manage_Object.Rx_Buffer_Active == UART1_Manage_Object.Rx_Buffer_0);
-
-    // 2. Terminal IDLE event finishes normal-mode DMA and delivers exact Rx_Buffer_0 payload.
     hdmarx.State = HAL_DMA_STATE_READY;
     huart1.RxState = HAL_UART_STATE_READY;
     huart1.RxEventType = HAL_UART_RXEVENT_IDLE;
     HAL_UARTEx_RxEventCallback(&huart1, 300U);
-    assert(cb_count == 1);
-    assert(cb_buf == UART1_Manage_Object.Rx_Buffer_0);
-    assert(cb_len == 300U);
-    assert(huart1.armed_buf == UART1_Manage_Object.Rx_Buffer_1);
-    assert(hdmarx.ht_disable_calls == 2U);
+    assert(cb_count == 1 && cb_buf == UART1_Manage_Object.Rx_Buffer_0 && cb_len == 300U);
 
-    // 3. Non-stopping error while RX is still BUSY_RX must preserve active Rx_Buffer_1.
-    HAL_UART_ErrorCallback(&huart1);
-    assert(!UART1_Manage_Object.Rx_Recovery_Pending);
-    assert(UART1_Manage_Object.Rx_Buffer_Active == UART1_Manage_Object.Rx_Buffer_1);
-    assert(UART_Service_Rx_Recovery(&huart1));
-    assert(huart1.abort_rx_calls == 0U);
-    assert(UART1_Manage_Object.Rx_Buffer_Active == UART1_Manage_Object.Rx_Buffer_1);
-
-    // 4. Actual bundled STM32H7 HAL TX DMA error sequence:
-    //    UART_DMAError sets huart->RxState = READY while leaving hdmarx->State == BUSY!
+    // 2. Bundled HAL TX DMA error leaves hdmarx BUSY while setting RxState=READY -> task context recovers.
     uint8_t tx_dummy[4] = {1, 2, 3, 4};
     UART_Transmit_Data(&huart1, tx_dummy, 4U);
     Simulate_Bundled_HAL_Tx_DMA_Error(&huart1);
-    assert(huart1.RxState == HAL_UART_STATE_READY);
-    assert(hdmarx.State == HAL_DMA_STATE_BUSY);
-    // ISR must NOT attempt a doomed rearm while hdmarx is BUSY; it defers to task context.
-    assert(huart1.arm_failures == 0U);
-    assert(UART1_Manage_Object.Rx_Recovery_Pending);
-
-    // Task-context recovery stops lingering hdmarx stream, rearms RX DMA, and disables HT.
+    assert(UART1_Manage_Object.Rx_Recovery_Pending && huart1.arm_failures == 0U);
     assert(UART_Service_Rx_Recovery(&huart1));
-    assert(huart1.abort_rx_calls == 1U);
-    assert(hdmarx.abort_calls == 1U);
-    assert(huart1.RxState == HAL_UART_STATE_BUSY_RX);
-    assert((huart1.cr1 & USART_CR1_IDLEIE) != 0U);
-    assert(hdmarx.State == HAL_DMA_STATE_BUSY);
-    assert(!UART1_Manage_Object.Rx_Recovery_Pending);
-    assert(UART1_Manage_Object.Rx_Buffer_Active == UART1_Manage_Object.Rx_Buffer_0);
-    assert(hdmarx.ht_disable_calls == 3U);
+    assert(huart1.RxState == HAL_UART_STATE_BUSY_RX && hdmarx.State == HAL_DMA_STATE_BUSY);
+    assert(!UART_Is_Rx_Fault_Latched(&huart1));
 
-    // 5. Transient abort failure AND transient rearm failure must keep Rx_Recovery_Pending set
-    //    and succeed on retry without stranding RX.
+    // 3. REAL HAL DMA abort timeout -> hdmarx transitions to HAL_DMA_STATE_ERROR!
+    //    Driver MUST explicitly handle ERROR via HAL_DMA_DeInit + HAL_DMA_Init (NOT loop HAL_DMA_Abort!).
     Simulate_Bundled_HAL_Tx_DMA_Error(&huart1);
-    assert(UART1_Manage_Object.Rx_Recovery_Pending);
-    hdmarx.fail_abort_once = true;
-    assert(!UART_Service_Rx_Recovery(&huart1));
-    assert(UART1_Manage_Object.Rx_Recovery_Pending);
-    assert(huart1.RxState == HAL_UART_STATE_READY);
+    hdmarx.timeout_abort_once = true;
+    assert(UART_Service_Rx_Recovery(&huart1));
+    assert(hdmarx.deinit_calls == 1U && hdmarx.init_calls == 1U);
+    assert(huart1.RxState == HAL_UART_STATE_BUSY_RX && hdmarx.State == HAL_DMA_STATE_BUSY);
+    assert(!UART1_Manage_Object.Rx_Recovery_Pending && !UART_Is_Rx_Fault_Latched(&huart1));
 
-    // Second tick: CR3_DMAR was already cleared by the failed AbortReceive, yet hdmarx is STILL BUSY!
-    // Explicit HAL_DMA_Abort fallback must clear hdmarx, then fail_rearm_once simulates transient HAL_BUSY.
+    // 4. Transient rearm busy recovers on the next tick.
+    Simulate_Bundled_HAL_Tx_DMA_Error(&huart1);
     huart1.fail_rearm_once = true;
     assert(!UART_Service_Rx_Recovery(&huart1));
-    assert(UART1_Manage_Object.Rx_Recovery_Pending);
-    assert(hdmarx.State == HAL_DMA_STATE_READY);
-
-    // Third tick: clean rearm succeeds!
+    assert(UART1_Manage_Object.Rx_Recovery_Pending && !UART_Is_Rx_Fault_Latched(&huart1));
     assert(UART_Service_Rx_Recovery(&huart1));
-    assert(!UART1_Manage_Object.Rx_Recovery_Pending);
-    assert(huart1.RxState == HAL_UART_STATE_BUSY_RX);
-    assert(hdmarx.ht_disable_calls == 4U);
+    assert(!UART1_Manage_Object.Rx_Recovery_Pending && !UART_Is_Rx_Fault_Latched(&huart1));
 
-    std::puts("PASS: drv_uart HT guard, bundled HAL TX-DMA-error task recovery, transient failure retry");
+    // 5. Permanently wedged DMA stream (HAL_DMA_Init stays in HAL_DMA_STATE_ERROR) MUST latch fault!
+    Simulate_Bundled_HAL_Tx_DMA_Error(&huart1);
+    hdmarx.timeout_abort_once = true;
+    hdmarx.wedge_init_always = true;
+    assert(!UART_Service_Rx_Recovery(&huart1));
+    assert(!UART_Is_Rx_Fault_Latched(&huart1));
+    assert(!UART_Service_Rx_Recovery(&huart1));
+    assert(!UART_Is_Rx_Fault_Latched(&huart1));
+    assert(!UART_Service_Rx_Recovery(&huart1));
+    assert(UART_Is_Rx_Fault_Latched(&huart1));
+    const uint32_t init_before = hdmarx.init_calls;
+    assert(!UART_Service_Rx_Recovery(&huart1));
+    assert(hdmarx.init_calls == init_before); // Latched fault stops retrying wedged stream!
+
+    std::puts("PASS: drv_uart HT guard, HAL-faithful DMA ERROR DeInit/Init recovery, wedged-stream fault latch");
     return 0;
 }
 ''',

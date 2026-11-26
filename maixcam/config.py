@@ -31,9 +31,9 @@ class RescueVisionConfig:
             "orange": [42, 85, 18, 65, 25, 72],
             "cyan": [48, 90, -45, -8, -42, -6],
             "red_zone": [28, 72, 26, 75, 10, 58],
-            "blue_zone": [20, 62, -10, 30, -68, -22],
+            "blue_zone": [20, 62, -15, 17, -68, -22],
             "purple_ramp": [20, 68, 18, 62, -55, -14],
-            "opponent": [35, 95, -15, 15, -15, 15],
+            "opponent": [28, 66, -15, 15, -15, 15],
         }
     )
     # Arena floor LAB band used with invert=True in near ROIs to flag unrecognized foreground objects.
