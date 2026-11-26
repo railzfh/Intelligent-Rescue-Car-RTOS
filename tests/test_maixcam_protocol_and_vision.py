@@ -4,6 +4,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from types import SimpleNamespace
 import unittest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -2517,15 +2518,8 @@ class MaixcamVisionAndUITest(unittest.TestCase):
             self.assertTrue(bool(pair_st.flags & VIS_FLAG_CORRAL_SAFE), msg=tier_name)
 
     def test_round21_concave_parent_cannot_explain_disconnected_same_label_patch(self) -> None:
-        from types import SimpleNamespace
-
         floor = (85, 0, 0)
         green = (55, -35, 30)
-
-        def binary_source(img):
-            binary = _FakeMaixBinaryImage(img.width, img.height, floor)
-            binary._lab_rows = [row[:] for row in img._grid]
-            return binary
 
         for overlap in (False, True):
             for parent_rejected, hollow in ((False, floor), (False, (12, 0, 0)), (True, floor)):
@@ -2544,11 +2538,7 @@ class MaixcamVisionAndUITest(unittest.TestCase):
                     if patch_present:
                         # Below the legal block minimum, but large enough to be an unknown hazard.
                         img.fill_rect(130, 149, 8, 8, green)
-                    for tier, source in (
-                        (1, img),
-                        (2, binary_source(img)),
-                        (3, SimpleNamespace(find_blobs=img.find_blobs)),
-                    ):
+                    for tier, source in self._extraction_sources(img, floor):
                         with self.subTest(tier=tier, overlap=overlap, rejected=parent_rejected,
                                           hollow=hollow, patch=patch_present):
                             blobs = extract_blobs_from_maix_image(source, cfg, scan_unknown_near=True)
@@ -2561,6 +2551,102 @@ class MaixcamVisionAndUITest(unittest.TestCase):
                             self.assertEqual(bool(state.flags & VIS_FLAG_CORRAL_SAFE),
                                              not (parent_rejected or patch_present))
                             self.assertTrue(state.flags & VIS_FLAG_SWEEP_CLEAR)
+
+    @staticmethod
+    def _extraction_sources(img, floor):
+        binary = _FakeMaixBinaryImage(img.width, img.height, floor)
+        binary._lab_rows = [row[:] for row in img._grid]
+        return ((1, img), (2, binary), (3, SimpleNamespace(find_blobs=img.find_blobs)))
+
+    def test_floor_exclusion_scan_boxes_do_not_duplicate_enclosed_blobs(self) -> None:
+        floor, overlap, green = (90, 0, 0), (75, 0, 0), (55, -35, 30)
+        cfg = RescueVisionConfig()
+        cfg.lab_thresholds["green"] = [30, 82, -60, 14, -14, 55]
+        for enclosed_mixed in (False, True):
+            img = _FakeMaixImage(320, 240, floor)
+            # The two mixed components have intersecting bounds but never touch in the image.
+            img.fill_rect(100, 130, 10, 50, overlap)
+            img.fill_rect(100, 175, 25, 5, overlap)
+            img.fill_rect(102, 132, 4, 4, green)
+            img.fill_rect(118, 160, 47, 10, overlap)
+            img.fill_rect(158, 162, 4, 4, green)
+            # The legal block is in the union box, outside either original component's bounds.
+            if enclosed_mixed:
+                img.fill_rect(131, 134, 14, 14, overlap)
+            img.fill_rect(132, 135, 12, 12, green)
+            for tier, source in self._extraction_sources(img, floor):
+                with self.subTest(tier=tier, enclosed_mixed=enclosed_mixed):
+                    blobs = extract_blobs_from_maix_image(source, cfg, scan_unknown_near=True)
+                    self.assertEqual([(b.x, b.y, b.pixels) for b in blobs if b.label == "green"],
+                                     [(132, 135, 144)])
+                    state = RescueVisionProcessor(cfg).process(
+                        blobs, camera_near_cmd=True, camera_settled=True, team=TEAM_RED,
+                        first_green_unlocked=False,
+                    )
+                    self.assertEqual(state.corral_green_cnt, 1)
+
+    def test_floor_exclusion_cannot_confirm_a_drop_from_the_same_home_block(self) -> None:
+        floor, overlap, green = (90, 0, 0), (75, 0, 0), (55, -35, 30)
+        cfg = RescueVisionConfig()
+        cfg.lab_thresholds["green"] = [30, 82, -60, 14, -14, 55]
+        pre = _FakeMaixImage(320, 240, floor)
+        post = _FakeMaixImage(320, 240, floor)
+        for img in (pre, post):
+            img.fill_rect(40, 20, 240, 75, (45, 55, 20))
+            img.fill_rect(40, 95, 240, 15, (45, 40, -35))
+            img.fill_rect(80, 35, 12, 12, green)  # Already in home before the drop.
+        pre.fill_rect(150, 150, 12, 12, green)
+        post.fill_rect(50, 25, 10, 50, overlap)
+        post.fill_rect(50, 70, 25, 5, overlap)
+        post.fill_rect(52, 27, 2, 2, green)
+        post.fill_rect(68, 55, 45, 10, overlap)
+        post.fill_rect(108, 57, 2, 2, green)
+
+        args = dict(camera_near_cmd=True, camera_settled=True, team=TEAM_RED,
+                    first_green_unlocked=True, gate_settled=True, max_materials_per_trip=1)
+        for (tier, pre_src), (_, post_src) in zip(self._extraction_sources(pre, floor),
+                                                 self._extraction_sources(post, floor)):
+            with self.subTest(tier=tier):
+                processor = RescueVisionProcessor(cfg)
+                pre_blobs = extract_blobs_from_maix_image(pre_src, cfg, scan_unknown_near=True)
+                before = processor.process(
+                    pre_blobs, mission_state=MISSION_DROP_OPEN_AND_PUSH, gate_closed=True, **args
+                )
+                self.assertTrue(before.flags & VIS_FLAG_DROP_BASELINE_READY)
+                post_blobs = extract_blobs_from_maix_image(post_src, cfg, scan_unknown_near=True)
+                after = processor.process(
+                    post_blobs, mission_state=MISSION_DROP_BACKOUT_VERIFY, gate_closed=False, **args
+                )
+                self.assertEqual(after.corral_green_cnt, 0)
+                self.assertTrue(after.flags & VIS_FLAG_DROP_PATH_CLEAR)
+                self.assertFalse(after.flags & VIS_FLAG_DROP_CONFIRMED)
+
+    def test_tier3_overlapping_surface_and_object_do_not_double_explain_pixels(self) -> None:
+        floor, red, red_orange = (85, 0, 0), (40, 50, 20), (55, 45, 32)
+        for accounted, floor_overlap in ((False, False), (True, False), (False, True)):
+            cfg = RescueVisionConfig()
+            cfg.lab_thresholds["orange"] = [48, 88, 14, 58, 30, 78]
+            if floor_overlap:
+                cfg.lab_thresholds["red_zone"] = [25, 82, -10, 78, 5, 34]
+            if accounted:
+                cfg.max_block_pixels = 95  # The same solid orange patch is now a rejected object.
+            img = _FakeMaixImage(320, 240, floor)
+            img.fill_rect(60, 30, 100, 10, red)
+            img.fill_rect(60, 40, 10, 20, red)
+            img.fill_rect(60, 60, 100, 10, red)
+            img.fill_rect(60, 45, 10, 10, red_orange)  # Entirely inside the concave surface.
+            if floor_overlap:
+                img.fill_rect(110, 40, 10, 2, (75, 0, 10))  # Force a cached floor-excluded surface.
+            for obstacle in (False, True):
+                if obstacle:
+                    img.fill_rect(70, 46, 8, 8, (50, 5, 45))  # 64 unknown pixels touching the spine.
+                for tier, source in self._extraction_sources(img, floor):
+                    with self.subTest(tier=tier, accounted=accounted, floor_overlap=floor_overlap, obstacle=obstacle):
+                        blobs = extract_blobs_from_maix_image(source, cfg, scan_unknown_near=True)
+                        self.assertEqual([b.pixels for b in blobs if b.label == "red_zone"], [2200])
+                        self.assertEqual([b.pixels for b in blobs if b.label == "orange"], [100])
+                        self.assertEqual([b.pixels for b in blobs if b.label == "unknown"],
+                                         [64] if obstacle else [])
 
 
 if __name__ == "__main__":

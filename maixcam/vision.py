@@ -87,6 +87,13 @@ class Blob:
         return self.y + self.h
 
 
+@dataclass(frozen=True)
+class _ProvenRegion:
+    blob: Blob
+    parent: Optional[Blob] = None  # Resolve intact sparse parents only when an exact union is needed.
+    points: Optional[List[Tuple[int, int]]] = None
+
+
 def _rects_intersect(ax: int, ay: int, aw: int, ah: int, bx: int, by: int, bw: int, bh: int) -> bool:
     return ax < bx + bw and ax + aw > bx and ay < by + bh and ay + ah > by
 
@@ -160,7 +167,7 @@ def _is_verified_object_blob(blob: Blob, min_pixels: int, cfg: Optional[RescueVi
 
 
 def _group_unique_pixels(items: Sequence[Tuple[Tuple[int, int, int, int], float, int]]) -> int:
-    """Upper bound on unique pixels for possibly-overlapping blobs (no double counting)."""
+    """Estimate unique pixels using uniform density within each bounding box."""
     if not items:
         return 0
     xs = sorted({x for r, _, _ in items for x in (r[0], r[2])})
@@ -191,7 +198,7 @@ def _unique_explained_pixels(
     explaining_blobs: Sequence[Blob],
     cfg: Optional[RescueVisionConfig] = None,
 ) -> Tuple[int, int]:
-    """Return (unique_explained_pixels, unique_union_area) clipped to fg without double counting."""
+    """Return estimated explained pixels and exact bounding-box union area clipped to fg."""
     clipped: List[Tuple[str, Tuple[int, int, int, int], float, int]] = []
     for eb in explaining_blobs:
         inter = _rect_intersection(fg.x, fg.y, fg.w, fg.h, eb.x, eb.y, eb.w, eb.h)
@@ -1512,49 +1519,38 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                 proven_non_floor_keys.add((label, p.x, p.y, p.w, p.h, p.pixels))
             return pure_non_floor
 
-        # Fold any pure blob overlapping a mixed blob's AABB into mixed so exact (thresh \ floor)
-        # extraction visits every non-floor pixel once without ever duplicating enclosed siblings.
-        remaining_pure = list(pure_non_floor)
-        changed = True
-        while changed and remaining_pure:
-            changed = False
-            next_pure: List[Blob] = []
-            for p in remaining_pure:
-                if any(_rects_intersect(p.x, p.y, p.w, p.h, m.x, m.y, m.w, m.h) for m in mixed):
-                    mixed.append(p)
-                    changed = True
-                else:
-                    next_pure.append(p)
-            remaining_pure = next_pure
+        # Extraction scans whole union boxes, including the space between input components.
+        # Grow each box to a fixed point against prior scan boxes and unclaimed pure blobs.
+        remaining_pure = pure_non_floor
+        scan_boxes: List[Tuple[int, int, int, int]] = []
+        for m in mixed:
+            ux1, uy1, ux2, uy2 = m.x, m.y, m.x2, m.y2
+            while True:
+                before = (ux1, uy1, ux2, uy2)
+                unclaimed_boxes = []
+                for x1, y1, x2, y2 in scan_boxes:
+                    if x1 < ux2 and ux1 < x2 and y1 < uy2 and uy1 < y2:
+                        ux1, uy1 = min(ux1, x1), min(uy1, y1)
+                        ux2, uy2 = max(ux2, x2), max(uy2, y2)
+                    else:
+                        unclaimed_boxes.append((x1, y1, x2, y2))
+                scan_boxes = unclaimed_boxes
 
-        # Partition mixed blobs into AABB-connected clusters and extract exact (thresh \ floor) components.
-        parent = list(range(len(mixed)))
-
-        def _uf_find(x: int) -> int:
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return x
-
-        for i in range(len(mixed)):
-            mi = mixed[i]
-            for j in range(i + 1, len(mixed)):
-                mj = mixed[j]
-                if _rects_intersect(mi.x, mi.y, mi.w, mi.h, mj.x, mj.y, mj.w, mj.h):
-                    ri, rj = _uf_find(i), _uf_find(j)
-                    if ri != rj:
-                        parent[rj] = ri
-
-        groups: Dict[int, List[Blob]] = {}
-        for i, m in enumerate(mixed):
-            groups.setdefault(_uf_find(i), []).append(m)
+                unclaimed_pure = []
+                for p in remaining_pure:
+                    if _rects_intersect(ux1, uy1, ux2 - ux1, uy2 - uy1, p.x, p.y, p.w, p.h):
+                        ux1, uy1 = min(ux1, p.x), min(uy1, p.y)
+                        ux2, uy2 = max(ux2, p.x2), max(uy2, p.y2)
+                    else:
+                        unclaimed_pure.append(p)
+                remaining_pure = unclaimed_pure
+                if before == (ux1, uy1, ux2, uy2):
+                    break
+            scan_boxes.append((ux1, uy1, ux2, uy2))
 
         extracted: List[Blob] = []
-        for cl in groups.values():
-            ux1 = max(0, min(m.x for m in cl))
-            uy1 = max(0, min(m.y for m in cl))
-            ux2 = min(fw, max(m.x2 for m in cl))
-            uy2 = min(fh, max(m.y2 for m in cl))
+        for x1, y1, x2, y2 in scan_boxes:
+            ux1, uy1, ux2, uy2 = max(0, x1), max(0, y1), min(fw, x2), min(fh, y2)
             uw, uh = ux2 - ux1, uy2 - uy1
             if uw <= 0 or uh <= 0:
                 continue
@@ -1725,6 +1721,7 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
             _emit_singleton_obj(b, meets_min, is_ver)
     else:
         cand_pts_cache: Dict[int, set[Tuple[int, int]]] = {}
+        inferred_cand_footprints: set[int] = set()
 
         def _get_cand_pixels(idx: int) -> set[Tuple[int, int]]:
             cached = cand_pts_cache.get(idx)
@@ -1762,6 +1759,7 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                         pts = set(cpts)
                         break
                 if not pts:
+                    inferred_cand_footprints.add(idx)
                     pts = {
                         (xx, yy)
                         for yy in range(by1, by2)
@@ -1771,6 +1769,8 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
             else:
                 cid_grid, geoms, _ = _resolve_exact_label_components(b.label, thresh_b, (ux1, uy1, ux2, uy2), exp_g)
                 b_cids = {cid for cid, g in enumerate(geoms) if g == b_geom}
+                if len(b_cids) != 1:
+                    inferred_cand_footprints.add(idx)
                 if b_cids:
                     for ly, row_c in enumerate(cid_grid):
                         ay = uy1 + ly
@@ -1846,7 +1846,9 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                 and not _lab_ranges_overlap(t_m, cfg.arena_floor_lab)
                 for m in members
             )
-            accounted_clusters.append((union_pts, (ux1, uy1, ux2, uy2), cluster_floor_disjoint))
+            # An approximate footprint can warn of a conflict, but must not explain away Tier-3 foreground.
+            if inferred_cand_footprints.isdisjoint(members):
+                accounted_clusters.append((union_pts, (ux1, uy1, ux2, uy2), cluster_floor_disjoint))
 
     # In NEAR view, detect unexplained non-floor foreground across ALL fixed near ROIs PLUS the dynamic
     # home zone, ramp band, and projected push-corridor geometry, masking ONLY verified connected
@@ -2719,6 +2721,32 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
         # an unexplained foreground patch sharing an AABB with a concave conflict is never skipped.
         emitted_tier3_residuals: set[Tuple[int, int, int, int]] = set()
         verified_parents = verified_full_surfaces + verified_full_objects
+
+        def _parent_pixels(parent: Blob, clip: Tuple[int, int, int, int]) -> Iterable[Tuple[int, int]]:
+            ix1, iy1, ix2, iy2 = clip
+            geom = (parent.x, parent.y, parent.w, parent.h, parent.pixels)
+            pre_pts = precomputed_pts_by_key.get((parent.label, *geom))
+            if pre_pts is not None:
+                return ((x, y) for x, y in pre_pts if ix1 <= x < ix2 and iy1 <= y < iy2)
+            # Resolve the full parent before clipping: the intersection may contain enclosed siblings.
+            box = (parent.x, parent.y, parent.x2, parent.y2)
+            expected_geoms = {
+                (b.x, b.y, b.w, b.h, b.pixels)
+                for b in all_raw_by_label[parent.label]
+                if parent.x <= b.x and parent.y <= b.y and b.x2 <= parent.x2 and b.y2 <= parent.y2
+            }
+            grid, geoms, _ = _resolve_exact_label_components(
+                parent.label, cfg.lab_thresholds[parent.label], box, expected_geoms
+            )
+            parent_ids = [cid for cid, g in enumerate(geoms) if g == geom]
+            if len(parent_ids) != 1:
+                return ()  # No unique parent proof: leave these pixels unexplained.
+            parent_id = parent_ids[0]
+            return (
+                (x, y) for y in range(iy1, iy2) for x in range(ix1, ix2)
+                if grid[y - parent.y][x - parent.x] == parent_id
+            )
+
         for roi, merge_fg in scan_rois:
             fg_blobs = _find_blobs_unit_stride(
                 img,
@@ -2820,7 +2848,7 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
 
                 fx2, fy2 = fx + fg_w, fy + fg_h
 
-                def _clip_parent_on_fg(parent: Blob, emit_label: str) -> List[Blob]:
+                def _clip_parent_on_fg(parent: Blob, emit_label: str) -> List[_ProvenRegion]:
                     inter = _rect_intersection(fx, fy, fg_w, fg_h, parent.x, parent.y, parent.w, parent.h)
                     if inter is None:
                         return []
@@ -2838,43 +2866,21 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                         cand = None
                     if cand is not None:
                         proven = _proven_sub_on_fg(cand, thresh, proven_non_floor=non_floor)
-                        return [proven] if proven is not None else []
-
-                    pre_pts = precomputed_pts_by_key.get(key)
-                    if pre_pts is not None:
-                        remaining_set = {(x, y) for x, y in pre_pts if ix1 <= x < ix2 and iy1 <= y < iy2}
-                    else:
-                        # Reconstruct the full parent before clipping. A scan of the intersection
-                        # alone cannot distinguish clipped parent pixels from enclosed siblings.
-                        box = (parent.x, parent.y, parent.x2, parent.y2)
-                        expected_geoms = {
-                            (b.x, b.y, b.w, b.h, b.pixels)
-                            for b in all_raw_by_label[parent.label]
-                            if parent.x <= b.x and parent.y <= b.y and b.x2 <= parent.x2 and b.y2 <= parent.y2
-                        }
-                        grid, geoms, _ = _resolve_exact_label_components(parent.label, thresh, box, expected_geoms)
-                        parent_ids = [cid for cid, g in enumerate(geoms) if g == geom]
-                        if len(parent_ids) != 1:
-                            # No unique parent proof: leave these pixels unexplained.
-                            return []
-                        parent_id = parent_ids[0]
-                        remaining_set = {
-                            (x, y) for y in range(iy1, iy2) for x in range(ix1, ix2)
-                            if grid[y - parent.y][x - parent.x] == parent_id
-                        }
+                        return [_ProvenRegion(proven, parent=parent)] if proven is not None else []
 
                     # Clipping can disconnect parts of the parent. Check foreground membership
                     # for each connected fragment separately.
-                    out_subs: List[Blob] = []
+                    remaining_set = set(_parent_pixels(parent, inter))
+                    out_subs: List[_ProvenRegion] = []
                     while remaining_set:
                         seed = remaining_set.pop()
                         st = [seed]
                         mn_x = mx_x = seed[0]
                         mn_y = mx_y = seed[1]
-                        cnt = 0
+                        points: List[Tuple[int, int]] = []
                         while st:
                             cx, cy = st.pop()
-                            cnt += 1
+                            points.append((cx, cy))
                             if cx < mn_x:
                                 mn_x = cx
                             if cx > mx_x:
@@ -2888,10 +2894,11 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                                     remaining_set.remove(nb_pt)
                                     st.append(nb_pt)
                         sw, sh = mx_x - mn_x + 1, mx_y - mn_y + 1
+                        cnt = len(points)
                         cand = Blob(emit_label, mn_x, mn_y, sw, sh, cnt, cnt / float(sw * sh))
                         proven = _proven_sub_on_fg(cand, thresh, proven_non_floor=non_floor)
                         if proven is not None:
-                            out_subs.append(proven)
+                            out_subs.append(_ProvenRegion(proven, points=points))
                     return out_subs
 
                 roi_verified = [
@@ -2899,7 +2906,7 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                     for sub in _clip_parent_on_fg(parent, parent.label)
                 ]
 
-                roi_accounted: List[Blob] = []
+                roi_accounted: List[_ProvenRegion] = []
                 for cl_pts, (ax1, ay1, ax2, ay2), cl_floor_disjoint in accounted_clusters:
                     if membership_uncertain or not _rects_intersect(fx, fy, fg_w, fg_h, ax1, ay1, ax2 - ax1, ay2 - ay1):
                         continue
@@ -2942,11 +2949,40 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                         py2 = max(p[1] for p in in_fg) + 1
                         pw, ph = max(1, px2 - px1), max(1, py2 - py1)
                         pcnt = len(in_fg)
-                        roi_accounted.append(Blob("_accounted", px1, py1, pw, ph, pcnt, pcnt / float(pw * ph)))
+                        region = Blob("_accounted", px1, py1, pw, ph, pcnt, pcnt / float(pw * ph))
+                        roi_accounted.append(_ProvenRegion(region, points=in_fg))
                 for rb in accounted_rejected_blobs:
                     roi_accounted.extend(_clip_parent_on_fg(rb, "_accounted"))
 
-                explained_px, union_area = _unique_explained_pixels(fg, roi_verified + roi_accounted, cfg=cfg)
+                regions = roi_verified + roi_accounted
+                region_blobs = [r.blob for r in regions]
+                # A density estimate can count a patch twice when it lies on a sparse parent's
+                # occupied pixels. Use actual occupancy in intersecting sparse/solid or sparse/sparse boxes.
+                exact_union = any(
+                    (a.pixels < a.w * a.h or b.pixels < b.w * b.h)
+                    and _rects_intersect(a.x, a.y, a.w, a.h, b.x, b.y, b.w, b.h)
+                    for i, a in enumerate(region_blobs)
+                    for b in region_blobs[i + 1:]
+                )
+                if exact_union:
+                    rows = [0] * fg_h
+                    for region in regions:
+                        b = region.blob
+                        box = (b.x, b.y, b.x2, b.y2)
+                        if b.pixels == b.w * b.h:
+                            row_mask = ((1 << b.w) - 1) << (b.x - fx)
+                            for y in range(b.y - fy, b.y2 - fy):
+                                rows[y] |= row_mask
+                        else:
+                            points: Optional[Iterable[Tuple[int, int]]] = region.points
+                            if points is None and region.parent is not None:
+                                points = _parent_pixels(region.parent, box)
+                            for x, y in points or ():
+                                rows[y - fy] |= 1 << (x - fx)
+                    explained_px = sum(row.bit_count() for row in rows)
+                    union_area = _rect_union_area([(b.x, b.y, b.x2, b.y2) for b in region_blobs])
+                else:
+                    explained_px, union_area = _unique_explained_pixels(fg, region_blobs, cfg=cfg)
                 unexplained_px = max(0, fg.pixels - explained_px)
                 pixel_coverage = explained_px / float(max(1, fg.pixels))
                 area_coverage = union_area / float(max(1, fg.w * fg.h))
@@ -2957,7 +2993,11 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                     or (area_coverage < 0.70 and explained_px < fg.pixels)
                 ):
                     emitted_tier3_residuals.add(fg_roi)
-                    emit_px = unexplained_px if roi_accounted and unexplained_px >= cfg.min_hazard_pixels else fg.pixels
+                    emit_px = (
+                        unexplained_px
+                        if (exact_union or roi_accounted) and unexplained_px >= cfg.min_hazard_pixels
+                        else fg.pixels
+                    )
                     blobs.append(
                         Blob("unknown", fg.x, fg.y, fg.w, fg.h, emit_px, min(1.0, emit_px / float(fg.w * fg.h)))
                     )
