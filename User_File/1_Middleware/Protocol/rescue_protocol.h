@@ -75,8 +75,9 @@ static constexpr uint16_t VIS_FLAG_GATE_OPEN_SETTLED_ACK = (1U << 12);
 static constexpr uint16_t VIS_FLAG_DROP_BASELINE_READY = (1U << 13);
 static constexpr uint16_t VIS_FLAG_PRE_MATCH_GEN_SHIFT = 14U;
 static constexpr uint16_t VIS_FLAG_PRE_MATCH_GEN_MASK = (3U << 14);
-// CAMERA_VIEW_NEAR only (bits 14..15 carry VIS_FLAG_PRE_MATCH_GEN exclusively in CAMERA_VIEW_FAR).
-static constexpr uint16_t VIS_FLAG_GATE_CLOSED_SETTLED_ACK = (1U << 14);
+// Unified 2-bit non-zero settle-cycle generation (1..3): PRE_MATCH in FAR, GATE_CLOSE/GATE_OPEN in NEAR.
+static constexpr uint16_t VIS_FLAG_SETTLE_GEN_SHIFT = 14U;
+static constexpr uint16_t VIS_FLAG_SETTLE_GEN_MASK = (3U << 14);
 
 // Bitmask for Struct_Rescue_Telemetry::status_flags
 static constexpr uint16_t TEL_FLAG_CONFIG_LOCKED = (1U << 0);
@@ -95,6 +96,8 @@ static constexpr uint16_t TEL_FLAG_CARRYING_CASUALTY = (1U << 12);
 static constexpr uint16_t TEL_FLAG_DROP_PUSHING = (1U << 13);
 static constexpr uint16_t TEL_FLAG_PRE_MATCH_GEN_SHIFT = 14U;
 static constexpr uint16_t TEL_FLAG_PRE_MATCH_GEN_MASK = (3U << 14);
+static constexpr uint16_t TEL_FLAG_SETTLE_GEN_SHIFT = 14U;
+static constexpr uint16_t TEL_FLAG_SETTLE_GEN_MASK = (3U << 14);
 
 // Bitmask for Struct_Rescue_Telemetry::fault_flags
 static constexpr uint16_t FAULT_FLAG_BATTERY = (1U << 0);

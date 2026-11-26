@@ -32,7 +32,6 @@ from maixcam.protocol import (
     VIS_FLAG_DROP_BASELINE_READY,
     VIS_FLAG_DROP_CONFIRMED,
     VIS_FLAG_DROP_PATH_CLEAR,
-    VIS_FLAG_GATE_CLOSED_SETTLED_ACK,
     VIS_FLAG_GATE_OPEN_SETTLED_ACK,
     VIS_FLAG_HOME_HALF_MATCH,
     VIS_FLAG_HOME_VALID,
@@ -40,6 +39,8 @@ from maixcam.protocol import (
     VIS_FLAG_OPPONENT_NEAR,
     VIS_FLAG_OPPONENT_ZONE_NEAR,
     VIS_FLAG_REAR_CLEAR,
+    VIS_FLAG_SETTLE_GEN_MASK,
+    VIS_FLAG_SETTLE_GEN_SHIFT,
     VIS_FLAG_SWEEP_CLEAR,
     VIS_FLAG_TARGET_VALID,
     VisionState,
@@ -2268,7 +2269,7 @@ class MaixcamVisionAndUITest(unittest.TestCase):
         self.assertEqual(burst_gens, [0, 0, 0, 0, 1, 0, 0, 0, 0, 1])
 
     def test_round18_gate_closed_drain_and_floor_overlap_cargo_exclusion(self) -> None:
-        """R18 P1 & P2: post-close camera drain + ACK while keeping NEAR hazard monitoring live, and floor-only cargo rejection."""
+        """R18 & R19: cycle-bound close drain (including missed open/reclose telemetry), cyan floor fail-closed, and Tier-3 cached L-green."""
         from types import SimpleNamespace
         from unittest.mock import patch
         from maixcam import main as maix_main
@@ -2277,44 +2278,56 @@ class MaixcamVisionAndUITest(unittest.TestCase):
             TEL_FLAG_CAMERA_SETTLED,
             TEL_FLAG_GATE_CLOSED,
             TEL_FLAG_GATE_SETTLED,
+            TEL_FLAG_SETTLE_GEN_SHIFT,
         )
 
-        # 1. R18 P1: Camera pitch stays settled in NEAR while gate closes open -> closing -> closed_settled.
-        #    The 4 buffered pre-close frames MUST emit CAMERA_VIEW_NEAR with LIVE hazard detection and
-        #    VIS_FLAG_GATE_CLOSED_SETTLED_ACK == 0; ONLY the 5th post-close frame emits ACK == 1!
+        # 1. R18 P1 & R19 P1: Camera pitch stays settled in NEAR while gate closes open -> closing -> closed_settled(gen=1),
+        #    then MaixCAM MISSES ALL opening/reclosing telemetry during an unload retry and receives closed_settled(gen=2) directly!
+        #    - All 4 buffered pre-close frames for gen=1 emit CAMERA_VIEW_NEAR with LIVE hazard detection and settle_gen=0;
+        #      frame 5 emits settle_gen=1 (empty corral).
+        #    - Receiving gen=2 directly WITHOUT seeing an open/unsettled edge MUST re-arm the 4-frame drain (emitting settle_gen=0
+        #      for all 4 queued pre-reclose frames!) and echo settle_gen=2 ONLY on frame 5!
         tel_near_open = encode_telemetry(
             1, Telemetry(status_flags=TEL_FLAG_CAMERA_NEAR | TEL_FLAG_CAMERA_SETTLED | TEL_FLAG_GATE_SETTLED)
         )
         tel_near_closing = encode_telemetry(
             2, Telemetry(status_flags=TEL_FLAG_CAMERA_NEAR | TEL_FLAG_CAMERA_SETTLED | TEL_FLAG_GATE_CLOSED)
         )
-        tel_near_closed = encode_telemetry(
+        tel_near_closed_gen1 = encode_telemetry(
             3,
             Telemetry(
                 status_flags=TEL_FLAG_CAMERA_NEAR
                 | TEL_FLAG_CAMERA_SETTLED
                 | TEL_FLAG_GATE_CLOSED
                 | TEL_FLAG_GATE_SETTLED
+                | (1 << TEL_FLAG_SETTLE_GEN_SHIFT)
             ),
         )
-        # 5 frames to settle NEAR open (4 drain + 1 settled), 1 frame while gate closing,
-        # 4 buffered pre-close frames after closed-settled telemetry (one carrying a cyan hazard!),
-        # 1 fresh post-close empty frame, then a same-burst [closing, closed_settled] re-arming 4 more drains + 1 fresh!
+        tel_near_closed_gen2 = encode_telemetry(
+            4,
+            Telemetry(
+                status_flags=TEL_FLAG_CAMERA_NEAR
+                | TEL_FLAG_CAMERA_SETTLED
+                | TEL_FLAG_GATE_CLOSED
+                | TEL_FLAG_GATE_SETTLED
+                | (2 << TEL_FLAG_SETTLE_GEN_SHIFT)
+            ),
+        )
         tags = (
             [f"open_drain_{i}" for i in range(4)]
             + ["open_live"]
             + ["closing_live"]
             + ["pre_close_0", "pre_close_cyan", "pre_close_2", "pre_close_3"]
             + ["post_close_empty"]
-            + ["burst_pre_0", "burst_pre_1", "burst_pre_2", "burst_pre_3"]
-            + ["burst_post_fresh"]
+            + ["reclose_pre_0", "reclose_pre_1", "reclose_pre_2", "reclose_pre_3"]
+            + ["reclose_post_fresh"]
         )
         rx_seq = (
             [tel_near_open, b"", b"", b"", b""]
             + [tel_near_closing]
-            + [tel_near_closed, b"", b"", b""]
+            + [tel_near_closed_gen1, b"", b"", b""]
             + [b""]
-            + [tel_near_closing + tel_near_closed, b"", b"", b""]
+            + [tel_near_closed_gen2, b"", b"", b""]  # missed open/reclose telemetry entirely!
             + [b""]
         )
         self.assertEqual(len(tags), 16)
@@ -2360,30 +2373,39 @@ class MaixcamVisionAndUITest(unittest.TestCase):
             if (vs := decode_vision_state(fr)) is not None
         ]
         self.assertEqual(len(close_states), len(tags))
-        # Indices 6..9 are the 4 buffered pre-close frames after closed-settled telemetry arrived:
+        # Indices 6..9 are the 4 buffered pre-close frames after closed_settled(gen=1) arrived:
         for idx in range(6, 10):
             self.assertEqual(close_states[idx].camera_view, CAMERA_VIEW_NEAR, msg=tags[idx])
-            self.assertFalse(bool(close_states[idx].flags & VIS_FLAG_GATE_CLOSED_SETTLED_ACK), msg=tags[idx])
+            self.assertEqual(
+                (close_states[idx].flags & VIS_FLAG_SETTLE_GEN_MASK) >> VIS_FLAG_SETTLE_GEN_SHIFT, 0, msg=tags[idx]
+            )
         # Hazard monitoring MUST remain live during the drain (index 7 has cyan hazard)!
         self.assertEqual(close_states[7].corral_cyan_cnt, 1)
         self.assertFalse(bool(close_states[7].flags & VIS_FLAG_CORRAL_SAFE))
-        # Index 10 is the first genuine post-close image (empty corral) -> ACK == 1, green == 0!
+        # Index 10 is the first genuine post-close image (empty corral) -> settle_gen == 1, green == 0!
         self.assertEqual(close_states[10].camera_view, CAMERA_VIEW_NEAR)
-        self.assertTrue(bool(close_states[10].flags & VIS_FLAG_GATE_CLOSED_SETTLED_ACK))
+        self.assertEqual((close_states[10].flags & VIS_FLAG_SETTLE_GEN_MASK) >> VIS_FLAG_SETTLE_GEN_SHIFT, 1)
         self.assertEqual(close_states[10].corral_green_cnt, 0)
-        # Indices 11..14 after same-burst [closing, closed_settled] re-arm MUST withhold ACK, index 15 sets ACK == 1!
+        # Indices 11..14 after direct gen=1 -> gen=2 jump (missed open/reclose telemetry!) MUST drain with gen == 0,
+        # and index 15 echoes settle_gen == 2!
         for idx in range(11, 15):
             self.assertEqual(close_states[idx].camera_view, CAMERA_VIEW_NEAR, msg=tags[idx])
-            self.assertFalse(bool(close_states[idx].flags & VIS_FLAG_GATE_CLOSED_SETTLED_ACK), msg=tags[idx])
-        self.assertTrue(bool(close_states[15].flags & VIS_FLAG_GATE_CLOSED_SETTLED_ACK))
+            self.assertEqual(
+                (close_states[idx].flags & VIS_FLAG_SETTLE_GEN_MASK) >> VIS_FLAG_SETTLE_GEN_SHIFT, 0, msg=tags[idx]
+            )
+        self.assertEqual((close_states[15].flags & VIS_FLAG_SETTLE_GEN_MASK) >> VIS_FLAG_SETTLE_GEN_SHIFT, 2)
 
-        # 2. R18 P2: Floor-only patch under a floor-overlapping green calibration MUST NEVER authorize pickup
-        #    across Tier 1 (exact), Tier 2 (binary), AND Tier 3 (find_blobs-only)!
+        # 2. R18 P2, R19 P1-2, R19 P2:
+        #    - Floor-only patch under floor-overlapping green calibration -> NEVER accepted as green!
+        #    - Cyan calibration overlapping floor band -> MUST retain cyan hazard (fail closed) across all 3 tiers!
+        #    - 110-px L-shaped non-floor green component under floor-overlapping calibration -> 1 green, 0 unknown in ALL 3 tiers!
         cfg_overlap = RescueVisionConfig()
         cfg_overlap.lab_thresholds["green"] = [30, 82, -60, 14, 12, 55]  # overlaps arena_floor_lab at (75, -14, 14)
+        cfg_overlap.lab_thresholds["cyan"] = [48, 90, -48, -6, -42, -6]  # overlaps arena_floor_lab at (75, -10, -10), not (85,0,0)
         cfg_overlap.validate()
         floor_base = (85, 0, 0)
         floor_green_overlap = (75, -14, 14)  # matches BOTH arena_floor_lab AND green!
+        floor_cyan_overlap = (75, -10, -10)  # matches BOTH arena_floor_lab AND cyan!
         real_green = (55, -35, 30)           # non-floor green
         unknown_lab = (55, 5, 85)            # non-floor unknown (outside green [30..82,-60..14,12..55] and all bands)
 
@@ -2445,6 +2467,39 @@ class MaixcamVisionAndUITest(unittest.TestCase):
             self.assertEqual(ok_st.corral_unknown_cnt, 0, msg=tier_name)
             self.assertTrue(bool(ok_st.flags & VIS_FLAG_CORRAL_SAFE), msg=tier_name)
             self.assertTrue(any(b.label == "green" and b.pixels == 120 for b in ok_blobs), msg=tier_name)
+
+            # 2e. R19 P1-2: 120-px cyan patch overlapping floor band MUST be retained as cyan hazard (fail closed)!
+            img_cy = _FakeMaixImage(320, 240, floor_base)
+            img_cy.fill_rect(120, 150, 12, 10, floor_cyan_overlap)  # 120 px cyan in corral
+            img_cy.fill_rect(240, 150, 12, 10, floor_cyan_overlap)  # 120 px cyan in sweep
+            cy_blobs = extract_blobs_from_maix_image(make_src(img_cy), cfg_overlap, scan_unknown_near=True)
+            cy_st = RescueVisionProcessor(cfg_overlap).process(
+                cy_blobs, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False
+            )
+            self.assertEqual(cy_st.corral_cyan_cnt, 1, msg=tier_name)
+            self.assertFalse(bool(cy_st.flags & VIS_FLAG_CORRAL_SAFE), msg=tier_name)
+            self.assertFalse(bool(cy_st.flags & VIS_FLAG_SWEEP_CLEAR), msg=tier_name)
+
+            # 2f. R19 P2: 110-px L-shaped non-floor green component under floor-overlapping calibration
+            #     MUST produce green=1, unknown=0, CORRAL_SAFE=True across Tier 1, Tier 2, AND Tier 3!
+            img_l = _FakeMaixImage(320, 240, floor_base)
+            img_l.fill_rect(120, 150, 15, 5, real_green)  # 75 px horizontal bar
+            img_l.fill_rect(120, 155, 5, 7, real_green)   # 35 px vertical leg -> 110 px L-shape!
+            l_blobs = extract_blobs_from_maix_image(make_src(img_l), cfg_overlap, scan_unknown_near=True)
+            l_st = RescueVisionProcessor(cfg_overlap).process(
+                l_blobs, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False
+            )
+            self.assertEqual(l_st.corral_green_cnt, 1, msg=tier_name)
+            self.assertEqual(l_st.corral_unknown_cnt, 0, msg=tier_name)
+            self.assertTrue(bool(l_st.flags & VIS_FLAG_CORRAL_SAFE), msg=tier_name)
+            # Attaching a 100-px unknown wart to that L-shaped green component MUST still emit unknown!
+            img_l.fill_rect(125, 155, 10, 10, unknown_lab)
+            lw_blobs = extract_blobs_from_maix_image(make_src(img_l), cfg_overlap, scan_unknown_near=True)
+            lw_st = RescueVisionProcessor(cfg_overlap).process(
+                lw_blobs, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False
+            )
+            self.assertEqual(lw_st.corral_unknown_cnt, 1, msg=tier_name)
+            self.assertFalse(bool(lw_st.flags & VIS_FLAG_CORRAL_SAFE), msg=tier_name)
 
 
 if __name__ == "__main__":

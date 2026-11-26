@@ -106,9 +106,14 @@ bool Class_Rescue_Mission::On_Vision_State(const Struct_Vision_State &vis, uint3
         {
             Pending_Near_Non_Valid_Corral_Event = true;
         }
-        if (State == MISSION_CLOSE_GATE_VERIFY && (vis.flags & VIS_FLAG_GATE_CLOSED_SETTLED_ACK) == 0U)
+        if (State == MISSION_CLOSE_GATE_VERIFY)
         {
-            Pending_Near_Non_Valid_Corral_Event = true;
+            const uint8_t vis_close_gen = static_cast<uint8_t>(
+                (vis.flags & VIS_FLAG_SETTLE_GEN_MASK) >> VIS_FLAG_SETTLE_GEN_SHIFT);
+            if (Gate_Close_Settle_Gen == 0U || vis_close_gen != Gate_Close_Settle_Gen)
+            {
+                Pending_Near_Non_Valid_Corral_Event = true;
+            }
         }
         if ((vis.flags & VIS_FLAG_DROP_PATH_CLEAR) == 0U)
         {
@@ -355,7 +360,10 @@ void Class_Rescue_Mission::Enter_State(Enum_Mission_State next, uint32_t now_ms)
     Visual_Stall_Counter_Ms = 0U;
     Pending_Escape_Reverse_M = 0.0f;
     Standstill_Abrupt_Stop = false;
+    Gate_Close_Settled_Latched = false;
+    Gate_Close_Settle_Gen = 0U;
     Gate_Open_Settled_Latched = false;
+    Gate_Open_Settle_Gen = 0U;
     Gate_Settled_Frame_Seq = 0U;
     Pre_Match_Settled_Latched = false;
     if (next != MISSION_PRE_MATCH)
@@ -1288,15 +1296,10 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             }
             break;
         }
-        if (Vision_Accept_Counter == Confirm_Boundary_Accept_Id)
         {
-            break;
-        }
-        Confirm_Boundary_Accept_Id = Vision_Accept_Counter;
-        {
-            const Enum_Corral_Verdict verdict = Validate_Corral(Latest_Vision);
-            // Continuously inspect hazards EVEN WHILE gate is still moving; cancel immediately!
-            if (verdict == CORRAL_ILLEGAL_HAZARD_OR_EXCESS)
+            const Enum_Corral_Verdict live_verdict = Validate_Corral(Latest_Vision);
+            // Continuously inspect hazards EVEN WHILE gate is still moving, at the settle boundary, or draining!
+            if (live_verdict == CORRAL_ILLEGAL_HAZARD_OR_EXCESS)
             {
                 Clear_Cargo();
                 Gate_Closed_Cmd = false;
@@ -1304,15 +1307,39 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                 Enter_State(MISSION_BACK_OUT_SEPARATE, in.now_ms);
                 break;
             }
-            // Only count confirmation frames (or declare post-close cargo loss) after the gate has
-            // mechanically settled AND MaixCAM acknowledges a post-drain frame captured after closure.
-            const bool closed_settled_ack = (Latest_Vision.flags & VIS_FLAG_GATE_CLOSED_SETTLED_ACK) != 0U;
-            if (!in.gate_settled || !closed_settled_ack)
+            if (!in.gate_settled)
+            {
+                Gate_Close_Settled_Latched = false;
+                Gate_Close_Settle_Gen = 0U;
+                Reset_Confirm_Streak();
+                break;
+            }
+            if (!Gate_Close_Settled_Latched)
+            {
+                // First tick observing gate closed & settled in THIS close cycle: advance the 2-bit non-zero
+                // close generation (1..3) so a reused ACK from an earlier close cycle can NEVER confirm cargo.
+                Gate_Close_Settled_Latched = true;
+                Gate_Close_Last_Gen = static_cast<uint8_t>((Gate_Close_Last_Gen % 3U) + 1U);
+                Gate_Close_Settle_Gen = Gate_Close_Last_Gen;
+                Gate_Settled_Frame_Seq = Latest_Vision.frame_seq;
+                Reset_Confirm_Streak();
+                break;
+            }
+            if (Vision_Accept_Counter == Confirm_Boundary_Accept_Id)
+            {
+                break;
+            }
+            Confirm_Boundary_Accept_Id = Vision_Accept_Counter;
+            // Only count confirmation frames (or declare post-close cargo loss) after MaixCAM echoes
+            // THIS close cycle's non-zero generation (proving post-close drain completed).
+            const uint8_t vis_close_gen = static_cast<uint8_t>(
+                (Latest_Vision.flags & VIS_FLAG_SETTLE_GEN_MASK) >> VIS_FLAG_SETTLE_GEN_SHIFT);
+            if (Gate_Close_Settle_Gen == 0U || vis_close_gen != Gate_Close_Settle_Gen)
             {
                 Reset_Confirm_Streak();
                 break;
             }
-            if (verdict == CORRAL_VALID_MATERIALS || verdict == CORRAL_VALID_CASUALTY)
+            if (live_verdict == CORRAL_VALID_MATERIALS || live_verdict == CORRAL_VALID_CASUALTY)
             {
                 if (near_non_valid_corral_event)
                 {
@@ -1320,7 +1347,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                 }
                 if (++Confirm_Count >= Config.confirm_frames_required)
                 {
-                    Cargo_Is_Casualty = (verdict == CORRAL_VALID_CASUALTY);
+                    Cargo_Is_Casualty = (live_verdict == CORRAL_VALID_CASUALTY);
                     Cargo_Green = Latest_Vision.corral_green_cnt;
                     Cargo_Black = Latest_Vision.corral_black_cnt;
                     Cargo_Orange = Latest_Vision.corral_orange_cnt;
@@ -1573,10 +1600,13 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                 if (!in.gate_settled)
                 {
                     Gate_Open_Settled_Latched = false;
+                    Gate_Open_Settle_Gen = 0U;
                 }
                 else if (!Gate_Open_Settled_Latched)
                 {
                     Gate_Open_Settled_Latched = true;
+                    Gate_Open_Last_Gen = static_cast<uint8_t>((Gate_Open_Last_Gen % 3U) + 1U);
+                    Gate_Open_Settle_Gen = Gate_Open_Last_Gen;
                     Gate_Settled_Frame_Seq = Latest_Vision.frame_seq;
                 }
                 else
@@ -1584,11 +1614,16 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                     const uint16_t seq_delta =
                         static_cast<uint16_t>(Latest_Vision.frame_seq - Gate_Settled_Frame_Seq);
                     const bool post_settle_frame = (seq_delta >= 1U && seq_delta < 0x8000U);
-                    const bool open_settled_ack = (Latest_Vision.flags & VIS_FLAG_GATE_OPEN_SETTLED_ACK) != 0U;
+                    const uint8_t vis_open_gen = static_cast<uint8_t>(
+                        (Latest_Vision.flags & VIS_FLAG_SETTLE_GEN_MASK) >> VIS_FLAG_SETTLE_GEN_SHIFT);
+                    const bool open_settled_ack = (Latest_Vision.flags & VIS_FLAG_GATE_OPEN_SETTLED_ACK) != 0U &&
+                                                  Gate_Open_Settle_Gen != 0U &&
+                                                  vis_open_gen == Gate_Open_Settle_Gen;
                     if (!in.chassis_active && in.wheels_still && post_settle_frame && open_settled_ack)
                     {
                         Sub_Phase = 2U;
                         State_Enter_Ms = in.now_ms;
+                        Gate_Open_Settle_Gen = 0U;
                         out.drive_action = DRIVE_ACTION_START_DISTANCE;
                         out.distance_m = Config.drop_push_distance_m;
                         out.speed_mps = Config.drop_push_speed_mps;
@@ -1599,6 +1634,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             else if (non_near_view_event || !in.gate_settled)
             {
                 Gate_Open_Settled_Latched = false;
+                Gate_Open_Settle_Gen = 0U;
             }
         }
         else

@@ -1007,14 +1007,30 @@ static void Drive_Control()
         if (Rescue_Mission.Is_Link_Alive(now_ms)) { status_flags |= TEL_FLAG_LINK_ALIVE; }
         if (Rescue_Mission.Is_Carrying_Casualty()) { status_flags |= TEL_FLAG_CARRYING_CASUALTY; }
         if (Rescue_Mission.Is_Drop_Pushing()) { status_flags |= TEL_FLAG_DROP_PUSHING; }
+        uint8_t active_settle_gen = 0U;
         if (Rescue_Mission.Get_State() == MISSION_PRE_MATCH &&
             !Rescue_Mission.Is_Gate_Closed_Cmd() && !Rescue_Mission.Is_Camera_Near_Cmd() &&
             (status_flags & TEL_FLAG_GATE_SETTLED) != 0U &&
             (status_flags & TEL_FLAG_CAMERA_SETTLED) != 0U)
         {
-            status_flags |= static_cast<uint16_t>(
-                (Rescue_Mission.Get_Pre_Match_Settle_Gen() & 0x3U) << TEL_FLAG_PRE_MATCH_GEN_SHIFT);
+            active_settle_gen = Rescue_Mission.Get_Pre_Match_Settle_Gen();
         }
+        else if (Rescue_Mission.Get_State() == MISSION_CLOSE_GATE_VERIFY &&
+                 Rescue_Mission.Is_Gate_Closed_Cmd() && Rescue_Mission.Is_Camera_Near_Cmd() &&
+                 (status_flags & TEL_FLAG_GATE_SETTLED) != 0U &&
+                 (status_flags & TEL_FLAG_CAMERA_SETTLED) != 0U)
+        {
+            active_settle_gen = Rescue_Mission.Get_Gate_Close_Settle_Gen();
+        }
+        else if (Rescue_Mission.Get_State() == MISSION_DROP_OPEN_AND_PUSH &&
+                 !Rescue_Mission.Is_Drop_Pushing() &&
+                 !Rescue_Mission.Is_Gate_Closed_Cmd() && Rescue_Mission.Is_Camera_Near_Cmd() &&
+                 (status_flags & TEL_FLAG_GATE_SETTLED) != 0U &&
+                 (status_flags & TEL_FLAG_CAMERA_SETTLED) != 0U)
+        {
+            active_settle_gen = Rescue_Mission.Get_Gate_Open_Settle_Gen();
+        }
+        status_flags |= static_cast<uint16_t>((active_settle_gen & 0x3U) << TEL_FLAG_SETTLE_GEN_SHIFT);
         tel.status_flags = status_flags;
 
         const bool rx_diag_pending = (Uart_Rx_Fault_Event_Seq != Uart_Rx_Fault_Reported_Seq);

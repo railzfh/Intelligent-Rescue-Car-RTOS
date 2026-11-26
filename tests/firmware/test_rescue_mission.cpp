@@ -24,6 +24,11 @@ static Struct_Vision_State Make_Far_Vision(uint16_t seq, uint8_t target, uint16_
     return v;
 }
 
+static uint16_t Settle_Gen_Flag(uint8_t gen)
+{
+    return static_cast<uint16_t>((gen & 0x3U) << VIS_FLAG_SETTLE_GEN_SHIFT);
+}
+
 static Struct_Vision_State Make_Near_Vision(uint16_t seq, uint8_t green, uint8_t black,
                                             uint8_t orange, uint8_t cyan, uint8_t unknown,
                                             uint16_t flags)
@@ -285,10 +290,14 @@ static void Test_Cyan_Interrupts_Unsettled_Gate_Closure()
         blind_m.Update(bin);
     }
     assert(blind_m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
+    // Latch close-cycle settle generation first, then build 2 post-close NEAR confirmation frames.
+    bin.now_ms = (bt += 40U);
+    blind_m.Update(bin);
+    const uint16_t blind_close_ack = safe | Settle_Gen_Flag(blind_m.Get_Gate_Close_Settle_Gen());
     for (int k = 0; k < 2; ++k)
     {
         bin.now_ms = (bt += 40U);
-        assert(blind_m.On_Vision_State(Make_Near_Vision(bseq++, 1U, 0U, 0U, 0U, 0U, safe | VIS_FLAG_GATE_CLOSED_SETTLED_ACK), bt));
+        assert(blind_m.On_Vision_State(Make_Near_Vision(bseq++, 1U, 0U, 0U, 0U, 0U, blind_close_ack), bt));
         blind_m.Update(bin);
     }
     assert(blind_m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
@@ -303,7 +312,7 @@ static void Test_Cyan_Interrupts_Unsettled_Gate_Closure()
     assert(blind_m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
     // Single NEAR frame after TRANSITION MUST NOT advance to FIND_HOME (needs full 3-frame streak again)!
     bin.now_ms = (bt += 40U);
-    assert(blind_m.On_Vision_State(Make_Near_Vision(bseq++, 1U, 0U, 0U, 0U, 0U, safe | VIS_FLAG_GATE_CLOSED_SETTLED_ACK), bt));
+    assert(blind_m.On_Vision_State(Make_Near_Vision(bseq++, 1U, 0U, 0U, 0U, 0U, blind_close_ack), bt));
     blind_m.Update(bin);
     assert(blind_m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
 
@@ -384,10 +393,13 @@ static void Test_Full_First_Green_Delivery_And_Proven_Rear_Corridor()
     assert(mission.Get_State() == MISSION_CLOSE_GATE_VERIFY);
     assert(out.gate_closed && out.camera_near);
 
+    in.now_ms = (t += 50U);
+    out = mission.Update(in); // latch close-cycle settle gen
+    const uint16_t close_ack = safe | Settle_Gen_Flag(mission.Get_Gate_Close_Settle_Gen());
     for (int k = 0; k < 3; ++k)
     {
         in.now_ms = (t += 50U);
-        assert(mission.On_Vision_State(Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U, safe | VIS_FLAG_GATE_CLOSED_SETTLED_ACK), t));
+        assert(mission.On_Vision_State(Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U, close_ack), t));
         out = mission.Update(in);
     }
     assert(mission.Get_State() == MISSION_FIND_HOME);
@@ -416,10 +428,12 @@ static void Test_Full_First_Green_Delivery_And_Proven_Rear_Corridor()
     in.now_ms = (t += 50U);
     out = mission.Update(in);
     assert(out.drive_action == DRIVE_ACTION_SOFT_STOP);
-    // Strictly later NEAR frame acknowledging open-and-settled telemetry authorizes push!
+    // Strictly later NEAR frame acknowledging open-and-settled telemetry & current open gen authorizes push!
     in.now_ms = (t += 50U);
     assert(mission.On_Vision_State(
-        Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U, safe_push | VIS_FLAG_GATE_OPEN_SETTLED_ACK), t));
+        Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U,
+                         safe_push | VIS_FLAG_GATE_OPEN_SETTLED_ACK | Settle_Gen_Flag(mission.Get_Gate_Open_Settle_Gen())),
+        t));
     out = mission.Update(in);
     assert(out.drive_action == DRIVE_ACTION_START_DISTANCE && out.distance_m > 0.0f);
 
@@ -630,13 +644,14 @@ static void Test_Drop_Rechecks_Hazards_And_Alignment_While_Opening_And_Pushing()
             assert(m.On_Vision_State(Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U, VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR), t));
             m.Update(in);
         }
+        in.now_ms = (t += 50U);
+        m.Update(in); // latch close-cycle settle gen
+        const uint16_t close_ack =
+            VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR | Settle_Gen_Flag(m.Get_Gate_Close_Settle_Gen());
         for (int k = 0; k < 3; ++k)
         {
             in.now_ms = (t += 50U);
-            assert(m.On_Vision_State(
-                Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U,
-                                 VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR | VIS_FLAG_GATE_CLOSED_SETTLED_ACK),
-                t));
+            assert(m.On_Vision_State(Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U, close_ack), t));
             m.Update(in);
         }
         in.now_ms = (t += 50U);
@@ -684,10 +699,19 @@ static void Test_Drop_Rechecks_Hazards_And_Alignment_While_Opening_And_Pushing()
         out = m.Update(in);
         assert(out.drive_action == DRIVE_ACTION_SOFT_STOP);
 
-        // Strictly later post-settle frame WITH VIS_FLAG_GATE_OPEN_SETTLED_ACK -> authorizes push!
+        // Later frame with VIS_FLAG_GATE_OPEN_SETTLED_ACK but WRONG/zero open gen -> MUST NOT start push!
         in.now_ms = (t += 50U);
         assert(m.On_Vision_State(
             Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U, safe_aligned | VIS_FLAG_GATE_OPEN_SETTLED_ACK), t));
+        out = m.Update(in);
+        assert(out.drive_action == DRIVE_ACTION_SOFT_STOP);
+
+        // Strictly later post-settle frame WITH VIS_FLAG_GATE_OPEN_SETTLED_ACK and current open gen -> authorizes push!
+        in.now_ms = (t += 50U);
+        assert(m.On_Vision_State(
+            Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U,
+                             safe_aligned | VIS_FLAG_GATE_OPEN_SETTLED_ACK | Settle_Gen_Flag(m.Get_Gate_Open_Settle_Gen())),
+            t));
         out = m.Update(in);
         assert(out.drive_action == DRIVE_ACTION_START_DISTANCE && out.distance_m > 0.0f);
     }
@@ -739,7 +763,9 @@ static void Test_Drop_Rechecks_Hazards_And_Alignment_While_Opening_And_Pushing()
         m.Update(in); // latch settled edge
         in.now_ms = (t += 50U);
         assert(m.On_Vision_State(
-            Make_Near_Vision(seq++, 1U, 1U, 0U, 0U, 0U, safe_aligned | VIS_FLAG_GATE_OPEN_SETTLED_ACK), t));
+            Make_Near_Vision(seq++, 1U, 1U, 0U, 0U, 0U,
+                             safe_aligned | VIS_FLAG_GATE_OPEN_SETTLED_ACK | Settle_Gen_Flag(m.Get_Gate_Open_Settle_Gen())),
+            t));
         auto out = m.Update(in);
         assert(out.drive_action == DRIVE_ACTION_EMERGENCY_STOP);
         assert(m.Get_State() == MISSION_BACK_OUT_SEPARATE);
@@ -758,7 +784,9 @@ static void Test_Drop_Rechecks_Hazards_And_Alignment_While_Opening_And_Pushing()
         m.Update(in); // latch settled edge
         in.now_ms = (t += 50U);
         assert(m.On_Vision_State(
-            Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U, safe_aligned | VIS_FLAG_GATE_OPEN_SETTLED_ACK), t));
+            Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U,
+                             safe_aligned | VIS_FLAG_GATE_OPEN_SETTLED_ACK | Settle_Gen_Flag(m.Get_Gate_Open_Settle_Gen())),
+            t));
         auto out = m.Update(in);
         assert(out.drive_action == DRIVE_ACTION_START_DISTANCE && out.distance_m > 0.0f);
 
@@ -902,11 +930,19 @@ static void Test_Active_Reverse_Abrupt_Clearance_Loss_Cancels_Immediately_And_Wa
             assert(dm.On_Vision_State(Make_Far_Vision(dseq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 0, 190U), dt));
             dm.Update(din);
         }
-        for (int k = 0; k < 6; ++k)
+        for (int k = 0; k < 3; ++k)
         {
             din.now_ms = (dt += 50U);
-            const uint16_t flags_k = (k >= 3) ? (safe | VIS_FLAG_GATE_CLOSED_SETTLED_ACK) : safe;
-            assert(dm.On_Vision_State(Make_Near_Vision(dseq++, 1U, 0U, 0U, 0U, 0U, flags_k), dt));
+            assert(dm.On_Vision_State(Make_Near_Vision(dseq++, 1U, 0U, 0U, 0U, 0U, safe), dt));
+            dm.Update(din);
+        }
+        din.now_ms = (dt += 50U);
+        dm.Update(din); // latch close-cycle settle gen
+        const uint16_t d_close_ack = safe | Settle_Gen_Flag(dm.Get_Gate_Close_Settle_Gen());
+        for (int k = 0; k < 3; ++k)
+        {
+            din.now_ms = (dt += 50U);
+            assert(dm.On_Vision_State(Make_Near_Vision(dseq++, 1U, 0U, 0U, 0U, 0U, d_close_ack), dt));
             dm.Update(din);
         }
         din.now_ms = (dt += 50U);
@@ -921,12 +957,14 @@ static void Test_Active_Reverse_Abrupt_Clearance_Loss_Cancels_Immediately_And_Wa
             assert(dm.On_Vision_State(Make_Near_Vision(dseq++, 1U, 0U, 0U, 0U, 0U, safe_aligned), dt));
             dm.Update(din);
         }
-        // Settled edge latch + strictly later post-settle frame with ACK.
+        // Settled edge latch + strictly later post-settle frame with ACK & current open gen.
         din.now_ms = (dt += 50U);
         dm.Update(din);
         din.now_ms = (dt += 50U);
         assert(dm.On_Vision_State(
-            Make_Near_Vision(dseq++, 1U, 0U, 0U, 0U, 0U, safe_aligned | VIS_FLAG_GATE_OPEN_SETTLED_ACK), dt));
+            Make_Near_Vision(dseq++, 1U, 0U, 0U, 0U, 0U,
+                             safe_aligned | VIS_FLAG_GATE_OPEN_SETTLED_ACK | Settle_Gen_Flag(dm.Get_Gate_Open_Settle_Gen())),
+            dt));
         dm.Update(din);
         // Complete 0.16 m push -> standstill -> starts margin-bounded backout reverse (-0.12 m).
         din.forward_delta_m = 0.16f;
@@ -1055,10 +1093,13 @@ static void Test_Same_Cargo_Reverify_After_Escape_Cannot_Bypass_Recovery_Budget(
         assert(mission.On_Vision_State(Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U, safe), t));
         mission.Update(in);
     }
+    in.now_ms = (t += 50U);
+    mission.Update(in); // latch close-cycle settle gen
+    const uint16_t close_ack_0 = safe | Settle_Gen_Flag(mission.Get_Gate_Close_Settle_Gen());
     for (int k = 0; k < 3; ++k)
     {
         in.now_ms = (t += 50U);
-        assert(mission.On_Vision_State(Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U, safe | VIS_FLAG_GATE_CLOSED_SETTLED_ACK), t));
+        assert(mission.On_Vision_State(Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U, close_ack_0), t));
         mission.Update(in);
     }
     assert(mission.Get_State() == MISSION_FIND_HOME);
@@ -1088,10 +1129,14 @@ static void Test_Same_Cargo_Reverify_After_Escape_Cannot_Bypass_Recovery_Budget(
         assert(mission.Get_State() == MISSION_CLOSE_GATE_VERIFY);
 
         // Re-confirm the SAME cargo -> MUST NOT reset Consecutive_Escapes!
+        in.now_ms = (t += 50U);
+        assert(mission.On_Vision_State(Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U, safe), t));
+        mission.Update(in); // latch new close-cycle settle gen
+        const uint16_t cycle_ack = safe | Settle_Gen_Flag(mission.Get_Gate_Close_Settle_Gen());
         for (int k = 0; k < 3; ++k)
         {
             in.now_ms = (t += 50U);
-            assert(mission.On_Vision_State(Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U, safe | VIS_FLAG_GATE_CLOSED_SETTLED_ACK), t));
+            assert(mission.On_Vision_State(Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U, cycle_ack), t));
             mission.Update(in);
         }
         assert(mission.Get_State() == MISSION_FIND_HOME);
@@ -1348,11 +1393,19 @@ static void Test_Drop_Verify_Requires_Consecutive_Near_Frames()
         assert(dm.On_Vision_State(Make_Far_Vision(dseq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 0, 190U), dt));
         dm.Update(din);
     }
-    for (int k = 0; k < 6; ++k)
+    for (int k = 0; k < 3; ++k)
     {
         din.now_ms = (dt += 50U);
-        const uint16_t flags_k = (k >= 3) ? (safe | VIS_FLAG_GATE_CLOSED_SETTLED_ACK) : safe;
-        assert(dm.On_Vision_State(Make_Near_Vision(dseq++, 1U, 0U, 0U, 0U, 0U, flags_k), dt));
+        assert(dm.On_Vision_State(Make_Near_Vision(dseq++, 1U, 0U, 0U, 0U, 0U, safe), dt));
+        dm.Update(din);
+    }
+    din.now_ms = (dt += 50U);
+    dm.Update(din); // latch close-cycle settle gen
+    const uint16_t d_close_ack2 = safe | Settle_Gen_Flag(dm.Get_Gate_Close_Settle_Gen());
+    for (int k = 0; k < 3; ++k)
+    {
+        din.now_ms = (dt += 50U);
+        assert(dm.On_Vision_State(Make_Near_Vision(dseq++, 1U, 0U, 0U, 0U, 0U, d_close_ack2), dt));
         dm.Update(din);
     }
     din.now_ms = (dt += 50U);
@@ -1371,7 +1424,9 @@ static void Test_Drop_Verify_Requires_Consecutive_Near_Frames()
     dm.Update(din);
     din.now_ms = (dt += 50U);
     assert(dm.On_Vision_State(
-        Make_Near_Vision(dseq++, 1U, 0U, 0U, 0U, 0U, safe_aligned | VIS_FLAG_GATE_OPEN_SETTLED_ACK), dt));
+        Make_Near_Vision(dseq++, 1U, 0U, 0U, 0U, 0U,
+                         safe_aligned | VIS_FLAG_GATE_OPEN_SETTLED_ACK | Settle_Gen_Flag(dm.Get_Gate_Open_Settle_Gen())),
+        dt));
     dm.Update(din);
     // Complete push with no proven reverse -> enters MISSION_DROP_BACKOUT_VERIFY Sub_Phase 2 directly!
     din.chassis_motion_done = true;
@@ -1487,12 +1542,17 @@ static void Test_Round12_Push_Same_Drain_Standstill_Bench_Leave_And_Interrupted_
         void to_opening()
         {
             to_inspect();
-            for (unsigned i = 0; i < 6U; ++i)
+            for (unsigned i = 0; i < 3U; ++i)
             {
-                const uint16_t f = (i >= 3U)
-                                       ? (VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR | VIS_FLAG_GATE_CLOSED_SETTLED_ACK)
-                                       : (VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR);
-                near(1U, f);
+                near(1U, VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR);
+                tick();
+            }
+            tick(); // latch close-cycle settle gen
+            const uint16_t close_f =
+                VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR | Settle_Gen_Flag(m.Get_Gate_Close_Settle_Gen());
+            for (unsigned i = 0; i < 3U; ++i)
+            {
+                near(1U, close_f);
                 tick();
             }
             assert(m.Get_State() == MISSION_FIND_HOME);
@@ -1515,7 +1575,7 @@ static void Test_Round12_Push_Same_Drain_Standstill_Bench_Leave_And_Interrupted_
             to_opening();
             const uint16_t al = VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR | VIS_FLAG_HOME_VALID |
                                 VIS_FLAG_HOME_HALF_MATCH | VIS_FLAG_DROP_PATH_CLEAR | VIS_FLAG_DROP_BASELINE_READY;
-            near(1U, al | VIS_FLAG_GATE_OPEN_SETTLED_ACK);
+            near(1U, al | VIS_FLAG_GATE_OPEN_SETTLED_ACK | Settle_Gen_Flag(m.Get_Gate_Open_Settle_Gen()));
             assert(tick().drive_action == DRIVE_ACTION_START_DISTANCE);
         }
         void to_verifying()
@@ -1820,8 +1880,9 @@ static void Test_Round12_Push_Same_Drain_Standstill_Bench_Leave_And_Interrupted_
         assert(!h.m.Is_First_Green_Unlocked());
     }
 
-    // 7. Round 18 P1: MISSION_CLOSE_GATE_VERIFY with pitch already settled in NEAR MUST NOT confirm
-    //    cargo from buffered pre-close NEAR frames (lacking VIS_FLAG_GATE_CLOSED_SETTLED_ACK), while
+    // 7. Round 18 & 19 P1: MISSION_CLOSE_GATE_VERIFY with pitch already settled in NEAR MUST bind
+    //    confirmation to THIS close cycle's 2-bit non-zero settle generation (1..3), rejecting both
+    //    gen=0 pre-close frames AND stale ACK generations reused from an earlier close cycle, while
     //    still aborting immediately on hazards without ACK and backing out on post-close empty corral.
     {
         Harness h;
@@ -1834,7 +1895,10 @@ static void Test_Round12_Push_Same_Drain_Standstill_Bench_Leave_And_Interrupted_
         assert(h.m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
         h.in.gate_settled = true;
         h.in.camera_settled = true;
-        // 4 ordinary NEAR frames (pre-close buffered frames without closed-settled ACK) MUST NOT advance to FIND_HOME!
+        h.tick(); // latch close cycle 1 -> gen=1
+        const uint8_t gen1 = h.m.Get_Gate_Close_Settle_Gen();
+        assert(gen1 == 1U);
+        // 4 ordinary NEAR frames (pre-close buffered frames with gen=0) MUST NOT advance to FIND_HOME!
         for (unsigned i = 0; i < 4U; ++i)
         {
             h.near(1U, safe);
@@ -1842,14 +1906,49 @@ static void Test_Round12_Push_Same_Drain_Standstill_Bench_Leave_And_Interrupted_
             assert(out.gate_closed);
             assert(h.m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
         }
-        // First post-close image showing empty corral WITH closed-settled ACK immediately backs out!
-        h.near(0U, safe | VIS_FLAG_GATE_CLOSED_SETTLED_ACK);
+        // First post-close image showing empty corral WITH current close gen immediately backs out!
+        h.near(0U, safe | Settle_Gen_Flag(gen1));
         const auto lost_out = h.tick();
         assert(!lost_out.gate_closed);
         assert(h.m.Get_State() == MISSION_BACK_OUT_SEPARATE);
+
+        // Round 19 P1: Retry pickup into Close Cycle 2 -> MUST advance gen1 (1) -> gen2 (2), and
+        // 4 NEAR frames still carrying Cycle 1's reused gen1 ACK MUST NOT confirm or enter FIND_HOME!
+        h.far(TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 190U);
+        h.tick(); // BACK_OUT_SEPARATE Sub_Phase 0 -> Sub_Phase 3 (turn)
+        h.in.chassis_motion_done = true;
+        h.far(TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 190U);
+        h.tick(); // BACK_OUT_SEPARATE Sub_Phase 3 -> SEARCH_TARGET
+        h.in.chassis_motion_done = false;
+        h.far(TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 190U);
+        h.tick(); // SEARCH -> APPROACH
+        h.far(TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 190U);
+        h.tick(); // APPROACH -> INSPECT_CORRAL
+        assert(h.m.Get_State() == MISSION_INSPECT_CORRAL);
+        for (unsigned i = 0; i < 3U; ++i)
+        {
+            h.near(1U, safe);
+            h.tick();
+        }
+        assert(h.m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
+        h.tick(); // latch close cycle 2 -> gen=2
+        const uint8_t gen2 = h.m.Get_Gate_Close_Settle_Gen();
+        assert(gen2 == 2U && gen2 != gen1);
+        for (unsigned i = 0; i < 4U; ++i)
+        {
+            h.near(1U, safe | Settle_Gen_Flag(gen1)); // stale reused Cycle-1 ACK!
+            const auto out = h.tick();
+            assert(out.gate_closed);
+            assert(h.m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
+        }
+        // Empty corral frame carrying Cycle-2 gen2 immediately opens gate and backs out!
+        h.near(0U, safe | Settle_Gen_Flag(gen2));
+        const auto lost2 = h.tick();
+        assert(!lost2.gate_closed);
+        assert(h.m.Get_State() == MISSION_BACK_OUT_SEPARATE);
     }
     {
-        // Hazard arriving during post-close drain (closed_settled_ack == 0) MUST still immediately abort!
+        // Hazard arriving during post-close drain (gen == 0) MUST still immediately abort!
         Harness h;
         h.to_inspect();
         for (unsigned i = 0; i < 3U; ++i)
@@ -1865,7 +1964,7 @@ static void Test_Round12_Push_Same_Drain_Standstill_Bench_Leave_And_Interrupted_
         assert(h.m.Get_State() == MISSION_BACK_OUT_SEPARATE);
     }
     {
-        // Same-drain [ack=0, ack=1] after 2 valid post-close frames MUST reset streak (cannot hit 3)!
+        // Same-drain [gen=0, gen=current] after 2 valid post-close frames MUST reset streak (cannot hit 3)!
         Harness h;
         h.to_inspect();
         for (unsigned i = 0; i < 3U; ++i)
@@ -1875,21 +1974,23 @@ static void Test_Round12_Push_Same_Drain_Standstill_Bench_Leave_And_Interrupted_
         }
         assert(h.m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
         h.in.gate_settled = true;
+        h.tick(); // latch close gen
+        const uint16_t cur_ack = safe | Settle_Gen_Flag(h.m.Get_Gate_Close_Settle_Gen());
         for (unsigned i = 0; i < 2U; ++i)
         {
-            h.near(1U, safe | VIS_FLAG_GATE_CLOSED_SETTLED_ACK);
+            h.near(1U, cur_ack);
             h.tick();
         }
         assert(h.m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
-        h.near(1U, safe); // ack=0 in same drain
-        h.near(1U, safe | VIS_FLAG_GATE_CLOSED_SETTLED_ACK);
+        h.near(1U, safe); // gen=0 in same drain
+        h.near(1U, cur_ack);
         h.tick();
         assert(h.m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
         // Needs 2 more consecutive post-close ack frames to confirm (total 3 consecutive)!
-        h.near(1U, safe | VIS_FLAG_GATE_CLOSED_SETTLED_ACK);
+        h.near(1U, cur_ack);
         h.tick();
         assert(h.m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
-        h.near(1U, safe | VIS_FLAG_GATE_CLOSED_SETTLED_ACK);
+        h.near(1U, cur_ack);
         h.tick();
         assert(h.m.Get_State() == MISSION_FIND_HOME);
     }

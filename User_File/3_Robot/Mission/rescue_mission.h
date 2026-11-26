@@ -151,6 +151,8 @@ public:
     bool Is_Drop_Pushing() const { return State == MISSION_DROP_OPEN_AND_PUSH && Sub_Phase == 2U; }
     bool Is_Standstill_Gate_Pending_Boundary() const { return Require_Standstill_Gate && Standstill_Boundary_Pending; }
     uint8_t Get_Pre_Match_Settle_Gen() const { return Pre_Match_Settle_Gen; }
+    uint8_t Get_Gate_Close_Settle_Gen() const { return Gate_Close_Settle_Gen; }
+    uint8_t Get_Gate_Open_Settle_Gen() const { return Gate_Open_Settle_Gen; }
     bool Consume_Pre_Match_Rx_Fence();
     uint32_t Get_Match_Elapsed_Ms(uint32_t now_ms) const;
     uint8_t Get_Delivered_Green() const { return Delivered_Green; }
@@ -242,8 +244,13 @@ private:
     float Pending_Escape_Reverse_M = 0.0f;
     bool Standstill_Abrupt_Stop = false;
 
-    // Post-settle gate check latch & global standstill interlock tracking reverse through braking.
+    // Post-settle gate check latches & global standstill interlock tracking reverse through braking.
+    bool Gate_Close_Settled_Latched = false;
+    uint8_t Gate_Close_Settle_Gen = 0U;
+    uint8_t Gate_Close_Last_Gen = 0U;
     bool Gate_Open_Settled_Latched = false;
+    uint8_t Gate_Open_Settle_Gen = 0U;
+    uint8_t Gate_Open_Last_Gen = 0U;
     uint16_t Gate_Settled_Frame_Seq = 0U;
     bool Reverse_Motion_In_Flight = false;
     bool Require_Standstill_Gate = false;

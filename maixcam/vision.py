@@ -27,7 +27,6 @@ from .protocol import (
     VIS_FLAG_DROP_BASELINE_READY,
     VIS_FLAG_DROP_CONFIRMED,
     VIS_FLAG_DROP_PATH_CLEAR,
-    VIS_FLAG_GATE_CLOSED_SETTLED_ACK,
     VIS_FLAG_GATE_OPEN_SETTLED_ACK,
     VIS_FLAG_HOME_HALF_MATCH,
     VIS_FLAG_HOME_VALID,
@@ -37,6 +36,7 @@ from .protocol import (
     VIS_FLAG_PRE_MATCH_GEN_SHIFT,
     VIS_FLAG_RAMP_VISIBLE,
     VIS_FLAG_REAR_CLEAR,
+    VIS_FLAG_SETTLE_GEN_SHIFT,
     VIS_FLAG_SWEEP_CLEAR,
     VIS_FLAG_TARGET_VALID,
     VisionState,
@@ -787,6 +787,7 @@ class RescueVisionProcessor:
         drop_pushing: bool = False,
         wheels_moving: bool = False,
         pre_match_settle_gen: int = 0,
+        gate_settle_gen: int = 0,
     ) -> VisionState:
         self._frame_seq = (self._frame_seq + 1) & 0xFFFF
         view = CAMERA_VIEW_TRANSITION
@@ -951,8 +952,10 @@ class RescueVisionProcessor:
 
             if gate_closed is False and gate_settled is True and baseline_ready:
                 flags |= VIS_FLAG_GATE_OPEN_SETTLED_ACK
-            if gate_closed is True and gate_settled is True:
-                flags |= VIS_FLAG_GATE_CLOSED_SETTLED_ACK
+                if 1 <= gate_settle_gen <= 3:
+                    flags |= (gate_settle_gen & 0x3) << VIS_FLAG_SETTLE_GEN_SHIFT
+            elif gate_closed is True and gate_settled is True and 1 <= gate_settle_gen <= 3:
+                flags |= (gate_settle_gen & 0x3) << VIS_FLAG_SETTLE_GEN_SHIFT
 
             if self._verify_drop_inside_correct_half(
                 home=home,
@@ -1645,7 +1648,9 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
             found_blobs.append(
                 Blob(label=label, x=int(item.x()), y=int(item.y()), w=w, h=h, pixels=px, density=px / float(w * h))
             )
-        if _lab_ranges_overlap(thresh, cfg.arena_floor_lab):
+        # Strip floor pixels from overlapping legal-cargo and surface calibrations, but NEVER
+        # subtract floor from `cyan` hazards so ambiguous cyan/floor overlap always fails closed (R19 P1).
+        if label != "cyan" and _lab_ranges_overlap(thresh, cfg.arena_floor_lab):
             found_blobs = _filter_blobs_excluding_floor(found_blobs, label, thresh, px_thr)
         for b in found_blobs:
             px = b.pixels
@@ -2768,7 +2773,9 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                         solid_self_comps.append((cx, cy, cx + cw, cy + ch))
                 membership_uncertain = (not merge_fg and not matched_self) or (merge_fg and total_box_fg_px != px)
 
-                def _proven_sub_on_fg(candidate: Blob, thresh: Optional[Sequence[int]]) -> Optional[Blob]:
+                def _proven_sub_on_fg(
+                    candidate: Blob, thresh: Optional[Sequence[int]], proven_non_floor: bool = False
+                ) -> Optional[Blob]:
                     if membership_uncertain:
                         return None
                     fits_self = (
@@ -2787,11 +2794,10 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                         for sx1, sy1, sx2, sy2 in solid_self_comps
                     ):
                         return candidate
-                    # Connected-component subgraph membership proof (R14 P2-5, R15 P2-4, R16 P2-4, R17 P2-2):
-                    # Check floor disjointness BEFORE any early return! If `thresh` is missing or overlaps
-                    # `arena_floor_lab`, a Tier-3 find_blobs-only adapter cannot prove candidate pixels are
-                    # non-floor foreground rather than floor pixels inside a ring -> fail closed.
-                    if thresh is None or _lab_ranges_overlap(thresh, cfg.arena_floor_lab):
+                    # Connected-component subgraph membership proof (R14 P2-5, R15 P2-4, R16 P2-4, R17 P2-2, R19 P2):
+                    # Check floor disjointness BEFORE any early return unless `candidate` already came from an
+                    # exact floor-excluded connected component (`precomputed_pts_by_key`).
+                    if not proven_non_floor and (thresh is None or _lab_ranges_overlap(thresh, cfg.arena_floor_lab)):
                         return None
                     if not other_fgs:
                         return candidate
@@ -2815,6 +2821,53 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                     # and pixel count; fail closed so a disconnected known block can never mask `fg`.
                     return None
 
+                fx2, fy2 = fx + fg_w, fy + fg_h
+
+                def _proven_cached_parent_on_fg(parent: Blob, emit_label: str) -> List[Blob]:
+                    pre_pts = precomputed_pts_by_key.get(
+                        (parent.label, parent.x, parent.y, parent.w, parent.h, parent.pixels)
+                    )
+                    if not pre_pts:
+                        return []
+                    clipped = [(x, y) for x, y in pre_pts if fx <= x < fx2 and fy <= y < fy2]
+                    if not clipped:
+                        return []
+                    if len(clipped) == len(pre_pts):
+                        # Whole pre-verified non-floor connected component lies inside fg_roi.
+                        cand = Blob(emit_label, parent.x, parent.y, parent.w, parent.h, parent.pixels, parent.density)
+                        proven = _proven_sub_on_fg(cand, None, proven_non_floor=True)
+                        return [proven] if proven is not None else []
+                    # Split clipped proven non-floor pixels into connected sub-components before subgraph check.
+                    remaining_set = set(clipped)
+                    out_subs: List[Blob] = []
+                    while remaining_set:
+                        seed = remaining_set.pop()
+                        st = [seed]
+                        mn_x = mx_x = seed[0]
+                        mn_y = mx_y = seed[1]
+                        cnt = 0
+                        while st:
+                            cx, cy = st.pop()
+                            cnt += 1
+                            if cx < mn_x:
+                                mn_x = cx
+                            if cx > mx_x:
+                                mx_x = cx
+                            if cy < mn_y:
+                                mn_y = cy
+                            if cy > mx_y:
+                                mx_y = cy
+                            for nb_pt in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+                                if nb_pt in remaining_set:
+                                    remaining_set.remove(nb_pt)
+                                    st.append(nb_pt)
+                        sw, sh = mx_x - mn_x + 1, mx_y - mn_y + 1
+                        cand = Blob(emit_label, mn_x, mn_y, sw, sh, cnt, cnt / float(sw * sh))
+                        proven = _proven_sub_on_fg(cand, None, proven_non_floor=True)
+                        if proven is not None:
+                            out_subs.append(proven)
+                    return out_subs
+
                 roi_surfaces: List[Blob] = []
                 for surface_label in _SURFACE_LABELS:
                     thresh = cfg.lab_thresholds.get(surface_label)
@@ -2823,14 +2876,22 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                     parent_surfaces = verified_by_label[surface_label]
                     if not parent_surfaces:
                         continue
-                    for sub in _extract_roi_blobs_for_label(img, surface_label, thresh, fg_roi):
-                        if any(
-                            _rects_intersect(sub.x, sub.y, sub.w, sub.h, p.x, p.y, p.w, p.h)
-                            for p in parent_surfaces
-                        ):
-                            proven = _proven_sub_on_fg(sub, thresh)
-                            if proven is not None:
-                                roi_surfaces.append(proven)
+                    uncached_surfaces: List[Blob] = []
+                    for p in parent_surfaces:
+                        if (surface_label, p.x, p.y, p.w, p.h, p.pixels) in precomputed_pts_by_key:
+                            if _rects_intersect(fx, fy, fg_w, fg_h, p.x, p.y, p.w, p.h):
+                                roi_surfaces.extend(_proven_cached_parent_on_fg(p, surface_label))
+                        else:
+                            uncached_surfaces.append(p)
+                    if uncached_surfaces:
+                        for sub in _extract_roi_blobs_for_label(img, surface_label, thresh, fg_roi):
+                            if any(
+                                _rects_intersect(sub.x, sub.y, sub.w, sub.h, p.x, p.y, p.w, p.h)
+                                for p in uncached_surfaces
+                            ):
+                                proven = _proven_sub_on_fg(sub, thresh)
+                                if proven is not None:
+                                    roi_surfaces.append(proven)
 
                 roi_objects: List[Blob] = []
                 for obj_label in _OBJECT_LABELS:
@@ -2840,16 +2901,23 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                     parent_objs = verified_by_label[obj_label]
                     if not parent_objs:
                         continue
-                    for sub in _extract_roi_blobs_for_label(img, obj_label, thresh, fg_roi):
-                        if any(
-                            _rects_intersect(sub.x, sub.y, sub.w, sub.h, p.x, p.y, p.w, p.h) for p in parent_objs
-                        ):
-                            proven = _proven_sub_on_fg(sub, thresh)
-                            if proven is not None:
-                                roi_objects.append(proven)
+                    uncached_objs: List[Blob] = []
+                    for p in parent_objs:
+                        if (obj_label, p.x, p.y, p.w, p.h, p.pixels) in precomputed_pts_by_key:
+                            if _rects_intersect(fx, fy, fg_w, fg_h, p.x, p.y, p.w, p.h):
+                                roi_objects.extend(_proven_cached_parent_on_fg(p, obj_label))
+                        else:
+                            uncached_objs.append(p)
+                    if uncached_objs:
+                        for sub in _extract_roi_blobs_for_label(img, obj_label, thresh, fg_roi):
+                            if any(
+                                _rects_intersect(sub.x, sub.y, sub.w, sub.h, p.x, p.y, p.w, p.h) for p in uncached_objs
+                            ):
+                                proven = _proven_sub_on_fg(sub, thresh)
+                                if proven is not None:
+                                    roi_objects.append(proven)
 
                 roi_accounted: List[Blob] = []
-                fx2, fy2 = fx + fg_w, fy + fg_h
                 for cl_pts, (ax1, ay1, ax2, ay2), cl_floor_disjoint in accounted_clusters:
                     if membership_uncertain or not _rects_intersect(fx, fy, fg_w, fg_h, ax1, ay1, ax2 - ax1, ay2 - ay1):
                         continue
@@ -2896,6 +2964,9 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                 for rb in accounted_rejected_blobs:
                     inter = _rect_intersection(fx, fy, fg_w, fg_h, rb.x, rb.y, rb.w, rb.h)
                     if inter is None:
+                        continue
+                    if (rb.label, rb.x, rb.y, rb.w, rb.h, rb.pixels) in precomputed_pts_by_key:
+                        roi_accounted.extend(_proven_cached_parent_on_fg(rb, "_accounted"))
                         continue
                     ix1, iy1, ix2, iy2 = inter
                     iw, ih = max(1, ix2 - ix1), max(1, iy2 - iy1)
