@@ -127,6 +127,7 @@ public:
     bool On_Vision_State(const Struct_Vision_State &vis, uint32_t now_ms);
     bool On_Bench_Actuator(const Struct_Bench_Actuator_Cmd &cmd);
     void On_Uart_Rx_Fault();
+    void Latch_Standstill_Boundary(const uint32_t motor_seq[2], const uint32_t motor_ms[2]);
     void Fault_Stop(uint32_t now_ms);
 
     Struct_Mission_Output Update(const Struct_Mission_Inputs &in);
@@ -147,6 +148,7 @@ public:
     bool Is_Gate_Closed_Cmd() const { return Gate_Closed_Cmd; }
     bool Is_Camera_Near_Cmd() const { return Camera_Near_Cmd; }
     bool Is_Drop_Pushing() const { return State == MISSION_DROP_OPEN_AND_PUSH && Sub_Phase == 2U; }
+    bool Is_Standstill_Gate_Pending_Boundary() const { return Require_Standstill_Gate && Standstill_Boundary_Pending; }
     uint32_t Get_Match_Elapsed_Ms(uint32_t now_ms) const;
     uint8_t Get_Delivered_Green() const { return Delivered_Green; }
     uint8_t Get_Delivered_Black() const { return Delivered_Black; }
@@ -222,6 +224,7 @@ private:
     uint16_t Gate_Settled_Frame_Seq = 0U;
     bool Reverse_Motion_In_Flight = false;
     bool Require_Standstill_Gate = false;
+    bool Standstill_Boundary_Pending = false;
     uint32_t Standstill_Gate_Start_Ms = 0U;
     uint32_t Standstill_Gate_Motor_Seq[2] = {};
     uint32_t Standstill_Gate_Motor_Ms[2] = {};

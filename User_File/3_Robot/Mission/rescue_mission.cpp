@@ -67,6 +67,19 @@ void Class_Rescue_Mission::On_Uart_Rx_Fault()
     Vision_Invalidated_By_Rx_Fault = true;
 }
 
+void Class_Rescue_Mission::Latch_Standstill_Boundary(const uint32_t motor_seq[2], const uint32_t motor_ms[2])
+{
+    if (!Require_Standstill_Gate || motor_seq == nullptr || motor_ms == nullptr)
+    {
+        return;
+    }
+    Standstill_Gate_Motor_Seq[0] = motor_seq[0];
+    Standstill_Gate_Motor_Seq[1] = motor_seq[1];
+    Standstill_Gate_Motor_Ms[0] = motor_ms[0];
+    Standstill_Gate_Motor_Ms[1] = motor_ms[1];
+    Standstill_Boundary_Pending = false;
+}
+
 bool Class_Rescue_Mission::On_Bench_Actuator(const Struct_Bench_Actuator_Cmd &cmd)
 {
     // Actuator bench overrides are strictly limited to pre-match bench mode.
@@ -108,12 +121,14 @@ void Class_Rescue_Mission::Fault_Stop(uint32_t now_ms)
         Match_Final_Elapsed_Ms = now_ms - Match_Start_Ms;
         Reverse_Motion_In_Flight = false;
         Require_Standstill_Gate = false;
+        Standstill_Boundary_Pending = false;
         Enter_State(MISSION_FAULT_STOP, now_ms);
     }
     else if (State == MISSION_BENCH_STRAIGHT)
     {
         Reverse_Motion_In_Flight = false;
         Require_Standstill_Gate = false;
+        Standstill_Boundary_Pending = false;
         Enter_State(MISSION_PRE_MATCH, now_ms);
     }
 }
@@ -286,10 +301,14 @@ bool Class_Rescue_Mission::Is_Fresh_Standstill(const Struct_Mission_Inputs &in) 
     {
         return true;
     }
-    const bool m0_fresh = (in.motor_feedback_seq[0] != Standstill_Gate_Motor_Seq[0]) ||
-                          (in.motor_feedback_ms[0] != Standstill_Gate_Motor_Ms[0]);
-    const bool m1_fresh = (in.motor_feedback_seq[1] != Standstill_Gate_Motor_Seq[1]) ||
-                          (in.motor_feedback_ms[1] != Standstill_Gate_Motor_Ms[1]);
+    if (Standstill_Boundary_Pending)
+    {
+        return false;
+    }
+    const bool m0_fresh = ((uint32_t)(in.motor_feedback_seq[0] - Standstill_Gate_Motor_Seq[0]) != 0U) ||
+                          ((uint32_t)(in.motor_feedback_ms[0] - Standstill_Gate_Motor_Ms[0]) != 0U);
+    const bool m1_fresh = ((uint32_t)(in.motor_feedback_seq[1] - Standstill_Gate_Motor_Seq[1]) != 0U) ||
+                          ((uint32_t)(in.motor_feedback_ms[1] - Standstill_Gate_Motor_Ms[1]) != 0U);
     return m0_fresh && m1_fresh;
 }
 
@@ -303,6 +322,9 @@ void Class_Rescue_Mission::Engage_Standstill_Gate(uint32_t now_ms, const Struct_
         Standstill_Gate_Motor_Seq[1] = in.motor_feedback_seq[1];
         Standstill_Gate_Motor_Ms[0] = in.motor_feedback_ms[0];
         Standstill_Gate_Motor_Ms[1] = in.motor_feedback_ms[1];
+        // When motor CAN feedback sequence tracking is active, require the control task to latch
+        // the post-stop feedback boundary AFTER applying Emergency_Stop and transmitting zero torque.
+        Standstill_Boundary_Pending = in.use_motor_feedback_seq;
     }
 }
 
@@ -379,6 +401,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         Clear_Cargo();
         Reverse_Motion_In_Flight = false;
         Require_Standstill_Gate = false;
+        Standstill_Boundary_Pending = false;
         Gate_Closed_Cmd = false;
         Camera_Near_Cmd = false;
         Enter_State(MISSION_MATCH_FINISHED, in.now_ms);
@@ -396,6 +419,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         Clear_Cargo();
         Reverse_Motion_In_Flight = false;
         Require_Standstill_Gate = false;
+        Standstill_Boundary_Pending = false;
         Gate_Closed_Cmd = false;
         Camera_Near_Cmd = false;
         Enter_State(MISSION_MATCH_FINISHED, in.now_ms);
@@ -426,6 +450,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         if (Is_Fresh_Standstill(in))
         {
             Require_Standstill_Gate = false;
+            Standstill_Boundary_Pending = false;
             Reverse_Motion_In_Flight = false;
         }
         else

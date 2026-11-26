@@ -278,7 +278,14 @@ static void Vision_Flush_Rx_Queue()
     Vision_Parser.Reset();
 }
 
-static void Vision_Drain_Rx(uint32_t now_ms)
+static bool Vision_Uart_Rx_Still_Valid(uint32_t expected_epoch)
+{
+    return UART_Is_Rx_Healthy(&huart1) &&
+           !UART_Is_Rx_Fault_Latched(&huart1) &&
+           UART_Get_Rx_Epoch(&huart1) == expected_epoch;
+}
+
+static bool Vision_Drain_Rx(uint32_t now_ms, uint32_t expected_epoch)
 {
     uint16_t tail = Vision_Rx_Tail;
     const uint16_t head = Vision_Rx_Head;
@@ -286,11 +293,24 @@ static void Vision_Drain_Rx(uint32_t now_ms)
     Struct_Rescue_Frame frame;
     while (tail != head)
     {
+        if (!Vision_Uart_Rx_Still_Valid(expected_epoch))
+        {
+            Vision_Flush_Rx_Queue();
+            Rescue_Mission.On_Uart_Rx_Fault();
+            return false;
+        }
         const uint8_t byte = Vision_Rx_Ring[tail];
         tail = static_cast<uint16_t>((tail + 1U) % Vision_Rx_Ring_Size);
         if (!Vision_Parser.Feed_Byte(byte, frame))
         {
             continue;
+        }
+        // Revalidate UART RX health & recovery epoch IMMEDIATELY before committing any parsed frame!
+        if (!Vision_Uart_Rx_Still_Valid(expected_epoch))
+        {
+            Vision_Flush_Rx_Queue();
+            Rescue_Mission.On_Uart_Rx_Fault();
+            return false;
         }
         if (frame.msg_type == RESCUE_MSG_HEARTBEAT)
         {
@@ -327,6 +347,7 @@ static void Vision_Drain_Rx(uint32_t now_ms)
     }
     __DMB();
     Vision_Rx_Tail = tail;
+    return Vision_Uart_Rx_Still_Valid(expected_epoch);
 }
 
 static Struct_WS2812_Color Compute_Status_LED(bool battery_ready, bool hardware_ready, uint32_t now_ms)
@@ -403,10 +424,10 @@ static void Drive_Control()
 
     // 1 ms 控制任务仅做非阻塞 RX 健康与纪元检查，绝不阻塞调用 HAL DMA 中止/重初始化；
     // 任一 RX 异常或跨周期恢复均清空旧环缓冲、复位协议解析器并失效故障前缓存视觉帧，
-    // 强制收到恢复后的新有效帧后才允许恢复 VISION_FRESH 与运动。
-    const bool uart_rx_healthy = UART_Is_Rx_Healthy(&huart1);
-    const bool uart_rx_fault = UART_Is_Rx_Fault_Latched(&huart1);
-    const uint32_t uart_rx_epoch = UART_Get_Rx_Epoch(&huart1);
+    // 且在提交解析帧前、状态机决策前与电机输出前二次复验，防止同周期中断竞态放行运动。
+    bool uart_rx_healthy = UART_Is_Rx_Healthy(&huart1);
+    bool uart_rx_fault = UART_Is_Rx_Fault_Latched(&huart1);
+    uint32_t uart_rx_epoch = UART_Get_Rx_Epoch(&huart1);
     if (!uart_rx_healthy || uart_rx_fault || uart_rx_epoch != Last_Uart_Rx_Epoch)
     {
         Last_Uart_Rx_Epoch = uart_rx_epoch;
@@ -421,7 +442,32 @@ static void Drive_Control()
             Vision_Flush_Rx_Queue();
             Vision_Rx_Was_Healthy = true;
         }
-        Vision_Drain_Rx(now_ms);
+        if (!Vision_Drain_Rx(now_ms, uart_rx_epoch))
+        {
+            uart_rx_healthy = false;
+            uart_rx_fault = UART_Is_Rx_Fault_Latched(&huart1);
+            Last_Uart_Rx_Epoch = UART_Get_Rx_Epoch(&huart1);
+            Vision_Rx_Was_Healthy = false;
+        }
+    }
+    // Revalidate RX health & generation immediately before mission decision!
+    {
+        const bool rx_ok_now = UART_Is_Rx_Healthy(&huart1);
+        const bool rx_fault_now = UART_Is_Rx_Fault_Latched(&huart1);
+        const uint32_t rx_epoch_now = UART_Get_Rx_Epoch(&huart1);
+        if (!rx_ok_now || rx_fault_now || rx_epoch_now != Last_Uart_Rx_Epoch)
+        {
+            Last_Uart_Rx_Epoch = rx_epoch_now;
+            Vision_Flush_Rx_Queue();
+            Rescue_Mission.On_Uart_Rx_Fault();
+            uart_rx_healthy = false;
+            uart_rx_fault = uart_rx_fault || rx_fault_now;
+            Vision_Rx_Was_Healthy = rx_ok_now && !rx_fault_now;
+        }
+        else
+        {
+            uart_rx_epoch = rx_epoch_now;
+        }
     }
 
     // 舵机控制：等待首帧有效电池采样后再启动 PWM；真实电池故障或 PWM 启动失败则永久锁停。
@@ -512,7 +558,29 @@ static void Drive_Control()
     mission_in.use_motor_feedback_seq = true;
 
     const Struct_Mission_Output cmd = Rescue_Mission.Update(mission_in);
-    Drive_Notify_Buzzer(mission_in.can_launch, cmd.launch_rejected_cue, now_ms);
+
+    // Post-decision / pre-output RX revalidation: if a UART RX fault or recovery epoch bump
+    // arrived mid-tick during mission update in competition mode, immediately suppress motor output
+    // and invalidate vision/freshness publication for this tick.
+    bool uart_rx_faulted_mid_tick = false;
+    if (!is_bench_mode)
+    {
+        const bool rx_ok_post = UART_Is_Rx_Healthy(&huart1);
+        const bool rx_fault_post = UART_Is_Rx_Fault_Latched(&huart1);
+        const uint32_t rx_epoch_post = UART_Get_Rx_Epoch(&huart1);
+        if (!rx_ok_post || rx_fault_post || rx_epoch_post != Last_Uart_Rx_Epoch)
+        {
+            Last_Uart_Rx_Epoch = rx_epoch_post;
+            Vision_Flush_Rx_Queue();
+            Rescue_Mission.On_Uart_Rx_Fault();
+            uart_rx_healthy = false;
+            uart_rx_fault = uart_rx_fault || rx_fault_post;
+            Vision_Rx_Was_Healthy = rx_ok_post && !rx_fault_post;
+            uart_rx_faulted_mid_tick = true;
+        }
+    }
+
+    Drive_Notify_Buzzer(mission_in.can_launch && !uart_rx_faulted_mid_tick, cmd.launch_rejected_cue, now_ms);
 
     if (servos_ready)
     {
@@ -523,7 +591,7 @@ static void Drive_Control()
     }
 
     std::array<float, 2> torque = {};
-    if (!ready)
+    if (!ready || uart_rx_faulted_mid_tick)
     {
         Straight_Drive.Stop();
         Chassis_Drive.Emergency_Stop();
@@ -601,6 +669,23 @@ static void Drive_Control()
         {
             CAN_Transmit_Data(&hfdcan2, 0x200, CAN2_0x200_Tx_Data, FDCAN_DLC_BYTES_8);
         }
+    }
+
+    // Establish the standstill feedback boundary AFTER Emergency_Stop and zero-torque CAN TX have been
+    // applied, so CAN IRQs that fired earlier in this tick (while still reversing) can NEVER release it!
+    if (Rescue_Mission.Is_Standstill_Gate_Pending_Boundary())
+    {
+        std::array<uint32_t, 2> post_stop_seq = {};
+        std::array<uint32_t, 2> post_stop_ms = {};
+        const uint32_t stop_mask = __get_PRIMASK();
+        __disable_irq();
+        for (uint8_t i = 0; i < 2; ++i)
+        {
+            post_stop_seq[i] = M2006_Feedback_Seq[i];
+            post_stop_ms[i] = M2006_Last_Feedback_Ms[i];
+        }
+        __set_PRIMASK(stop_mask);
+        Rescue_Mission.Latch_Standstill_Boundary(post_stop_seq.data(), post_stop_ms.data());
     }
 
     // 发布灯光颜色与遥测快照，供 statusTask 消费。

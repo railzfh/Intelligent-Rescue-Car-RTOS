@@ -73,6 +73,7 @@ struct UART_HandleTypeDef {
     bool rx_fault_latched = false;
     uint32_t rx_epoch = 0U;
     int service_rx_calls = 0;
+    bool inject_fault_after_epoch_read = false;
 };
 UART_HandleTypeDef huart1;
 bool UART_Service_Rx_Recovery(UART_HandleTypeDef *h) {
@@ -81,7 +82,15 @@ bool UART_Service_Rx_Recovery(UART_HandleTypeDef *h) {
 }
 bool UART_Is_Rx_Healthy(UART_HandleTypeDef *h) { return h->rx_healthy && !h->rx_fault_latched; }
 bool UART_Is_Rx_Fault_Latched(UART_HandleTypeDef *h) { return h->rx_fault_latched; }
-uint32_t UART_Get_Rx_Epoch(UART_HandleTypeDef *h) { return h->rx_epoch; }
+uint32_t UART_Get_Rx_Epoch(UART_HandleTypeDef *h) {
+    const uint32_t sampled = h->rx_epoch;
+    if (h->inject_fault_after_epoch_read) {
+        h->inject_fault_after_epoch_read = false;
+        h->rx_healthy = false;
+        ++h->rx_epoch;
+    }
+    return sampled;
+}
 struct FDCAN_HandleTypeDef { bool pending = false, fail = false; int tx_calls = 0; };
 FDCAN_HandleTypeDef hfdcan1, hfdcan2;
 uint8_t CAN1_0x200_Tx_Data[8], CAN2_0x200_Tx_Data[8];
@@ -90,9 +99,17 @@ uint32_t now_ms = 0, irq_mask = 0;
 bool key = false;
 constexpr int KEY__INPUT_GPIO_Port = 0, KEY__INPUT_Pin = 0, GPIO_PIN_RESET = 0;
 uint32_t HAL_GetTick() { return now_ms; }
+void (*irq_after_unmask)() = nullptr;
 uint32_t __get_PRIMASK() { return irq_mask; }
 void __disable_irq() { irq_mask = 1; }
-void __set_PRIMASK(uint32_t mask) { irq_mask = mask; }
+void __set_PRIMASK(uint32_t mask) {
+    irq_mask = mask;
+    if (mask == 0U && irq_after_unmask != nullptr) {
+        auto fn = irq_after_unmask;
+        irq_after_unmask = nullptr;
+        fn();
+    }
+}
 void __DMB() {}
 int HAL_GPIO_ReadPin(int, int) { return key ? 0 : 1; }
 uint32_t HAL_FDCAN_GetLatestTxFifoQRequestBuffer(FDCAN_HandleTypeDef *) { return 0; }
@@ -321,6 +338,181 @@ int main(int argc, char **argv) {
         drive_no_can(99U);
         assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_TURN);
         std::puts("PASS: reverse standstill interlock rejects pre-stop CAN samples and requires fresh post-stop standstill from EACH motor");
+        return 0;
+    }
+
+    const bool irq_races = argc > 1 && std::strcmp(argv[1], "irq_races") == 0;
+    if (irq_races) {
+        // Finding 2 (R7): UART RX fault injected immediately after pre-drain epoch read MUST suppress
+        // frame commit, VISION_FRESH publication, competition launch, and motor torque in the same tick!
+        Feed_Config(RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION);
+        Feed_Vision(1U);
+        for (uint32_t tm = 0U; tm < 40U; ++tm) { Step(tm, false); }
+        Step(40U, true);
+        Feed_Vision(2U);
+        huart1.inject_fault_after_epoch_read = true;
+        Step(70U, true);
+        assert(!huart1.rx_healthy);
+        assert((Telemetry_Snapshot.status_flags & TEL_FLAG_VISION_FRESH) == 0U);
+        assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_UART_RX) != 0U);
+        assert(Rescue_Mission.Get_State() == MISSION_PRE_MATCH);
+        assert(!Rescue_Mission.Is_Config_Locked());
+        Stopped();
+
+        // Finding 1 (R7): CAN zero-speed IRQs arriving AFTER Drive_Control's initial snapshot but BEFORE
+        // Emergency_Stop is applied (while still reversing!) MUST NOT release the standstill interlock on the next tick!
+        // Test BOTH abrupt reverse abort AND normal reverse completion!
+        huart1.rx_healthy = true;
+        Step(80U, false);
+        Step(110U, false);
+        uint16_t fseq = 10U;
+        auto feed_far_r7 = [&](uint16_t s, uint8_t target, uint16_t flags, uint16_t dist_mm) {
+            uint8_t buf[RESCUE_PROTO_MAX_FRAME];
+            static uint8_t pseq = 20U;
+            Struct_Vision_State vis{};
+            vis.frame_seq = s;
+            vis.camera_view = CAMERA_VIEW_FAR;
+            vis.target_type = target;
+            vis.flags = flags;
+            vis.target_dist_mm = dist_mm;
+            vis.confidence = 95U;
+            const size_t n = Rescue_Encode_Vision_State(pseq++, vis, buf, sizeof(buf));
+            Vision_Uart_RxCallback(buf, static_cast<uint16_t>(n));
+        };
+        auto feed_near_r7 = [&](uint16_t s, uint8_t g, uint8_t c, uint16_t flags) {
+            uint8_t buf[RESCUE_PROTO_MAX_FRAME];
+            static uint8_t pseq = 80U;
+            Struct_Vision_State vis{};
+            vis.frame_seq = s;
+            vis.camera_view = CAMERA_VIEW_NEAR;
+            vis.flags = flags;
+            vis.corral_green_cnt = g;
+            vis.corral_cyan_cnt = c;
+            vis.confidence = 95U;
+            const size_t n = Rescue_Encode_Vision_State(pseq++, vis, buf, sizeof(buf));
+            Vision_Uart_RxCallback(buf, static_cast<uint16_t>(n));
+        };
+        uint32_t tm = 120U;
+        for (; tm < 220U; ++tm) {
+            if ((tm % 30U) == 0U) { feed_far_r7(fseq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 190U); }
+            Step(tm, false);
+        }
+        Step(tm += 10U, true);
+        Step(tm += 30U, true);
+        assert(Rescue_Mission.Get_State() == MISSION_LAUNCH_CROSS_BUMPS);
+        // Advance straight to reach SEARCH -> APPROACH -> INSPECT -> cyan -> BACK_OUT_SEPARATE.
+        for (int k = 0; k < 8000 && Rescue_Mission.Get_State() == MISSION_LAUNCH_CROSS_BUMPS; ++k) {
+            ++tm;
+            if ((tm % 40U) == 0U) { feed_far_r7(fseq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 190U); }
+            Step(tm, false);
+            for (int i = 0; i < 2; ++i) {
+                M2006[i].angle += M2006[i].omega * 0.001f;
+                M2006[i].omega += 40.0f * M2006[i].torque * 0.001f;
+            }
+        }
+        M2006[0].omega = M2006[1].omega = 0.0f;
+        for (int k = 0; k < 300 && Rescue_Mission.Get_State() != MISSION_INSPECT_CORRAL; ++k) {
+            ++tm;
+            if ((tm % 30U) == 0U) { feed_far_r7(fseq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 190U); }
+            Step(tm, false);
+        }
+        for (int k = 0; k < 600 && !Pitch_Servo.Is_Settled(); ++k) {
+            ++tm;
+            if ((tm % 30U) == 0U) { feed_near_r7(fseq++, 1U, 0U, VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR); }
+            Step(tm, false);
+        }
+        feed_near_r7(fseq++, 0U, 1U, 0U);
+        Step(++tm, false);
+        assert(Rescue_Mission.Get_State() == MISSION_BACK_OUT_SEPARATE);
+        feed_far_r7(fseq++, TARGET_NONE, VIS_FLAG_REAR_CLEAR, 500U);
+        Step(++tm, false);
+        assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_DISTANCE);
+
+        auto drive_no_can = [&](uint32_t t_now) {
+            now_ms = t_now;
+            Battery.Update(24.0f, t_now);
+            Attitude_Sample_Ms = t_now;
+            Drive_Control();
+        };
+        // Case A: Abrupt reverse abort with pre-stop CAN IRQs firing right after initial snapshot while still in DISTANCE!
+        for (int k = 0; k < 20; ++k) { drive_no_can(++tm); }
+        feed_far_r7(fseq++, TARGET_NONE, 0U, 500U);
+        Heading_Rad += 0.2f; // abrupt clearance loss!
+        irq_after_unmask = [] {
+            assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_DISTANCE);
+            for (unsigned i = 0; i < 2U; ++i) {
+                ++M2006_Feedback_Seq[i];
+                M2006_Last_Feedback_Ms[i] = now_ms;
+                M2006[i].omega = 0.0f;
+            }
+        };
+        drive_no_can(++tm);
+        assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_IDLE);
+        // Next tick with NO post-stop CAN samples -> MUST stay IDLE (NOT release to CHASSIS_MODE_TURN!).
+        drive_no_can(++tm);
+        assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_IDLE);
+        // Fresh post-stop standstill samples from BOTH motors -> NOW releases to CHASSIS_MODE_TURN!
+        for (unsigned i = 0; i < 2U; ++i) {
+            ++M2006_Feedback_Seq[i];
+            M2006_Last_Feedback_Ms[i] = tm + 1U;
+            M2006[i].omega = 0.0f;
+        }
+        drive_no_can(++tm);
+        assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_TURN);
+
+        // Case B: Normal reverse completion (chassis_motion_done) with pre-stop CAN IRQs firing before stop applied!
+        // Finish turn -> SEARCH -> APPROACH -> INSPECT -> cyan -> BACK_OUT_SEPARATE -> complete reverse distance normally!
+        for (int k = 0; k < 2000 && Rescue_Mission.Get_State() == MISSION_BACK_OUT_SEPARATE; ++k) {
+            ++tm;
+            if ((tm % 40U) == 0U) { feed_far_r7(fseq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 190U); }
+            Heading_Rad += 0.002f;
+            Step(tm, false);
+        }
+        M2006[0].omega = M2006[1].omega = 0.0f;
+        for (int k = 0; k < 300 && Rescue_Mission.Get_State() != MISSION_INSPECT_CORRAL; ++k) {
+            ++tm;
+            if ((tm % 30U) == 0U) { feed_far_r7(fseq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 190U); }
+            Step(tm, false);
+        }
+        for (int k = 0; k < 600 && !Pitch_Servo.Is_Settled(); ++k) {
+            ++tm;
+            if ((tm % 30U) == 0U) { feed_near_r7(fseq++, 1U, 0U, VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR); }
+            Step(tm, false);
+        }
+        feed_near_r7(fseq++, 0U, 1U, 0U);
+        Step(++tm, false);
+        assert(Rescue_Mission.Get_State() == MISSION_BACK_OUT_SEPARATE);
+        feed_far_r7(fseq++, TARGET_NONE, VIS_FLAG_REAR_CLEAR, 500U);
+        Step(++tm, false);
+        assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_DISTANCE);
+        // Move wheels the full reverse distance so Chassis_Drive completes normally on next tick!
+        const float rev_rad = -0.25f / Drive_Wheel_Radius_M;
+        M2006[0].angle += M2006_Direction[0] * rev_rad;
+        M2006[1].angle += M2006_Direction[1] * rev_rad;
+        M2006[0].omega = M2006[1].omega = 0.0f;
+        Step(++tm, false); // Chassis_Drive hits Is_Motion_Done() on this tick; Mission handles completion on next tick!
+        // On the mission completion tick, inject pre-stop CAN IRQs right after initial snapshot!
+        irq_after_unmask = [] {
+            for (unsigned i = 0; i < 2U; ++i) {
+                ++M2006_Feedback_Seq[i];
+                M2006_Last_Feedback_Ms[i] = now_ms;
+                M2006[i].omega = 0.0f;
+            }
+        };
+        drive_no_can(++tm);
+        assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_IDLE);
+        // Next tick with NO post-stop CAN sample -> MUST stay IDLE (NOT start turn)!
+        drive_no_can(++tm);
+        assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_IDLE);
+        // Post-stop CAN samples from BOTH motors -> cleanly starts turn!
+        for (unsigned i = 0; i < 2U; ++i) {
+            ++M2006_Feedback_Seq[i];
+            M2006_Last_Feedback_Ms[i] = tm + 1U;
+            M2006[i].omega = 0.0f;
+        }
+        drive_no_can(++tm);
+        assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_TURN);
+        std::puts("PASS: same-tick UART RX race suppressed and post-stop CAN boundary enforced for both reverse abort and normal completion");
         return 0;
     }
 
@@ -648,5 +840,5 @@ cmd = ["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-Wno-unused-variable
 if os.name == "nt":
     cmd.append("-static")
 subprocess.run(cmd, check=True)
-for mode in ([], ["held"], ["comp"], ["can_fault"], ["frozen"], ["cold_boot"], ["servo_fail"], ["reverse_abort"], ["uart_unhealthy"], ["standstill_can"]):
+for mode in ([], ["held"], ["comp"], ["can_fault"], ["frozen"], ["cold_boot"], ["servo_fail"], ["reverse_abort"], ["uart_unhealthy"], ["standstill_can"], ["irq_races"]):
     subprocess.run([str(exe), *mode], check=True)

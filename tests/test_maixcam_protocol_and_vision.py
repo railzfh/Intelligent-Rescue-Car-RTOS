@@ -98,11 +98,14 @@ class _FakeMaixImage:
         self,
         thresholds: list[tuple[int, int, int, int, int, int]],
         roi: tuple[int, int, int, int] | None = None,
+        x_stride: int = 1,
+        y_stride: int = 1,
         pixels_threshold: int = 1,
         area_threshold: int = 1,
         invert: bool = False,
         merge: bool = False,
     ) -> list[_FakeMaixBlob]:
+        _ = (x_stride, y_stride)
         rx, ry, rw, rh = roi if roi is not None else (0, 0, self.width, self.height)
         x1, y1 = max(0, rx), max(0, ry)
         x2, y2 = min(self.width, rx + rw), min(self.height, ry + rh)
@@ -208,11 +211,14 @@ class _FakeMaixBinaryImage:
         self,
         thresholds: list[tuple[int, int, int, int, int, int]],
         roi: tuple[int, int, int, int] | None = None,
+        x_stride: int = 1,
+        y_stride: int = 1,
         pixels_threshold: int = 1,
         area_threshold: int = 1,
         invert: bool = False,
         merge: bool = False,
     ) -> list[_FakeMaixBlob]:
+        _ = (x_stride, y_stride)
         rx, ry, rw, rh = roi if roi is not None else (0, 0, self.width, self.height)
         x1, y1 = max(0, rx), max(0, ry)
         x2, y2 = min(self.width, rx + rw), min(self.height, ry + rh)
@@ -281,6 +287,59 @@ class _FakeMaixBinaryImage:
             comps = merged
 
         return [_FakeMaixBlob(bx, by, bw, bh, cnt) for bx, by, bw, bh, cnt in comps]
+
+
+class _FakeMaixNativeStrideImage(_FakeMaixBinaryImage):
+    """Models Sipeed MaixPy / OpenMV SDK default x_stride=2, y_stride=1 alternating-column seed lattice."""
+
+    def crop(self, *args) -> "_FakeMaixNativeStrideImage":
+        res = super().crop(*args)
+        res.__class__ = _FakeMaixNativeStrideImage
+        return res
+
+    def binary(self, *args, **kwargs) -> "_FakeMaixNativeStrideImage":
+        res = super().binary(*args, **kwargs)
+        res.__class__ = _FakeMaixNativeStrideImage
+        return res
+
+    def find_blobs(
+        self,
+        thresholds: list[tuple[int, int, int, int, int, int]],
+        roi: tuple[int, int, int, int] | None = None,
+        x_stride: int = 2,
+        y_stride: int = 1,
+        pixels_threshold: int = 1,
+        area_threshold: int = 1,
+        invert: bool = False,
+        merge: bool = False,
+    ) -> list[_FakeMaixBlob]:
+        results = super().find_blobs(
+            thresholds,
+            roi=roi,
+            x_stride=x_stride,
+            y_stride=y_stride,
+            pixels_threshold=pixels_threshold,
+            area_threshold=area_threshold,
+            invert=invert,
+            merge=merge,
+        )
+        rx, ry = roi[:2] if roi is not None else (0, 0)
+        t = thresholds[0]
+
+        def matched(x: int, y: int) -> bool:
+            px = self._lab_rows[y][x]
+            inside = (t[0] <= px[0] <= t[1]) and (t[2] <= px[1] <= t[3]) and (t[4] <= px[2] <= t[5])
+            return (not inside) if invert else inside
+
+        return [
+            b
+            for b in results
+            if any(
+                (yy - ry) % y_stride == 0 and (xx - rx - yy) % x_stride == 0 and matched(xx, yy)
+                for yy in range(b.y(), b.y() + b.h())
+                for xx in range(b.x(), b.x() + b.w())
+            )
+        ]
 
 
 class MaixcamProtocolTest(unittest.TestCase):
@@ -1293,6 +1352,93 @@ class MaixcamVisionAndUITest(unittest.TestCase):
             post_1px + [Blob("cyan", 140, 82, 20, 20, 400)], gate_closed=False, drop_pushing=True, **drop_kw
         )
         self.assertFalse(st_new_haz.flags & VIS_FLAG_DROP_PATH_CLEAR)
+
+    def test_round7_unit_stride_actual_clipped_pixels_and_backout_flags(self) -> None:
+        floor_lab = (85, 0, 0)
+        red_lab = (50, 45, 30)
+        ramp_lab = (45, 40, -35)
+        green_lab = (55, -35, 30)
+        unknown_lab = (55, 0, 45)
+        kw = dict(camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False)
+
+        def make_scene(cls):
+            img = cls(320, 240, floor_lab)
+            img.fill_rect(100, 20, 220, 69, red_lab)
+            img.fill_rect(100, 89, 220, 23, ramp_lab)
+            img.fill_rect(193, 175, 24, 24, green_lab)
+            return img
+
+        # 1. Finding 3 (R7): 64-px 1-px-wide diagonal unknown (misses default x_stride=2 seed lattice!)
+        #    MUST be caught in corral AND in home across Tier 1, Tier 2, AND _FakeMaixNativeStrideImage!
+        for cls in (_FakeMaixImage, _FakeMaixBinaryImage, _FakeMaixNativeStrideImage):
+            img_diag_corral = make_scene(cls)
+            for i in range(64):
+                img_diag_corral.fill_rect(106 + i, 143 + i, 1, 1, unknown_lab)
+            blobs_dc = extract_blobs_from_maix_image(img_diag_corral, self.cfg, scan_unknown_near=True)
+            st_dc = RescueVisionProcessor(self.cfg).process(
+                blobs_dc, mission_state=MISSION_DROP_OPEN_AND_PUSH, gate_closed=True, **kw
+            )
+            self.assertGreaterEqual(st_dc.corral_unknown_cnt, 1, cls.__name__)
+            self.assertFalse(st_dc.flags & VIS_FLAG_DROP_PATH_CLEAR, cls.__name__)
+            self.assertFalse(st_dc.flags & VIS_FLAG_DROP_BASELINE_READY, cls.__name__)
+
+            # Also verify 64-px diagonal unknown inside home (merge_small=False ROI) is caught!
+            img_diag_home = make_scene(cls)
+            for i in range(64):
+                img_diag_home.fill_rect(120 + i, 22 + i, 1, 1, unknown_lab)
+            blobs_dh = extract_blobs_from_maix_image(img_diag_home, self.cfg, scan_unknown_near=True)
+            st_dh = RescueVisionProcessor(self.cfg).process(
+                blobs_dh, mission_state=MISSION_DROP_OPEN_AND_PUSH, gate_closed=True, **kw
+            )
+            self.assertEqual(st_dh.corral_unknown_cnt, 0, cls.__name__)
+            self.assertFalse(st_dh.flags & VIS_FLAG_DROP_PATH_CLEAR, cls.__name__)
+            self.assertFalse(st_dh.flags & VIS_FLAG_DROP_BASELINE_READY, cls.__name__)
+
+        # 2. Finding 4 (R7): 150-px L-shaped unverified purple patch completely OUTSIDE near_corral_roi
+        #    (zero actual pixels inside corral, only concave AABB corner intersects corral) MUST produce
+        #    corral_unknown_cnt == 0 and exact actual-pixel clipped bounds in ALL tiers!
+        for cls in (_FakeMaixImage, _FakeMaixBinaryImage, _FakeMaixNativeStrideImage):
+            img_l = make_scene(cls)
+            img_l.fill_rect(75, 119, 27, 3, ramp_lab)
+            img_l.fill_rect(75, 122, 3, 23, ramp_lab)
+            blobs_l = extract_blobs_from_maix_image(img_l, self.cfg, scan_unknown_near=True)
+            unk_bounds = [(b.x, b.y, b.w, b.h, b.pixels) for b in blobs_l if b.label == "unknown"]
+            self.assertEqual(unk_bounds, [(75, 119, 27, 9, 99)], cls.__name__)
+            st_l = RescueVisionProcessor(self.cfg).process(blobs_l, **kw)
+            self.assertEqual(st_l.corral_unknown_cnt, 0, cls.__name__)
+            self.assertTrue(st_l.flags & VIS_FLAG_CORRAL_SAFE, cls.__name__)
+
+        # 3. Finding 5 (R7): Retain _drop_baseline during MISSION_DROP_BACKOUT_VERIFY for delivery confirmation,
+        #    but NEVER emit VIS_FLAG_DROP_BASELINE_READY or VIS_FLAG_GATE_OPEN_SETTLED_ACK outside pre-push!
+        proc = RescueVisionProcessor(self.cfg)
+        home = Blob("red_zone", 100, 20, 220, 60, 13200)
+        ramp = Blob("purple_ramp", 100, 80, 220, 22, 4840)
+        green_corral = Blob("green", 147, 156, 24, 24, 576)
+        st_pre = proc.process(
+            [home, ramp, green_corral], mission_state=MISSION_DROP_OPEN_AND_PUSH, gate_closed=True, **kw
+        )
+        self.assertTrue(st_pre.flags & VIS_FLAG_DROP_BASELINE_READY)
+        st_backout_empty = proc.process(
+            [home, ramp],
+            mission_state=MISSION_DROP_BACKOUT_VERIFY,
+            gate_closed=False,
+            gate_settled=True,
+            **kw,
+        )
+        self.assertFalse(st_backout_empty.flags & VIS_FLAG_DROP_BASELINE_READY)
+        self.assertFalse(st_backout_empty.flags & VIS_FLAG_GATE_OPEN_SETTLED_ACK)
+        self.assertFalse(st_backout_empty.flags & VIS_FLAG_DROP_CONFIRMED)
+        # Baseline is still retained so actual delivery inside target half confirms cleanly while keeping pre-push bits 0!
+        st_backout_done = proc.process(
+            [home, ramp, Blob("green", 130, 40, 24, 24, 576)],
+            mission_state=MISSION_DROP_BACKOUT_VERIFY,
+            gate_closed=False,
+            gate_settled=True,
+            **kw,
+        )
+        self.assertTrue(st_backout_done.flags & VIS_FLAG_DROP_CONFIRMED)
+        self.assertFalse(st_backout_done.flags & VIS_FLAG_DROP_BASELINE_READY)
+        self.assertFalse(st_backout_done.flags & VIS_FLAG_GATE_OPEN_SETTLED_ACK)
 
     def test_home_half_match_checks_full_corral_width_and_opponent_zone(self) -> None:
         # Home x=100..320 (cx=210, left material half=[100, 192]).

@@ -608,9 +608,10 @@ class RescueVisionProcessor:
         gate_settled: Optional[bool],
         drop_pushing: bool,
     ) -> Tuple[bool, Tuple[int, int, int]]:
-        # Never capture, modify, or rewrite baseline once the explicit MCU push phase or backout verify starts.
+        # Retain frozen baseline for delivery verification during push/backout, but NEVER report
+        # pre-push baseline authorization as ready once pushing or outside MISSION_DROP_OPEN_AND_PUSH!
         if drop_pushing or (mission_state is not None and mission_state != MISSION_DROP_OPEN_AND_PUSH):
-            return self._drop_baseline is not None, (0, 0, 0)
+            return False, (0, 0, 0)
         if not corral_safe or not drop_path_hazards_clear or home is None or assoc_ramp is None:
             if gate_closed is True:
                 self._drop_baseline = None
@@ -903,8 +904,9 @@ class RescueVisionProcessor:
             if drop_path_hazards_clear:
                 flags |= VIS_FLAG_DROP_PATH_CLEAR
 
+            in_pre_push_phase = (mission_state is None or mission_state == MISSION_DROP_OPEN_AND_PUSH) and not drop_pushing
             baseline_ready = (
-                not drop_pushing
+                in_pre_push_phase
                 and baseline_ok
                 and corral_safe
                 and drop_path_hazards_clear
@@ -954,8 +956,16 @@ def _get_lab_pixel_accessor(img):
     return None
 
 
+def _find_blobs_unit_stride(img, thresholds, **kwargs):
+    """Call MaixPy/OpenMV find_blobs with explicit x_stride=1, y_stride=1 so native default x_stride=2 never skips thin/diagonal blobs."""
+    try:
+        return img.find_blobs(thresholds, x_stride=1, y_stride=1, **kwargs)
+    except TypeError:
+        return img.find_blobs(thresholds, **kwargs)
+
+
 def _extract_roi_blobs_for_label(img, label: str, thresh: Sequence[int], roi: Tuple[int, int, int, int]) -> List[Blob]:
-    found = img.find_blobs([tuple(thresh)], roi=roi, pixels_threshold=1, area_threshold=1, merge=False)
+    found = _find_blobs_unit_stride(img, [tuple(thresh)], roi=roi, pixels_threshold=1, area_threshold=1, merge=False)
     out: List[Blob] = []
     for item in found:
         w = max(1, int(item.w()))
@@ -1013,12 +1023,12 @@ def _filter_opponent_excluding_floor(
             if rw <= 0 or rh <= 0:
                 return 0
             r = (rx, ry, rw, rh)
-            f_px = sum(int(b.pixels()) for b in floor_mask.find_blobs(white, roi=r, pixels_threshold=1, area_threshold=1, merge=True))
-            b_px = sum(int(b.pixels()) for b in both_mask.find_blobs(white, roi=r, pixels_threshold=1, area_threshold=1, merge=True))
+            f_px = sum(int(b.pixels()) for b in _find_blobs_unit_stride(floor_mask, white, roi=r, pixels_threshold=1, area_threshold=1, merge=True))
+            b_px = sum(int(b.pixels()) for b in _find_blobs_unit_stride(both_mask, white, roi=r, pixels_threshold=1, area_threshold=1, merge=True))
             return max(0, b_px - f_px)
 
-        floor_px = sum(int(b.pixels()) for b in floor_mask.find_blobs(white, pixels_threshold=1, area_threshold=1, merge=True))
-        both_px = sum(int(b.pixels()) for b in both_mask.find_blobs(white, pixels_threshold=1, area_threshold=1, merge=True))
+        floor_px = sum(int(b.pixels()) for b in _find_blobs_unit_stride(floor_mask, white, pixels_threshold=1, area_threshold=1, merge=True))
+        both_px = sum(int(b.pixels()) for b in _find_blobs_unit_stride(both_mask, white, pixels_threshold=1, area_threshold=1, merge=True))
         total_opp_px = max(0, both_px - floor_px)
         if total_opp_px < cfg.min_opponent_pixels:
             return None
@@ -1064,7 +1074,8 @@ def _filter_opponent_excluding_floor(
         return Blob("opponent", ox1, oy1, ow, oh, total_opp_px, min(1.0, total_opp_px / float(ow * oh)))
 
     # Fallback using find_blobs: intersect opponent ROI with non-floor pixels so plain floor never triggers.
-    non_floor = img.find_blobs(
+    non_floor = _find_blobs_unit_stride(
+        img,
         [tuple(floor_thresh)],
         roi=(bx, by, bw, bh),
         pixels_threshold=1,
@@ -1161,17 +1172,17 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
         thresh = cfg.lab_thresholds[label]
         min_area = _min_area_for_label(label, cfg)
         if label == "opponent":
-            found = img.find_blobs([tuple(thresh)], pixels_threshold=min_area, area_threshold=min_area, merge=True)
+            found = _find_blobs_unit_stride(img, [tuple(thresh)], pixels_threshold=min_area, area_threshold=min_area, merge=True)
             for item in found:
                 filtered = _filter_opponent_excluding_floor(img, item, thresh, cfg)
                 if filtered is not None:
                     blobs.append(filtered)
             continue
 
-        # In NEAR mode, capture all connected components (merge=False) so detached unverified patches
-        # inside concave verified components (e.g. a C-shaped ramp) are separated directly by component!
+        # In NEAR mode, capture all connected components (merge=False, x_stride=1, y_stride=1) so detached
+        # unverified patches inside concave verified components (e.g. a C-shaped ramp) are separated by component!
         px_thr = 1 if (scan_unknown_near and label in (_SURFACE_LABELS + _OBJECT_LABELS)) else min_area
-        found = img.find_blobs([tuple(thresh)], pixels_threshold=px_thr, area_threshold=px_thr, merge=False)
+        found = _find_blobs_unit_stride(img, [tuple(thresh)], pixels_threshold=px_thr, area_threshold=px_thr, merge=False)
         for item in found:
             w = max(1, int(item.w()))
             h = max(1, int(item.h()))
@@ -1326,7 +1337,11 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                                 min_y = cy
                             if cy > max_y:
                                 max_y = cy
-                            for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+                            for nx, ny in (
+                                (cx - 1, cy - 1), (cx, cy - 1), (cx + 1, cy - 1),
+                                (cx - 1, cy), (cx + 1, cy),
+                                (cx - 1, cy + 1), (cx, cy + 1), (cx + 1, cy + 1),
+                            ):
                                 if x1 <= nx < x2 and y1 <= ny < y2 and not vis_u[ny - y1][nx - x1]:
                                     if not explained[ny][nx] and not _lab_in_thresh(get_lab(nx, ny), cfg.arena_floor_lab):
                                         vis_u[ny - y1][nx - x1] = True
@@ -1396,8 +1411,8 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                             sub_c = img.crop(c.x, c.y, c.w, c.h)
                             oth_m = sub_c.binary([list(oth_thresh)], invert=False, copy=True)
                             both_m = sub_c.binary([list(oth_thresh), list(thresh)], invert=False, copy=True)
-                            oth_px = sum(int(b.pixels()) for b in oth_m.find_blobs(white, pixels_threshold=1, area_threshold=1, merge=True))
-                            both_px = sum(int(b.pixels()) for b in both_m.find_blobs(white, pixels_threshold=1, area_threshold=1, merge=True))
+                            oth_px = sum(int(b.pixels()) for b in _find_blobs_unit_stride(oth_m, white, pixels_threshold=1, area_threshold=1, merge=True))
+                            both_px = sum(int(b.pixels()) for b in _find_blobs_unit_stride(both_m, white, pixels_threshold=1, area_threshold=1, merge=True))
                             if max(0, both_px - oth_px) == 0:
                                 covered_by_other = True
                                 break
@@ -1406,11 +1421,38 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                     if not covered_by_other:
                         unverified_set_b.append(c)
 
+            corral_clipped = _clip_roi(cfg.near_corral_roi)
+
+            def _actual_unverified_subblobs_in_rect(
+                comp: Blob, rect_x: int, rect_y: int, rect_w: int, rect_h: int
+            ) -> List[Blob]:
+                """Clip an unverified component to a rectangle using ACTUAL component pixels (never AABB area!)."""
+                if rect_w <= 0 or rect_h <= 0:
+                    return []
+                c_thresh = cfg.lab_thresholds.get(comp.label)
+                if c_thresh is None:
+                    return []
+                sub_raw = _find_blobs_unit_stride(
+                    img,
+                    [tuple(c_thresh)],
+                    roi=(rect_x, rect_y, rect_w, rect_h),
+                    pixels_threshold=1,
+                    area_threshold=1,
+                    merge=False,
+                )
+                out_subs: List[Blob] = []
+                for item in sub_raw:
+                    sx, sy = int(item.x()), int(item.y())
+                    sw, sh = max(1, int(item.w())), max(1, int(item.h()))
+                    spx = int(item.pixels())
+                    out_subs.append(Blob("unknown", sx, sy, sw, sh, spx, min(1.0, spx / float(sw * sh))))
+                return out_subs
+
             for roi, merge_small in scan_rois:
                 rx, ry, rw, rh = roi
                 roi_img = img.crop(rx, ry, rw, rh)
                 matched_mask = roi_img.binary(all_known_thresholds, invert=False, copy=True)
-                uncal_raw = matched_mask.find_blobs(black, pixels_threshold=1, area_threshold=1, merge=False)
+                uncal_raw = _find_blobs_unit_stride(matched_mask, black, pixels_threshold=1, area_threshold=1, merge=False)
                 roi_cands: List[Blob] = []
                 for item in uncal_raw:
                     w = max(1, int(item.w()))
@@ -1424,10 +1466,35 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                     ix1, iy1, ix2, iy2 = inter
                     iw, ih = max(1, ix2 - ix1), max(1, iy2 - iy1)
                     if ix1 == c.x and iy1 == c.y and iw == c.w and ih == c.h:
+                        # If a concave unverified component fits inside a wide ROI while its AABB overlaps
+                        # corral_roi with ZERO actual pixels inside corral_roi, split outside corral_roi so
+                        # it never falsely inflates corral_unknown_cnt!
+                        if (
+                            corral_clipped is not None
+                            and roi != corral_clipped
+                            and c.pixels < c.w * c.h
+                            and _rects_intersect(c.x, c.y, c.w, c.h, *corral_clipped)
+                        ):
+                            ci = _rect_intersection(c.x, c.y, c.w, c.h, *corral_clipped)
+                            in_corral = (
+                                _actual_unverified_subblobs_in_rect(c, ci[0], ci[1], ci[2] - ci[0], ci[3] - ci[1])
+                                if ci is not None
+                                else []
+                            )
+                            if not in_corral and ci is not None:
+                                cx1, cy1, cx2, cy2 = ci
+                                strips = (
+                                    (c.x, c.y, c.w, cy1 - c.y),
+                                    (c.x, cy2, c.w, c.y2 - cy2),
+                                    (c.x, cy1, cx1 - c.x, cy2 - cy1),
+                                    (cx2, cy1, c.x2 - cx2, cy2 - cy1),
+                                )
+                                for sx, sy, sw, sh in strips:
+                                    roi_cands.extend(_actual_unverified_subblobs_in_rect(c, sx, sy, sw, sh))
+                                continue
                         roi_cands.append(Blob("unknown", c.x, c.y, c.w, c.h, c.pixels, c.density))
                     else:
-                        clipped_px = min(c.pixels, iw * ih)
-                        roi_cands.append(Blob("unknown", ix1, iy1, iw, ih, clipped_px, min(1.0, clipped_px / float(iw * ih))))
+                        roi_cands.extend(_actual_unverified_subblobs_in_rect(c, ix1, iy1, iw, ih))
 
                 merged_cands = _merge_adjacent_unknowns(roi_cands)
                 small_cands: List[Blob] = []
@@ -1455,7 +1522,8 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
 
         # Tier 3: Fallback for find_blobs-only mocks without pixel access or binary().
         for roi, merge_fg in scan_rois:
-            fg_blobs = img.find_blobs(
+            fg_blobs = _find_blobs_unit_stride(
+                img,
                 [tuple(cfg.arena_floor_lab)],
                 roi=roi,
                 pixels_threshold=cfg.min_hazard_pixels,
