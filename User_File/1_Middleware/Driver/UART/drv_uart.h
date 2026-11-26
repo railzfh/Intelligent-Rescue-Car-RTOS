@@ -35,6 +35,8 @@
  */
 typedef void (*UART_Callback)(uint8_t *Buffer, uint16_t Length);
 
+typedef void (*UART_Tx_Callback)(bool Completed);
+
 /**
  * @brief UART通信处理结构体
  */
@@ -42,6 +44,7 @@ struct Struct_UART_Manage_Object
 {
     UART_HandleTypeDef *UART_Handler;
     UART_Callback Callback_Function;
+    UART_Tx_Callback Tx_Callback_Function;
 
     // 双缓冲适配的缓冲区以及当前激活的缓冲区
     uint8_t Rx_Buffer_0[UART_BUFFER_SIZE];
@@ -78,6 +81,8 @@ extern struct Struct_UART_Manage_Object UART10_Manage_Object;
 /* Exported function declarations --------------------------------------------*/
 
 void UART_Init(UART_HandleTypeDef *huart, UART_Callback Callback_Function);
+
+void UART_Set_Tx_Callback(UART_HandleTypeDef *huart, UART_Tx_Callback Callback_Function);
 
 void UART_Reinit(UART_HandleTypeDef * huart);
 

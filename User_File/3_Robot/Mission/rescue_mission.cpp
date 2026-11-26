@@ -40,6 +40,7 @@ bool Class_Rescue_Mission::On_Set_Config(const Struct_Match_Config_Cmd &cfg)
         Gate_Closed_Cmd = false;
         Camera_Near_Cmd = false;
         Pre_Match_Wait_Servo_Apply = true;
+        Pre_Match_Settled_Latched = false;
         Pre_Match_Need_Post_Settle_Far = true;
         Pre_Match_Settle_Accept_Id = Vision_Accept_Counter;
     }
@@ -324,6 +325,7 @@ void Class_Rescue_Mission::Enter_State(Enum_Mission_State next, uint32_t now_ms)
     Standstill_Abrupt_Stop = false;
     Gate_Open_Settled_Latched = false;
     Gate_Settled_Frame_Seq = 0U;
+    Pre_Match_Settled_Latched = false;
     Pending_Non_Near_View_Event = false;
     Pending_Non_Far_View_Event = false;
     Pending_Near_Hazard_Event = false;
@@ -837,12 +839,32 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             if (Pre_Match_Wait_Servo_Apply)
             {
                 // This tick's settled bits still belong to the previous (bench) servo targets;
-                // command open/FAR first and require a fresh post-settle FAR frame on later ticks.
+                // command open/FAR first and require settled observation + a later FAR frame.
                 Pre_Match_Wait_Servo_Apply = false;
+                Pre_Match_Settled_Latched = false;
                 Pre_Match_Need_Post_Settle_Far = true;
                 Pre_Match_Settle_Accept_Id = Vision_Accept_Counter;
             }
-            else if (!in.gate_settled || !in.camera_settled || !vision_fresh)
+            else if (!in.gate_settled || !in.camera_settled)
+            {
+                Pre_Match_Settled_Latched = false;
+                Pre_Match_Need_Post_Settle_Far = true;
+                Pre_Match_Settle_Accept_Id = Vision_Accept_Counter;
+            }
+            else if (!Pre_Match_Settled_Latched)
+            {
+                // First tick observing BOTH open and FAR targets settled: record settled status and,
+                // when waiting for post-settle vision (e.g. cold boot or bench exit) or missing fresh
+                // vision, anchor Vision_Accept_Counter AFTER this tick's RX drain and refuse launch on
+                // this boundary tick so any FAR frame queued before settling cannot authorize launch.
+                Pre_Match_Settled_Latched = true;
+                if (Pre_Match_Need_Post_Settle_Far || !vision_fresh)
+                {
+                    Pre_Match_Need_Post_Settle_Far = true;
+                    Pre_Match_Settle_Accept_Id = Vision_Accept_Counter;
+                }
+            }
+            else if (!vision_fresh)
             {
                 Pre_Match_Need_Post_Settle_Far = true;
                 Pre_Match_Settle_Accept_Id = Vision_Accept_Counter;

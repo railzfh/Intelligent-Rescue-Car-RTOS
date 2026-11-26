@@ -111,6 +111,7 @@ void UART_Init(UART_HandleTypeDef *huart, UART_Callback Callback_Function)
     }
     obj->UART_Handler = huart;
     obj->Callback_Function = Callback_Function;
+    obj->Tx_Callback_Function = nullptr;
     obj->Rx_Buffer_Active = obj->Rx_Buffer_0;
     obj->Rx_Buffer_Ready = nullptr;
     obj->Rx_Recovery_Pending = false;
@@ -118,6 +119,16 @@ void UART_Init(UART_HandleTypeDef *huart, UART_Callback Callback_Function)
     obj->Rx_Recovery_Epoch = 0U;
     obj->Rx_Recovery_Fail_Count = 0U;
     (void)UART_Start_Rx_DMA(obj);
+}
+
+void UART_Set_Tx_Callback(UART_HandleTypeDef *huart, UART_Tx_Callback Callback_Function)
+{
+    Struct_UART_Manage_Object *obj = UART_Get_Manage_Object(huart);
+    if (obj == nullptr)
+    {
+        return;
+    }
+    obj->Tx_Callback_Function = Callback_Function;
 }
 
 /**
@@ -303,6 +314,24 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
     }
 }
 
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    Struct_UART_Manage_Object *obj = UART_Get_Manage_Object(huart);
+    if (obj != nullptr && obj->UART_Handler == huart && obj->Tx_Callback_Function != nullptr)
+    {
+        obj->Tx_Callback_Function(true);
+    }
+}
+
+void HAL_UART_AbortTransmitCpltCallback(UART_HandleTypeDef *huart)
+{
+    Struct_UART_Manage_Object *obj = UART_Get_Manage_Object(huart);
+    if (obj != nullptr && obj->UART_Handler == huart && obj->Tx_Callback_Function != nullptr)
+    {
+        obj->Tx_Callback_Function(false);
+    }
+}
+
 /**
  * @brief HAL库UART错误中断
  *
@@ -321,6 +350,11 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
     {
         obj->Rx_Recovery_Epoch = obj->Rx_Recovery_Epoch + 1U;
         obj->Rx_Recovery_Pending = true;
+    }
+    // Notify TX failure only when HAL has terminated the TX transfer (gState returned to READY).
+    if (huart->gState == HAL_UART_STATE_READY && obj->Tx_Callback_Function != nullptr)
+    {
+        obj->Tx_Callback_Function(false);
     }
 }
 

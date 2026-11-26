@@ -195,25 +195,37 @@ static Struct_CAN_Manage_Object *CAN_Get_Manage_Object(const FDCAN_HandleTypeDef
     return nullptr;
 }
 
+bool CAN_Is_Bus_Off_Active(const FDCAN_HandleTypeDef *hfdcan)
+{
+    if (hfdcan == nullptr || hfdcan->Instance == nullptr)
+    {
+        return false;
+    }
+    // 直接检查 FDCAN 协议状态 PSR.BO 与挂起中断位 IR.BO，在关中断临界区内也能立即发现硬件 Bus-Off。
+    return ((hfdcan->Instance->PSR & FDCAN_PSR_BO) != 0U) ||
+           ((hfdcan->Instance->IR & FDCAN_IR_BO) != 0U);
+}
+
 bool CAN_Is_Bus_Off_Latched(const FDCAN_HandleTypeDef *hfdcan)
 {
     const Struct_CAN_Manage_Object *obj = CAN_Get_Manage_Object(hfdcan);
-    return (obj != nullptr) && obj->Bus_Off_Latched;
+    return ((obj != nullptr) && obj->Bus_Off_Latched) || CAN_Is_Bus_Off_Active(hfdcan);
 }
 
 bool CAN_Consume_Bus_Off(const FDCAN_HandleTypeDef *hfdcan)
 {
     Struct_CAN_Manage_Object *obj = CAN_Get_Manage_Object(hfdcan);
+    const bool hw_active = CAN_Is_Bus_Off_Active(hfdcan);
     if (obj == nullptr)
     {
-        return false;
+        return hw_active;
     }
     const uint32_t primask = __get_PRIMASK();
     __disable_irq();
     const bool latched = obj->Bus_Off_Latched;
     obj->Bus_Off_Latched = false;
     __set_PRIMASK(primask);
-    return latched;
+    return latched || hw_active;
 }
 
 uint32_t CAN_Get_Bus_Off_Count(const FDCAN_HandleTypeDef *hfdcan)
@@ -335,15 +347,21 @@ void HAL_FDCAN_ErrorStatusCallback(FDCAN_HandleTypeDef *hfdcan, uint32_t ErrorSt
 {
     if ((ErrorStatusITs & FDCAN_IT_BUS_OFF) != RESET)
     {
-        // 先锁存总线离线事件再重启控制器，防止 HAL_FDCAN_Stop 清空发送请求掩盖故障或误放行停稳边界。
-        Struct_CAN_Manage_Object *obj = CAN_Get_Manage_Object(hfdcan);
-        if (obj != nullptr)
+        // STM32H7 FDCAN 的 IR.BO 在进入 Bus-Off (PSR.BO 0->1) 与恢复退出 (1->0) 都会触发；
+        // 仅在硬件 PSR.BO 置位（真实进入 Bus-Off）时锁存故障、计数并重启控制器，避免恢复中断误重复计数/重启。
+        const bool entered_bus_off = (hfdcan != nullptr && hfdcan->Instance != nullptr &&
+                                      (hfdcan->Instance->PSR & FDCAN_PSR_BO) != 0U);
+        if (entered_bus_off)
         {
-            obj->Bus_Off_Latched = true;
-            obj->Bus_Off_Count = obj->Bus_Off_Count + 1U;
+            Struct_CAN_Manage_Object *obj = CAN_Get_Manage_Object(hfdcan);
+            if (obj != nullptr)
+            {
+                obj->Bus_Off_Latched = true;
+                obj->Bus_Off_Count = obj->Bus_Off_Count + 1U;
+            }
+            HAL_FDCAN_Stop(hfdcan);
+            HAL_FDCAN_Start(hfdcan);
         }
-        HAL_FDCAN_Stop(hfdcan);
-        HAL_FDCAN_Start(hfdcan);
     }
 }
 

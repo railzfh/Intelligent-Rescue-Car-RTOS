@@ -2485,6 +2485,43 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                 fg_roi = (fx, fy, fg_w, fg_h)
                 if fg_roi in emitted_tier3_residuals:
                     continue
+
+                # Partition ALL non-floor pixels inside fg_roi into pairwise-disjoint connected
+                # components so Tier 3 NEVER subtracts pixels belonging to a disconnected component
+                # sitting inside a concave fg's AABB (e.g. a green block inside a C-shaped unknown).
+                box_fg_comps = _find_blobs_unit_stride(
+                    img,
+                    [tuple(cfg.arena_floor_lab)],
+                    roi=fg_roi,
+                    pixels_threshold=1,
+                    area_threshold=1,
+                    invert=True,
+                    merge=False,
+                )
+                other_fgs: List[Tuple[int, int, int, int, int]] = []
+                matched_self = False
+                total_box_fg_px = 0
+                for c_item in box_fg_comps:
+                    cx, cy = int(c_item.x()), int(c_item.y())
+                    cw, ch = max(1, int(c_item.w())), max(1, int(c_item.h()))
+                    cpx = int(c_item.pixels())
+                    total_box_fg_px += cpx
+                    if not merge_fg and not matched_self and (cx, cy, cw, ch, cpx) == (fx, fy, fg_w, fg_h, px):
+                        matched_self = True
+                    elif not merge_fg:
+                        other_fgs.append((cx, cy, cw, ch, cpx))
+                membership_uncertain = (not merge_fg and not matched_self) or (merge_fg and total_box_fg_px != px)
+
+                def _proven_on_fg(candidate: Blob) -> bool:
+                    if membership_uncertain:
+                        return False
+                    if not other_fgs:
+                        return True
+                    return not any(
+                        _rects_intersect(candidate.x, candidate.y, candidate.w, candidate.h, ox, oy, ow, oh)
+                        for ox, oy, ow, oh, _ in other_fgs
+                    )
+
                 roi_surfaces: List[Blob] = []
                 for surface_label in _SURFACE_LABELS:
                     thresh = cfg.lab_thresholds.get(surface_label)
@@ -2494,7 +2531,7 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                     if not parent_surfaces:
                         continue
                     for sub in _extract_roi_blobs_for_label(img, surface_label, thresh, fg_roi):
-                        if any(
+                        if _proven_on_fg(sub) and any(
                             _rects_intersect(sub.x, sub.y, sub.w, sub.h, p.x, p.y, p.w, p.h)
                             for p in parent_surfaces
                         ):
@@ -2509,7 +2546,7 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                     if not parent_objs:
                         continue
                     for sub in _extract_roi_blobs_for_label(img, obj_label, thresh, fg_roi):
-                        if any(
+                        if _proven_on_fg(sub) and any(
                             _rects_intersect(sub.x, sub.y, sub.w, sub.h, p.x, p.y, p.w, p.h) for p in parent_objs
                         ):
                             roi_objects.append(sub)
@@ -2527,7 +2564,9 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                         py2 = max(p[1] for p in in_fg) + 1
                         pw, ph = max(1, px2 - px1), max(1, py2 - py1)
                         pcnt = len(in_fg)
-                        roi_accounted.append(Blob("_accounted", px1, py1, pw, ph, pcnt, pcnt / float(pw * ph)))
+                        acc_b = Blob("_accounted", px1, py1, pw, ph, pcnt, pcnt / float(pw * ph))
+                        if _proven_on_fg(acc_b):
+                            roi_accounted.append(acc_b)
                 for rb in accounted_rejected_blobs:
                     inter = _rect_intersection(fx, fy, fg_w, fg_h, rb.x, rb.y, rb.w, rb.h)
                     if inter is None:
@@ -2535,10 +2574,13 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                     ix1, iy1, ix2, iy2 = inter
                     iw, ih = max(1, ix2 - ix1), max(1, iy2 - iy1)
                     if rb.pixels >= rb.w * rb.h:
-                        roi_accounted.append(Blob("_accounted", ix1, iy1, iw, ih, iw * ih, 1.0))
+                        acc_b = Blob("_accounted", ix1, iy1, iw, ih, iw * ih, 1.0)
+                        if _proven_on_fg(acc_b):
+                            roi_accounted.append(acc_b)
                     elif rb.label in cfg.lab_thresholds:
                         for sub in _extract_roi_blobs_for_label(img, "_accounted", cfg.lab_thresholds[rb.label], (ix1, iy1, iw, ih)):
-                            roi_accounted.append(sub)
+                            if _proven_on_fg(sub):
+                                roi_accounted.append(sub)
 
                 explained_px, union_area = _unique_explained_pixels(
                     fg, roi_objects + roi_surfaces + roi_accounted, cfg=cfg
@@ -2547,7 +2589,8 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                 pixel_coverage = explained_px / float(max(1, fg.pixels))
                 area_coverage = union_area / float(max(1, fg.w * fg.h))
                 if (
-                    unexplained_px >= cfg.min_hazard_pixels
+                    membership_uncertain
+                    or unexplained_px >= cfg.min_hazard_pixels
                     or pixel_coverage < 0.70
                     or (area_coverage < 0.70 and explained_px < fg.pixels)
                 ):

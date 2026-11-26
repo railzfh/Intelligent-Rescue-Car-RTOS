@@ -214,6 +214,7 @@ private:
     bool Pending_Drop_Unconfirmed_Event = false;
 
     bool Pre_Match_Wait_Servo_Apply = false;
+    bool Pre_Match_Settled_Latched = false;
     bool Pre_Match_Need_Post_Settle_Far = false;
     uint32_t Pre_Match_Settle_Accept_Id = 0U;
 

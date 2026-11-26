@@ -1623,8 +1623,10 @@ static void Test_Round12_Push_Same_Drain_Standstill_Bench_Leave_And_Interrupted_
         assert(h.m.Get_State() == MISSION_INSPECT_CORRAL);
     }
 
-    // 5. Round 13 invariants:
-    //    5a. P1-1: Bench exit + FAR frame in one drain MUST command open first and refuse launch on that tick!
+    // 5. Round 13 & Round 14 invariants:
+    //    5a. P1-1 & R14 P1-3: Bench exit + FAR frame in one drain MUST command open first, refuse launch on
+    //        that tick AND on the first tick observing open/FAR settled (even if a FAR frame was queued
+    //        before settling), and launch ONLY after a strictly newer post-settle FAR frame arrives!
     {
         Harness h;
         h.in.hardware_ready = h.in.can_launch = h.in.wheels_still = h.in.gate_settled = h.in.camera_settled = true;
@@ -1636,10 +1638,14 @@ static void Test_Round12_Push_Same_Drain_Standstill_Bench_Leave_And_Interrupted_
         h.in.button_pressed = true;
         const auto out1 = h.tick();
         assert(!out1.gate_closed && out1.drive_action == DRIVE_ACTION_IDLE && out1.launch_rejected_cue);
-        // Only after open/FAR is settled AND a strictly newer post-settle FAR frame arrives does launch proceed!
+        // First tick observing open/FAR settled with a pre-boundary FAR frame -> records boundary and refuses!
         h.far(TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 190U);
         const auto out2 = h.tick();
-        assert(out2.drive_action == DRIVE_ACTION_START_DISTANCE);
+        assert(out2.drive_action == DRIVE_ACTION_IDLE && out2.launch_rejected_cue);
+        // Strictly newer post-settle FAR frame on a later tick -> launch proceeds!
+        h.far(TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 190U);
+        const auto out3 = h.tick();
+        assert(out3.drive_action == DRIVE_ACTION_START_DISTANCE);
     }
     //    5b. P1-2: Half-mismatch + FAR in one drain while moving/unsettled MUST keep gate open!
     {

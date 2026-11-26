@@ -100,6 +100,8 @@ bool CAN_Is_Tx_Buffer_Occurred(const FDCAN_HandleTypeDef *hfdcan, uint32_t tx_bu
 
 bool CAN_Is_Rx_Fifo0_Empty(const FDCAN_HandleTypeDef *hfdcan);
 
+bool CAN_Is_Bus_Off_Active(const FDCAN_HandleTypeDef *hfdcan);
+
 bool CAN_Is_Bus_Off_Latched(const FDCAN_HandleTypeDef *hfdcan);
 
 bool CAN_Consume_Bus_Off(const FDCAN_HandleTypeDef *hfdcan);

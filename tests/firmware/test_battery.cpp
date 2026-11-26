@@ -62,6 +62,16 @@ int main()
     wraparound.Check_Timeout(50);
     assert(!wraparound.Can_Run());
 
+    // ADC 中断写入较新时间戳（now_ms 落后 1 tick）的良性时钟推进绝不能误判超时锁停。
+    Class_Battery newer_isr_sample;
+    newer_isr_sample.Update(24.0f, 232);
+    newer_isr_sample.Check_Timeout(231);
+    assert(newer_isr_sample.Can_Run() && !newer_isr_sample.Is_Fault_Latched());
+    newer_isr_sample.Check_Timeout(331);
+    assert(newer_isr_sample.Can_Run());
+    newer_isr_sample.Check_Timeout(332);
+    assert(!newer_isr_sample.Can_Run() && newer_isr_sample.Is_Fault_Latched());
+
     Class_Battery hardware_error;
     hardware_error.Stop();
     hardware_error.Update(24.0f, 0);

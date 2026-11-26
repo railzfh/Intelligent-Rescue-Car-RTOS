@@ -2019,6 +2019,31 @@ class MaixcamVisionAndUITest(unittest.TestCase):
         self.assertEqual(ui.handle_touch(btn_mode.x + 5, btn_mode.y + 5, True, tel_locked), "locked")
         self.assertEqual(ui.config.run_mode, MODE_BENCH_STRAIGHT)
 
+    def test_round14_tier3_concave_unknown_around_disconnected_known_block(self) -> None:
+        """R14 P2-5: Tier 3 must never subtract a disconnected known component inside a concave unknown's AABB."""
+        from types import SimpleNamespace
+
+        cfg = RescueVisionConfig()
+        img = _FakeMaixImage(320, 240, (85, 0, 0))
+        unknown_lab = (55, 0, 85)
+        # 128-pixel C-shaped unknown surrounding a disconnected 144-pixel green block.
+        img.fill_rect(120, 40, 45, 1, unknown_lab)
+        img.fill_rect(120, 41, 1, 38, unknown_lab)
+        img.fill_rect(120, 79, 45, 1, unknown_lab)
+        img.fill_rect(135, 55, 12, 12, (55, -35, 30))
+
+        exact = extract_blobs_from_maix_image(img, cfg, scan_unknown_near=True)
+        fallback = extract_blobs_from_maix_image(
+            SimpleNamespace(find_blobs=img.find_blobs), cfg, scan_unknown_near=True
+        )
+        self.assertTrue(any(b.label == "unknown" and b.pixels == 128 for b in exact))
+        self.assertTrue(any(b.label == "unknown" and b.pixels == 128 for b in fallback))
+        # The disconnected 144-pixel green block itself must remain recognized as green and NOT flagged as unknown!
+        self.assertTrue(any(b.label == "green" and b.pixels == 144 for b in fallback))
+        self.assertFalse(
+            any(b.label == "unknown" and (b.x, b.y, b.w, b.h) == (135, 55, 12, 12) for b in fallback)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

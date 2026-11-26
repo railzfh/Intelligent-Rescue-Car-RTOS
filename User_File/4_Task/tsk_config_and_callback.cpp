@@ -126,6 +126,11 @@ static volatile uint32_t Telemetry_Snapshot_Rx_Seq = 0U;
 static volatile uint32_t Can_Tx_Fault_Event_Seq = 0U;
 static volatile uint32_t Can_Tx_Fault_Reported_Seq = 0U;
 static volatile uint32_t Telemetry_Snapshot_Can_Seq = 0U;
+static volatile bool Telemetry_Tx_In_Flight = false;
+static volatile bool Telemetry_Tx_Ack_Rx = false;
+static volatile bool Telemetry_Tx_Ack_Can = false;
+static volatile uint32_t Telemetry_Tx_In_Flight_Rx_Seq = 0U;
+static volatile uint32_t Telemetry_Tx_In_Flight_Can_Seq = 0U;
 static bool Standstill_Zero_Tx_Armed[2] = {};
 static uint32_t Standstill_Zero_Tx_Buffer[2] = {};
 static bool Standstill_Zero_Tx_Occurred[2] = {};
@@ -658,9 +663,10 @@ static void Drive_Control()
     {
         const uint32_t commit_mask = __get_PRIMASK();
         __disable_irq();
-        // 在最终原子提交临界区内重新校验电池、CAN Bus-Off 与 UART RX 状态，防止采样后发生的
-        // ADC 故障中断、CAN 离线中断或 UART 异常中断与发车/扭矩/供电/遥测提交发生竞态。
-        Battery.Check_Timeout(now_ms);
+        // 在最终原子提交临界区内使用当前最新滴答重新校验电池、CAN 硬件/中断 Bus-Off 与 UART RX 状态，
+        // 防止采样后推进的 SysTick 或 ADC/CAN/UART 中断造成误超时或与发车/扭矩/供电/遥测提交发生竞态。
+        const uint32_t commit_now_ms = HAL_GetTick();
+        Battery.Check_Timeout(commit_now_ms);
         battery_ready = Battery.Can_Run();
         battery_fault = Battery.Is_Fault_Latched();
         pack_voltage = Battery.Get_Pack_Voltage();
@@ -811,8 +817,8 @@ static void Drive_Control()
             M2006[i].TIM_Calculate_PeriodElapsedCallback();
         }
 
-        const auto can1_status = can1_ready ? CAN_Transmit_Data(&hfdcan1, 0x200, CAN1_0x200_Tx_Data, FDCAN_DLC_BYTES_8) : HAL_OK;
-        const auto can2_status = can2_ready ? CAN_Transmit_Data(&hfdcan2, 0x200, CAN2_0x200_Tx_Data, FDCAN_DLC_BYTES_8) : HAL_OK;
+        const auto can1_status = (can1_ready && !can1_bus_off) ? CAN_Transmit_Data(&hfdcan1, 0x200, CAN1_0x200_Tx_Data, FDCAN_DLC_BYTES_8) : HAL_OK;
+        const auto can2_status = (can2_ready && !can2_bus_off) ? CAN_Transmit_Data(&hfdcan2, 0x200, CAN2_0x200_Tx_Data, FDCAN_DLC_BYTES_8) : HAL_OK;
         const bool can_tx_ok = (can1_status == HAL_OK && can2_status == HAL_OK);
         if (!can_tx_ok)
         {
@@ -968,6 +974,30 @@ static void Drive_Control()
     Drive_Notify_Buzzer(can_launch_commit, cmd.launch_rejected_cue, now_ms);
 }
 
+static void Telemetry_Uart_Tx_Callback(bool completed)
+{
+    const uint32_t irq_state = __get_PRIMASK();
+    __disable_irq();
+    if (Telemetry_Tx_In_Flight)
+    {
+        if (completed)
+        {
+            if (Telemetry_Tx_Ack_Rx)
+            {
+                Uart_Rx_Fault_Reported_Seq = Telemetry_Tx_In_Flight_Rx_Seq;
+            }
+            if (Telemetry_Tx_Ack_Can)
+            {
+                Can_Tx_Fault_Reported_Seq = Telemetry_Tx_In_Flight_Can_Seq;
+            }
+        }
+        Telemetry_Tx_In_Flight = false;
+        Telemetry_Tx_Ack_Rx = false;
+        Telemetry_Tx_Ack_Can = false;
+    }
+    __set_PRIMASK(irq_state);
+}
+
 static bool Telemetry_Service_Tx()
 {
     if (huart1.gState != HAL_UART_STATE_READY)
@@ -976,6 +1006,10 @@ static bool Telemetry_Service_Tx()
     }
     const uint32_t irq_state = __get_PRIMASK();
     __disable_irq();
+    // 若先前在途 DMA 未走完成回调便回到 READY（例如中途错误或被中止），丢弃未完成记录且不确认诊断。
+    Telemetry_Tx_In_Flight = false;
+    Telemetry_Tx_Ack_Rx = false;
+    Telemetry_Tx_Ack_Can = false;
     const Struct_Rescue_Telemetry tel = Telemetry_Snapshot;
     const uint32_t rx_seq_seen = Telemetry_Snapshot_Rx_Seq;
     const uint32_t can_seq_seen = Telemetry_Snapshot_Can_Seq;
@@ -987,22 +1021,21 @@ static bool Telemetry_Service_Tx()
     {
         return false;
     }
-    if (UART_Transmit_Data(&huart1, Telemetry_Tx_Buffer, static_cast<uint16_t>(len)) == HAL_OK)
+    const uint32_t arm_mask = __get_PRIMASK();
+    __disable_irq();
+    Telemetry_Tx_In_Flight = true;
+    Telemetry_Tx_Ack_Rx = ((tel.fault_flags & FAULT_FLAG_UART_RX) != 0U);
+    Telemetry_Tx_Ack_Can = ((tel.fault_flags & FAULT_FLAG_CAN_TX) != 0U);
+    Telemetry_Tx_In_Flight_Rx_Seq = rx_seq_seen;
+    Telemetry_Tx_In_Flight_Can_Seq = can_seq_seen;
+    __set_PRIMASK(arm_mask);
+
+    if (UART_Transmit_Data(&huart1, Telemetry_Tx_Buffer, static_cast<uint16_t>(len)) != HAL_OK)
     {
-        const uint32_t ack_mask = __get_PRIMASK();
-        __disable_irq();
-        if ((tel.fault_flags & FAULT_FLAG_UART_RX) != 0U)
-        {
-            Uart_Rx_Fault_Reported_Seq = rx_seq_seen;
-        }
-        if ((tel.fault_flags & FAULT_FLAG_CAN_TX) != 0U)
-        {
-            Can_Tx_Fault_Reported_Seq = can_seq_seen;
-        }
-        __set_PRIMASK(ack_mask);
-        return true;
+        Telemetry_Uart_Tx_Callback(false);
+        return false;
     }
-    return false;
+    return true;
 }
 
 static void Wait_For_Next_Period(uint32_t &wake_tick, uint32_t period)
@@ -1028,6 +1061,7 @@ void Task_Init()
 
     // MaixCAM UART1 双向通信（115200 8N1，仅信号与共地，不跨接供电）。
     UART_Init(&huart1, Vision_Uart_RxCallback);
+    UART_Set_Tx_Callback(&huart1, Telemetry_Uart_Tx_Callback);
 
     // 50 Hz 三线 PWM 舵机初始化（预装 50 Hz 周期与安全脉宽，但保持停波直到电池电压采样校验通过）。
     Servos_Started = false;
