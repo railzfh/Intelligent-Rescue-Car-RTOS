@@ -69,17 +69,17 @@
 ### 4.2 消息定义与新鲜度规则
 
 1. `0x01 MSG_HEARTBEAT`（MaixCAM → STM32，8 B）：`uptime_ms(u32)`, `camera_ok(u8)`, `ui_state(u8)`, `reserved(u16)`。
-   - **新鲜度硬约束**：心跳仅更新链路存活标志，**绝不刷新视觉观测时间戳，绝不续期运动控制**。
+   - **新鲜度硬约束**：心跳更新链路存活标志，但**绝不刷新视觉观测时间戳，绝不续期运动控制**。相机运行时间倒退（正常 32 位回绕除外）会立即废弃旧观测，由下一有效视觉帧建立新会话帧号。
 2. `0x02 MSG_SET_CONFIG`（MaixCAM → STM32，4 B）：`team(u8: 0未定/1红/2蓝)`, `start_zone(u8: 1..4)`, `run_mode(u8: 0比赛/1台架1m直行)`, `max_materials_per_trip(u8: 1..3)`。
    - 仅在 `PRE_MATCH` 未发车时生效；一键发车后配置立即锁定。
 3. `0x03 MSG_VISION_STATE`（MaixCAM → STM32，20 B，推荐 `20 Hz`）：
-   - `frame_seq(u16)`：相机单调递增帧号（16 位回绕安全）；**重复或倒退的旧 `frame_seq` 绝不刷新视觉新鲜度**（仅在视觉真实断联 `>= 1000 ms` 后允许相机重启从 `0..5` 重新同步）。
+   - `frame_seq(u16)`：相机单调递增帧号，支持正常 16 位回绕；重复帧和单个旧帧不能刷新视觉。无心跳重启信号时，静默 `>= 150 ms` 后倒退至 `0..5` 且帧号步长大于 `4`，或静默 `>= 1000 ms` 后倒退至 `0..32`（含小步长回绕），均需三次按节奏递增的观测才能重同步。新会话废弃待决的赛前、关杆和开杆到位确认。
    - `camera_view(u8)`：`0=TRANSITION`, `1=FAR`, `2=NEAR`；舵机切换期间 STM32 强制丢弃不匹配视角的观测。
    - `target_type(u8)`：`0=NONE`, `1=GREEN`, `2=BLACK`, `3=ORANGE`, `4=CYAN`。
    - `flags(u16)`：位掩码涵盖目标有效（bit 0）、本方区有效（bit 1）、半区匹配（bit 2）、紫坡可见（bit 3）、框内无危险块（bit 4）、右杆扫掠区清空（bit 5）、卸货完整入区确认（bit 6）、对手临近（bit 7）、对方安全区临近（bit 8）、后方清空（bit 9）、视觉停滞打滑（bit 10）、推进路径无危险/未知物（`VIS_FLAG_DROP_PATH_CLEAR`，bit 11）、开杆到位遥测回执（`VIS_FLAG_GATE_OPEN_SETTLED_ACK`，bit 12）、卸货前基线就绪（`VIS_FLAG_DROP_BASELINE_READY`，bit 13）。
      - `VIS_FLAG_DROP_PATH_CLEAR`：连续路径安全标志，确认本方区、关联紫坡、卸货区及前向推进走廊内无浅蓝危险块或未知前景；推进中自有合法货块移出围框边界不会误清该位，延迟的 `TEL_FLAG_DROP_PUSHING` 遥测不会误中止正常推进，但任一浅蓝/未知物出现即刻清零停机。
      - `VIS_FLAG_DROP_BASELINE_READY`：推进前基线授权标志，要求未进入显式推进态、本趟基线已清洁锁定且紫坡/中线无存量压线物块、当前框内货型与基线一致且路径无危险；MCU 在 `MISSION_DROP_OPEN_AND_PUSH` 的关杆核验与开杆等待阶段同时校验该位与 `VIS_FLAG_DROP_PATH_CLEAR`。
-     - `VIS_FLAG_GATE_OPEN_SETTLED_ACK`：**证明内容**：MaixCAM 已收到 MCU 遥测 `TEL_FLAG_GATE_CLOSED=0 && TEL_FLAG_GATE_SETTLED=1`，且 `VIS_FLAG_DROP_BASELINE_READY` 为真；MCU 另在 `gate_settled` 上升沿锁存 `Gate_Settled_Frame_Seq`，仅接受严格晚于该帧号且携带该 ACK 的近视帧才启动推进。**失效条件**：任一危险/未知物出现、货型变化、进入显式推进态（`TEL_FLAG_DROP_PUSHING`）、关杆/未到位、切回远视、离开卸货状态或超过 `vision_timeout_ms (300 ms)` 即刻失效。
+     - `VIS_FLAG_GATE_OPEN_SETTLED_ACK`：**证明内容**：MaixCAM 已收到开杆到位遥测和本次 2 位到位代号（`1..3`，视觉 `flags` 的 bit 14–15 回传，`0` 表示无回执），已排空旧图像且 `VIS_FLAG_DROP_BASELINE_READY` 为真。STM32 锁存到位时的本地接收计数 `Gate_Open_Settle_Accept_Id`，仅在此后新接收的近视帧携带该 ACK 且代号匹配时启动推进，不比较跨会话的 `frame_seq`。**失效条件**：视觉会话切换、任一危险/未知物出现、货型变化、进入显式推进态（`TEL_FLAG_DROP_PUSHING`）、关杆/未到位、切回远视、离开卸货状态或超过 `vision_timeout_ms (300 ms)` 即刻失效。
    - `target_err_x_mrad(i16)`、`target_dist_mm(u16)`、`home_err_x_mrad(i16)`、`home_dist_mm(u16)`（左偏为正，与车体 `+omega` 左转一致）。
    - `corral_{green,black,orange,cyan,unknown}_cnt(u8 × 5)`、`confidence(u8: 0..100)`。
    - **超时保护**：视觉有效超时默认 `300 ms`，超时即降速/停车，禁止盲跑。

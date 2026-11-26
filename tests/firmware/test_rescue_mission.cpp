@@ -165,6 +165,58 @@ static void Test_Vision_Restart_Evidence()
     assert(!near_wrap.On_Vision_State(far(1U), 1200U));
     assert(!near_wrap.On_Vision_State(far(2U), 1250U));
     assert(near_wrap.On_Vision_State(far(3U), 1300U));
+
+    // A small wrap is normal while the stream is live; after a long outage it needs a new fence.
+    Class_Rescue_Mission live_wrap;
+    assert(live_wrap.On_Vision_State(far(65534U), 1000U));
+    assert(live_wrap.On_Vision_State(far(1U), 1200U));
+    Class_Rescue_Mission quiet_wrap;
+    assert(quiet_wrap.On_Vision_State(far(65534U), 1000U));
+    assert(!quiet_wrap.On_Vision_State(far(1U), 2000U));
+    assert(!quiet_wrap.On_Vision_State(far(2U), 2050U));
+    assert(quiet_wrap.On_Vision_State(far(3U), 2100U));
+}
+
+static void Test_Delayed_Vision_Restart_Fences_Pre_Match()
+{
+    constexpr uint16_t prior_seqs[] = {50000U, 65500U};
+    for (uint16_t last : prior_seqs)
+    {
+        Class_Rescue_Mission m;
+        Struct_Mission_Inputs in{};
+        in.hardware_ready = in.can_launch = in.wheels_still = in.gate_settled = in.camera_settled = true;
+        assert(m.On_Set_Config({RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION, 1U}));
+        in.now_ms = 1000U;
+        m.Update(in);
+        const uint8_t old_gen = m.Get_Pre_Match_Settle_Gen();
+        assert(old_gen != 0U && m.Consume_Pre_Match_Rx_Fence());
+        auto far = [](uint16_t seq, uint8_t gen) {
+            return Make_Far_Vision(seq, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 0, 600U, gen);
+        };
+        assert(m.On_Vision_State(far(last, old_gen), 1050U));
+        in.now_ms = 1050U;
+        m.Update(in);
+        in.now_ms = 1400U;
+        m.Update(in);
+
+        in.button_pressed = true;
+        for (uint16_t seq = 10U; seq <= 12U; ++seq)
+        {
+            in.now_ms = 2200U + 50U * (seq - 10U);
+            assert(m.On_Vision_State(far(seq, old_gen), in.now_ms) == (seq == 12U));
+            assert(m.Update(in).launch_rejected_cue);
+            assert(m.Get_State() == MISSION_PRE_MATCH);
+        }
+        const uint8_t new_gen = m.Get_Pre_Match_Settle_Gen();
+        assert(new_gen != 0U && new_gen != old_gen && m.Consume_Pre_Match_Rx_Fence());
+        in.now_ms += 50U;
+        assert(m.On_Vision_State(far(13U, old_gen), in.now_ms));
+        assert(m.Update(in).launch_rejected_cue);
+        in.now_ms += 50U;
+        assert(m.On_Vision_State(far(14U, new_gen), in.now_ms));
+        assert(m.Update(in).drive_action == DRIVE_ACTION_START_DISTANCE);
+        assert(m.Get_State() == MISSION_LAUNCH_CROSS_BUMPS);
+    }
 }
 
 static void Test_Stale_Vision_And_Opponent_Interlock_During_Moving_States()
@@ -2090,9 +2142,11 @@ static void Test_Round12_Push_Same_Drain_Standstill_Bench_Leave_And_Interrupted_
     }
 
     // 9. Resync during close discards an incomplete confirmation streak and the old generation.
+    constexpr uint16_t prior_seqs[] = {500U, 50000U, 65500U};
+    for (uint16_t last : prior_seqs)
     {
         Harness h;
-        h.seq = 500U;
+        h.seq = last - 30U;
         h.to_inspect();
         for (unsigned i = 0; i < 3U; ++i)
         {
@@ -2104,19 +2158,31 @@ static void Test_Round12_Push_Same_Drain_Standstill_Bench_Leave_And_Interrupted_
         const uint8_t old_gen = h.m.Get_Gate_Close_Settle_Gen();
         assert(old_gen != 0U);
         const uint16_t old_ack = safe | Settle_Gen_Flag(old_gen);
+        h.seq = last - 1U;
         for (unsigned i = 0; i < 2U; ++i)
         {
             h.near(1U, old_ack);
             h.tick();
         }
-        h.t += 200U;
-        for (uint16_t seq = 1U; seq <= 3U; ++seq)
+        const uint16_t first = last == 500U ? 1U : 10U;
+        if (first == 1U)
         {
-            assert(h.m.On_Vision_State(Make_Near_Vision(seq, 1U, 0U, 0U, 0U, 0U, old_ack), h.t) == (seq == 3U));
+            h.t += 200U;
+        }
+        else
+        {
+            h.tick(350U);
+            h.tick(800U);
+        }
+        for (uint16_t seq = first; seq < first + 3U; ++seq)
+        {
+            assert(h.m.On_Vision_State(Make_Near_Vision(seq, 1U, 0U, 0U, 0U, 0U, old_ack), h.t) ==
+                   (seq == first + 2U));
             h.tick(50U);
+            assert(h.m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
         }
         assert(h.m.Get_Gate_Close_Settle_Gen() == 0U);
-        h.seq = 4U;
+        h.seq = first + 3U;
         h.near(1U, old_ack);
         h.tick();
         const uint8_t new_gen = h.m.Get_Gate_Close_Settle_Gen();
@@ -2132,22 +2198,39 @@ static void Test_Round12_Push_Same_Drain_Standstill_Bench_Leave_And_Interrupted_
         assert(h.m.Get_State() == MISSION_FIND_HOME);
     }
 
-    // 10. A heartbeat and the first new-session frame in the same drain still fence open-gate ACKs.
+    // 10. Both reboot signals fence open-gate ACKs, even when the new session arrives in the same drain.
+    for (uint16_t last : prior_seqs)
     {
         Harness h;
-        h.seq = 500U;
+        h.seq = last - 30U;
         h.to_opening();
+        h.seq = last;
         h.near(1U, aligned);
         h.tick();
         const uint8_t old_gen = h.m.Get_Gate_Open_Settle_Gen();
         assert(old_gen != 0U);
-        h.m.On_Heartbeat({4000U, 1U, 1U, 0U}, h.t);
-        h.t += 50U;
-        h.m.On_Heartbeat({20U, 1U, 1U, 0U}, h.t);
-        assert(h.m.Get_Gate_Open_Settle_Gen() == 0U);
         const uint16_t old_ack = aligned | VIS_FLAG_GATE_OPEN_SETTLED_ACK | Settle_Gen_Flag(old_gen);
-        h.seq = 1U;
+        if (last == 500U)
+        {
+            h.m.On_Heartbeat({4000U, 1U, 1U, 0U}, h.t);
+            h.t += 50U;
+            h.m.On_Heartbeat({20U, 1U, 1U, 0U}, h.t);
+            assert(h.m.Get_Gate_Open_Settle_Gen() == 0U);
+            h.seq = 1U;
+        }
+        else
+        {
+            h.tick(350U);
+            h.tick(800U);
+            for (uint16_t seq = 10U; seq < 12U; ++seq)
+            {
+                assert(!h.m.On_Vision_State(Make_Near_Vision(seq, 1U, 0U, 0U, 0U, 0U, old_ack), h.t));
+                assert(h.tick(50U).drive_action == DRIVE_ACTION_SOFT_STOP);
+            }
+            h.seq = 12U;
+        }
         h.near(1U, old_ack);
+        assert(h.m.Get_Gate_Open_Settle_Gen() == 0U);
         assert(h.tick().drive_action == DRIVE_ACTION_SOFT_STOP);
         h.near(1U, aligned);
         assert(h.tick().drive_action == DRIVE_ACTION_SOFT_STOP);
@@ -2157,7 +2240,7 @@ static void Test_Round12_Push_Same_Drain_Standstill_Bench_Leave_And_Interrupted_
         assert(h.tick().drive_action == DRIVE_ACTION_SOFT_STOP);
         // A generation match on a duplicate cannot satisfy the post-settle observation.
         const uint16_t new_ack = aligned | VIS_FLAG_GATE_OPEN_SETTLED_ACK | Settle_Gen_Flag(new_gen);
-        assert(!h.m.On_Vision_State(Make_Near_Vision(3U, 1U, 0U, 0U, 0U, 0U, new_ack), h.t));
+        assert(!h.m.On_Vision_State(Make_Near_Vision(h.seq - 1U, 1U, 0U, 0U, 0U, 0U, new_ack), h.t));
         assert(h.tick().drive_action == DRIVE_ACTION_SOFT_STOP);
         h.near(1U, new_ack);
         const auto out = h.tick();
@@ -2169,6 +2252,7 @@ int main()
 {
     Test_Freshness_Nonconsecutive_Replay_Wrap_And_Restart();
     Test_Vision_Restart_Evidence();
+    Test_Delayed_Vision_Restart_Fences_Pre_Match();
     Test_Stale_Vision_And_Opponent_Interlock_During_Moving_States();
     Test_Cyan_Interrupts_Unsettled_Gate_Closure();
     Test_Full_First_Green_Delivery_And_Proven_Rear_Corridor();

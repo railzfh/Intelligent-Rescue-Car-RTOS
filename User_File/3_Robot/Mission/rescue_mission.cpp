@@ -104,23 +104,19 @@ bool Class_Rescue_Mission::Accept_Vision_Sequence(uint16_t seq, uint32_t now_ms)
     Restart_Candidate_Count = 0U;
 
     const uint32_t quiet_ms = now_ms - Last_Vision_Ms;
-    const bool forward = delta < 0x8000U;
-    // Keep normal small uint16 wraps forward. A jump to startup seq after a quiet gap can
-    // look forward modulo uint16 even though the camera rebooted near the end of its range.
+    // A rollback to startup can look forward modulo uint16. Only a short-gap, small wrap
+    // bypasses startup confirmation; a long outage fences even an otherwise plausible wrap.
     const bool startup_rollback = quiet_ms >= Restart_Quiet_Ms && seq <= Restart_Startup_Seq_Max &&
-                                  seq < Last_Vision_Frame_Seq && delta > Restart_Max_Seq_Step;
-    if (forward && !startup_rollback)
-    {
-        return true;
-    }
-    const bool delayed_rollback = seq <= Restart_Delayed_Seq_Max && quiet_ms >= Config.camera_restart_resync_ms;
-    if (startup_rollback || delayed_rollback)
+                                  delta > Restart_Max_Seq_Step;
+    const bool delayed_rollback = quiet_ms >= Config.camera_restart_resync_ms && seq <= Restart_Delayed_Seq_Max;
+    if (seq < Last_Vision_Frame_Seq && (startup_rollback || delayed_rollback))
     {
         Restart_Candidate_Seq = seq;
         Restart_Candidate_Ms = now_ms;
         Restart_Candidate_Count = 1U;
+        return false;
     }
-    return false;
+    return delta < 0x8000U;
 }
 
 bool Class_Rescue_Mission::On_Vision_State(const Struct_Vision_State &vis, uint32_t now_ms)
