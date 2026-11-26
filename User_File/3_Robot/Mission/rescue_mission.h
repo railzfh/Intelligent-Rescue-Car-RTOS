@@ -129,6 +129,7 @@ public:
     void On_Uart_Rx_Fault();
     void Latch_Standstill_Boundary(const uint32_t motor_seq[2], const uint32_t motor_ms[2]);
     void Fault_Stop(uint32_t now_ms);
+    void Abort_Failed_Launch(uint32_t now_ms, bool enter_fault_stop);
 
     Struct_Mission_Output Update(const Struct_Mission_Inputs &in);
 
@@ -149,6 +150,8 @@ public:
     bool Is_Camera_Near_Cmd() const { return Camera_Near_Cmd; }
     bool Is_Drop_Pushing() const { return State == MISSION_DROP_OPEN_AND_PUSH && Sub_Phase == 2U; }
     bool Is_Standstill_Gate_Pending_Boundary() const { return Require_Standstill_Gate && Standstill_Boundary_Pending; }
+    uint8_t Get_Pre_Match_Settle_Gen() const { return Pre_Match_Settle_Gen; }
+    bool Consume_Pre_Match_Rx_Fence();
     uint32_t Get_Match_Elapsed_Ms(uint32_t now_ms) const;
     uint8_t Get_Delivered_Green() const { return Delivered_Green; }
     uint8_t Get_Delivered_Black() const { return Delivered_Black; }
@@ -216,6 +219,9 @@ private:
     bool Pre_Match_Wait_Servo_Apply = false;
     bool Pre_Match_Settled_Latched = false;
     bool Pre_Match_Need_Post_Settle_Far = false;
+    bool Pre_Match_Rx_Fence_Pending = false;
+    uint8_t Pre_Match_Settle_Gen = 0U;
+    uint8_t Pre_Match_Last_Gen = 0U;
     uint32_t Pre_Match_Settle_Accept_Id = 0U;
 
     uint32_t Confirm_Boundary_Accept_Id = 0U;

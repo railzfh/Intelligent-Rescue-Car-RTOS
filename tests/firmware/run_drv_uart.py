@@ -11,6 +11,9 @@ out.mkdir(parents=True, exist_ok=True)
     r'''#ifndef MOCK_STM32H7XX_HAL_H
 #define MOCK_STM32H7XX_HAL_H
 #include <stdint.h>
+static inline uint32_t __get_PRIMASK() { return 0U; }
+static inline void __disable_irq() {}
+static inline void __set_PRIMASK(uint32_t) {}
 static inline void __DMB() {}
 #endif
 ''',
@@ -334,24 +337,41 @@ int main() {
     assert(!UART_Service_Rx_Recovery(&huart1));
     assert(hdmarx.init_calls == init_before); // Latched fault stops retrying wedged stream!
 
-    // 6. TX completion / abort / RX-only error callback dispatch (R14 P2-4).
+    // 6. TX completion / abort / RX-only error callback dispatch (R14 P2-4 & R15 P2-3).
     const int fail_before = tx_fail_count;
-    huart1.gState = HAL_UART_STATE_BUSY_TX;
-    // RX error while TX is still BUSY_TX MUST NOT report TX failure.
+    // RX error when NO TX is active (gState == READY, Tx_Active == false) MUST NOT report TX failure!
+    huart1.gState = HAL_UART_STATE_READY;
     HAL_UART_ErrorCallback(&huart1);
     assert(tx_fail_count == fail_before && tx_ok_count == 0);
-    // Genuine TX completion notifies completed=true.
+
+    // Active TX started via UART_Transmit_Data:
+    assert(UART_Transmit_Data(&huart1, tx_dummy, 4U) == HAL_OK);
+    assert(huart1.gState == HAL_UART_STATE_BUSY_TX);
+    // RX error while TX is still BUSY_TX MUST NOT report TX failure!
+    HAL_UART_ErrorCallback(&huart1);
+    assert(tx_fail_count == fail_before && tx_ok_count == 0);
+    // Genuine TX completion notifies completed=true exactly once.
     huart1.gState = HAL_UART_STATE_READY;
     HAL_UART_TxCpltCallback(&huart1);
+    HAL_UART_TxCpltCallback(&huart1); // Duplicate after inactive is ignored.
     assert(tx_ok_count == 1 && tx_fail_count == fail_before);
-    // Abort transmit notifies completed=false.
+
+    // Active TX terminated by AbortTransmit notifies completed=false once.
+    assert(UART_Transmit_Data(&huart1, tx_dummy, 4U) == HAL_OK);
+    huart1.gState = HAL_UART_STATE_READY;
     HAL_UART_AbortTransmitCpltCallback(&huart1);
     assert(tx_fail_count == fail_before + 1);
-    // Error callback with gState==READY (TX terminated by UART_DMAError) notifies completed=false.
+
+    // Active TX terminated by UART_DMAError (gState returned to READY while Tx_Active == true) notifies completed=false once.
+    assert(UART_Transmit_Data(&huart1, tx_dummy, 4U) == HAL_OK);
+    huart1.gState = HAL_UART_STATE_READY;
+    HAL_UART_ErrorCallback(&huart1);
+    assert(tx_fail_count == fail_before + 2);
+    // Subsequent RX error while idle STILL does not fire TX failure.
     HAL_UART_ErrorCallback(&huart1);
     assert(tx_fail_count == fail_before + 2);
 
-    std::puts("PASS: drv_uart HT guard, HAL-faithful DMA ERROR DeInit/Init recovery, wedged-stream latch, and TX completion/abort callbacks");
+    std::puts("PASS: drv_uart HT guard, HAL-faithful DMA ERROR DeInit/Init recovery, wedged-stream latch, and active-TX callback gating");
     return 0;
 }
 ''',

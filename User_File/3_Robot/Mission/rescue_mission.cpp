@@ -42,6 +42,7 @@ bool Class_Rescue_Mission::On_Set_Config(const Struct_Match_Config_Cmd &cfg)
         Pre_Match_Wait_Servo_Apply = true;
         Pre_Match_Settled_Latched = false;
         Pre_Match_Need_Post_Settle_Far = true;
+        Pre_Match_Settle_Gen = 0U;
         Pre_Match_Settle_Accept_Id = Vision_Accept_Counter;
     }
     return true;
@@ -220,6 +221,33 @@ void Class_Rescue_Mission::Fault_Stop(uint32_t now_ms)
     }
 }
 
+void Class_Rescue_Mission::Abort_Failed_Launch(uint32_t now_ms, bool enter_fault_stop)
+{
+    Config_Locked = false;
+    Match_Start_Ms = 0U;
+    Match_Final_Elapsed_Ms = 0U;
+    Clear_Cargo();
+    Proven_Rear_Clear_M = 0.0f;
+    Proven_Rear_Yaw_Accum_Rad = 0.0f;
+    Gate_Closed_Cmd = false;
+    Camera_Near_Cmd = false;
+    Reverse_Motion_In_Flight = false;
+    Require_Standstill_Gate = false;
+    Standstill_Boundary_Pending = false;
+    Pre_Match_Settle_Gen = 0U;
+    Pre_Match_Settled_Latched = false;
+    Pre_Match_Need_Post_Settle_Far = true;
+    Pre_Match_Settle_Accept_Id = Vision_Accept_Counter;
+    Enter_State(enter_fault_stop ? MISSION_FAULT_STOP : MISSION_PRE_MATCH, now_ms);
+}
+
+bool Class_Rescue_Mission::Consume_Pre_Match_Rx_Fence()
+{
+    const bool pending = Pre_Match_Rx_Fence_Pending;
+    Pre_Match_Rx_Fence_Pending = false;
+    return pending;
+}
+
 bool Class_Rescue_Mission::Is_Vision_Fresh(uint32_t now_ms) const
 {
     return Vision_Received && !Vision_Invalidated_By_Rx_Fault &&
@@ -326,6 +354,11 @@ void Class_Rescue_Mission::Enter_State(Enum_Mission_State next, uint32_t now_ms)
     Gate_Open_Settled_Latched = false;
     Gate_Settled_Frame_Seq = 0U;
     Pre_Match_Settled_Latched = false;
+    if (next != MISSION_PRE_MATCH)
+    {
+        Pre_Match_Settle_Gen = 0U;
+        Pre_Match_Rx_Fence_Pending = false;
+    }
     Pending_Non_Near_View_Event = false;
     Pending_Non_Far_View_Event = false;
     Pending_Near_Hazard_Event = false;
@@ -836,32 +869,39 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         {
             Gate_Closed_Cmd = false;
             Camera_Near_Cmd = false;
+            const uint8_t vis_pre_match_gen = static_cast<uint8_t>(
+                (Latest_Vision.flags & VIS_FLAG_PRE_MATCH_GEN_MASK) >> VIS_FLAG_PRE_MATCH_GEN_SHIFT);
             if (Pre_Match_Wait_Servo_Apply)
             {
                 // This tick's settled bits still belong to the previous (bench) servo targets;
-                // command open/FAR first and require settled observation + a later FAR frame.
+                // command open/FAR first and require settled observation + post-settle capture ack.
                 Pre_Match_Wait_Servo_Apply = false;
                 Pre_Match_Settled_Latched = false;
                 Pre_Match_Need_Post_Settle_Far = true;
+                Pre_Match_Settle_Gen = 0U;
                 Pre_Match_Settle_Accept_Id = Vision_Accept_Counter;
             }
             else if (!in.gate_settled || !in.camera_settled)
             {
                 Pre_Match_Settled_Latched = false;
                 Pre_Match_Need_Post_Settle_Far = true;
+                Pre_Match_Settle_Gen = 0U;
                 Pre_Match_Settle_Accept_Id = Vision_Accept_Counter;
             }
             else if (!Pre_Match_Settled_Latched)
             {
-                // First tick observing BOTH open and FAR targets settled: record settled status and,
-                // when waiting for post-settle vision (e.g. cold boot or bench exit) or missing fresh
-                // vision, anchor Vision_Accept_Counter AFTER this tick's RX drain and refuse launch on
-                // this boundary tick so any FAR frame queued before settling cannot authorize launch.
+                // First tick observing BOTH open and FAR targets settled: advance the 2-bit non-zero
+                // settle generation (1..3), fence any buffered/partial UART RX bytes, and refuse launch
+                // on this boundary tick when waiting for post-settle vision so only a genuinely new FAR
+                // frame acknowledging this transition's generation can authorize launch.
                 Pre_Match_Settled_Latched = true;
+                Pre_Match_Last_Gen = static_cast<uint8_t>((Pre_Match_Last_Gen % 3U) + 1U);
+                Pre_Match_Settle_Gen = Pre_Match_Last_Gen;
                 if (Pre_Match_Need_Post_Settle_Far || !vision_fresh)
                 {
                     Pre_Match_Need_Post_Settle_Far = true;
                     Pre_Match_Settle_Accept_Id = Vision_Accept_Counter;
+                    Pre_Match_Rx_Fence_Pending = true;
                 }
             }
             else if (!vision_fresh)
@@ -871,13 +911,22 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             }
             else if (Pre_Match_Need_Post_Settle_Far && !non_far_view_event &&
                      Latest_Vision.camera_view == CAMERA_VIEW_FAR &&
-                     Vision_Accept_Counter != Pre_Match_Settle_Accept_Id)
+                     Vision_Accept_Counter != Pre_Match_Settle_Accept_Id &&
+                     Pre_Match_Settle_Gen != 0U &&
+                     vis_pre_match_gen == Pre_Match_Settle_Gen)
             {
                 Pre_Match_Need_Post_Settle_Far = false;
             }
         }
+        else
+        {
+            Pre_Match_Settle_Gen = 0U;
+            Pre_Match_Settled_Latched = false;
+        }
         if (in.button_pressed && in.can_launch)
         {
+            const uint8_t launch_ack_gen = static_cast<uint8_t>(
+                (Latest_Vision.flags & VIS_FLAG_PRE_MATCH_GEN_MASK) >> VIS_FLAG_PRE_MATCH_GEN_SHIFT);
             if (Run_Mode == RESCUE_MODE_BENCH_STRAIGHT)
             {
                 Enter_State(MISSION_BENCH_STRAIGHT, in.now_ms);
@@ -890,7 +939,9 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                      in.gate_settled && in.camera_settled &&
                      !non_far_view_event &&
                      Latest_Vision.camera_view == CAMERA_VIEW_FAR &&
-                     !Pre_Match_Need_Post_Settle_Far)
+                     !Pre_Match_Need_Post_Settle_Far &&
+                     Pre_Match_Settle_Gen != 0U &&
+                     launch_ack_gen == Pre_Match_Settle_Gen)
             {
                 Config_Locked = true;
                 Match_Start_Ms = in.now_ms;

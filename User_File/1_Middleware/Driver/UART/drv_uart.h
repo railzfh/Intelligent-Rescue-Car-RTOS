@@ -61,6 +61,7 @@ struct Struct_UART_Manage_Object
     volatile bool Rx_Recovery_Fault_Latched;
     volatile uint32_t Rx_Recovery_Epoch;
     uint8_t Rx_Recovery_Fail_Count;
+    volatile bool Tx_Active;
 };
 
 /* Exported variables --------------------------------------------------------*/

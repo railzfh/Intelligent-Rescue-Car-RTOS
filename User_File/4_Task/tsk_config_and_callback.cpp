@@ -688,9 +688,9 @@ static void Drive_Control()
         const bool servos_ready_commit =
             Servos_Started && !Servos_Fault_Latched && Gate_Servo.Is_Enabled() && Pitch_Servo.Is_Enabled();
 
-        const bool can1_bus_off = CAN_Consume_Bus_Off(&hfdcan1);
-        const bool can2_bus_off = CAN_Consume_Bus_Off(&hfdcan2);
-        const bool can_bus_off = can1_bus_off || can2_bus_off;
+        bool can1_bus_off = CAN_Consume_Bus_Off(&hfdcan1);
+        bool can2_bus_off = CAN_Consume_Bus_Off(&hfdcan2);
+        bool can_bus_off = can1_bus_off || can2_bus_off;
         if (can_bus_off)
         {
             Standstill_Zero_Tx_Armed[0] = Standstill_Zero_Tx_Armed[1] = false;
@@ -754,6 +754,12 @@ static void Drive_Control()
         mission_in.use_motor_feedback_seq = true;
 
         cmd = Rescue_Mission.Update(mission_in);
+        if (Rescue_Mission.Consume_Pre_Match_Rx_Fence())
+        {
+            // Fence any partial parser state and queued RX bytes from before open/FAR settled.
+            Vision_Rx_Tail = Vision_Rx_Head;
+            reset_parser_after_commit = true;
+        }
 
         if (servos_ready_commit)
         {
@@ -817,23 +823,93 @@ static void Drive_Control()
             M2006[i].TIM_Calculate_PeriodElapsedCallback();
         }
 
-        const auto can1_status = (can1_ready && !can1_bus_off) ? CAN_Transmit_Data(&hfdcan1, 0x200, CAN1_0x200_Tx_Data, FDCAN_DLC_BYTES_8) : HAL_OK;
-        const auto can2_status = (can2_ready && !can2_bus_off) ? CAN_Transmit_Data(&hfdcan2, 0x200, CAN2_0x200_Tx_Data, FDCAN_DLC_BYTES_8) : HAL_OK;
-        const bool can_tx_ok = (can1_status == HAL_OK && can2_status == HAL_OK);
-        if (!can_tx_ok)
+        bool can1_bus_off_now = can1_bus_off || CAN_Consume_Bus_Off(&hfdcan1);
+        bool can2_bus_off_now = can2_bus_off || CAN_Consume_Bus_Off(&hfdcan2);
+        bool can1_submitted = false;
+        bool can2_submitted = false;
+        uint8_t can1_status = HAL_OK;
+        uint8_t can2_status = HAL_OK;
+
+        if (!can1_bus_off_now && !can2_bus_off_now)
         {
-            // CAN 发送失败必须立即锁停任务，防止下一周期自动恢复扭矩；并在可用总线上立刻补发零扭矩。
+            if (can1_ready)
+            {
+                can1_status = CAN_Transmit_Data(&hfdcan1, 0x200, CAN1_0x200_Tx_Data, FDCAN_DLC_BYTES_8);
+                can1_submitted = (can1_status == HAL_OK);
+            }
+            // Recheck BOTH buses between CAN1 and CAN2 submissions (masking CPU IRQs does not freeze FDCAN hardware).
+            can1_bus_off_now = can1_bus_off_now || CAN_Consume_Bus_Off(&hfdcan1);
+            can2_bus_off_now = can2_bus_off_now || CAN_Consume_Bus_Off(&hfdcan2);
+            if (!can1_bus_off_now && !can2_bus_off_now && can1_status == HAL_OK && can2_ready)
+            {
+                can2_status = CAN_Transmit_Data(&hfdcan2, 0x200, CAN2_0x200_Tx_Data, FDCAN_DLC_BYTES_8);
+                can2_submitted = (can2_status == HAL_OK);
+            }
+        }
+        else
+        {
+            // Already bus-off before TX: torque is 0.0f; still send zero torque on any healthy ready bus.
+            if (can1_ready && !can1_bus_off_now)
+            {
+                can1_status = CAN_Transmit_Data(&hfdcan1, 0x200, CAN1_0x200_Tx_Data, FDCAN_DLC_BYTES_8);
+                can1_submitted = (can1_status == HAL_OK);
+            }
+            if (can2_ready && !can2_bus_off_now)
+            {
+                can2_status = CAN_Transmit_Data(&hfdcan2, 0x200, CAN2_0x200_Tx_Data, FDCAN_DLC_BYTES_8);
+                can2_submitted = (can2_status == HAL_OK);
+            }
+        }
+
+        // Recheck BOTH buses immediately after submissions to catch a Bus-Off raised during the second TX request.
+        can1_bus_off_now = can1_bus_off_now || CAN_Consume_Bus_Off(&hfdcan1);
+        can2_bus_off_now = can2_bus_off_now || CAN_Consume_Bus_Off(&hfdcan2);
+        const bool late_bus_off = !can_bus_off && (can1_bus_off_now || can2_bus_off_now);
+        can1_bus_off = can1_bus_off_now;
+        can2_bus_off = can2_bus_off_now;
+        can_bus_off = can1_bus_off || can2_bus_off;
+        const bool can_tx_ok = (can1_status == HAL_OK && can2_status == HAL_OK);
+        if (!can_tx_ok || late_bus_off)
+        {
+            // CAN 发送失败或提交窗口内发生 Bus-Off：立即取消在途请求、撤销未提交发车或锁停任务，并在健康总线上补发零扭矩。
+            Standstill_Zero_Tx_Armed[0] = Standstill_Zero_Tx_Armed[1] = false;
+            Standstill_Zero_Tx_Occurred[0] = Standstill_Zero_Tx_Occurred[1] = false;
             Can_Tx_Fault_Event_Seq = Can_Tx_Fault_Event_Seq + 1U;
+            ready = false;
+            can_launch_commit = false;
             Straight_Drive.Stop();
             Chassis_Drive.Emergency_Stop();
-            Rescue_Mission.Fault_Stop(now_ms);
+
+            const uint32_t pending_buf1 = HAL_FDCAN_GetLatestTxFifoQRequestBuffer(&hfdcan1);
+            if (pending_buf1 != 0U && HAL_FDCAN_IsTxBufferMessagePending(&hfdcan1, pending_buf1))
+            {
+                HAL_FDCAN_AbortTxRequest(&hfdcan1, pending_buf1);
+            }
+            const uint32_t pending_buf2 = HAL_FDCAN_GetLatestTxFifoQRequestBuffer(&hfdcan2);
+            if (pending_buf2 != 0U && HAL_FDCAN_IsTxBufferMessagePending(&hfdcan2, pending_buf2))
+            {
+                HAL_FDCAN_AbortTxRequest(&hfdcan2, pending_buf2);
+            }
+
+            const bool nonzero_submitted_to_healthy =
+                (torque[0] != 0.0f && can1_submitted && !can1_bus_off) ||
+                (torque[1] != 0.0f && can2_submitted && !can2_bus_off);
+            if (prev_state == MISSION_PRE_MATCH && Rescue_Mission.Get_State() != MISSION_PRE_MATCH)
+            {
+                Rescue_Mission.Abort_Failed_Launch(now_ms, nonzero_submitted_to_healthy);
+            }
+            else
+            {
+                Rescue_Mission.Fault_Stop(now_ms);
+            }
+            torque = {0.0f, 0.0f};
             for (uint8_t i = 0; i < 2; ++i)
             {
                 M2006[i].Set_Target_Torque(0.0f);
                 M2006[i].TIM_Calculate_PeriodElapsedCallback();
             }
-            const bool can1_zero_ok = Drive_Tx_Ready(hfdcan1);
-            const bool can2_zero_ok = Drive_Tx_Ready(hfdcan2);
+            const bool can1_zero_ok = !can1_bus_off && Drive_Tx_Ready(hfdcan1);
+            const bool can2_zero_ok = !can2_bus_off && Drive_Tx_Ready(hfdcan2);
             if (can1_status == HAL_OK && can1_zero_ok)
             {
                 CAN_Transmit_Data(&hfdcan1, 0x200, CAN1_0x200_Tx_Data, FDCAN_DLC_BYTES_8);
@@ -929,6 +1005,14 @@ static void Drive_Control()
         if (Rescue_Mission.Is_Link_Alive(now_ms)) { status_flags |= TEL_FLAG_LINK_ALIVE; }
         if (Rescue_Mission.Is_Carrying_Casualty()) { status_flags |= TEL_FLAG_CARRYING_CASUALTY; }
         if (Rescue_Mission.Is_Drop_Pushing()) { status_flags |= TEL_FLAG_DROP_PUSHING; }
+        if (Rescue_Mission.Get_State() == MISSION_PRE_MATCH &&
+            !Rescue_Mission.Is_Gate_Closed_Cmd() && !Rescue_Mission.Is_Camera_Near_Cmd() &&
+            (status_flags & TEL_FLAG_GATE_SETTLED) != 0U &&
+            (status_flags & TEL_FLAG_CAMERA_SETTLED) != 0U)
+        {
+            status_flags |= static_cast<uint16_t>(
+                (Rescue_Mission.Get_Pre_Match_Settle_Gen() & 0x3U) << TEL_FLAG_PRE_MATCH_GEN_SHIFT);
+        }
         tel.status_flags = status_flags;
 
         const bool rx_diag_pending = (Uart_Rx_Fault_Event_Seq != Uart_Rx_Fault_Reported_Seq);
@@ -1023,19 +1107,25 @@ static bool Telemetry_Service_Tx()
     }
     const uint32_t arm_mask = __get_PRIMASK();
     __disable_irq();
+    if (huart1.gState != HAL_UART_STATE_READY)
+    {
+        __set_PRIMASK(arm_mask);
+        return false;
+    }
     Telemetry_Tx_In_Flight = true;
     Telemetry_Tx_Ack_Rx = ((tel.fault_flags & FAULT_FLAG_UART_RX) != 0U);
     Telemetry_Tx_Ack_Can = ((tel.fault_flags & FAULT_FLAG_CAN_TX) != 0U);
     Telemetry_Tx_In_Flight_Rx_Seq = rx_seq_seen;
     Telemetry_Tx_In_Flight_Can_Seq = can_seq_seen;
-    __set_PRIMASK(arm_mask);
-
-    if (UART_Transmit_Data(&huart1, Telemetry_Tx_Buffer, static_cast<uint16_t>(len)) != HAL_OK)
+    const uint8_t tx_status = UART_Transmit_Data(&huart1, Telemetry_Tx_Buffer, static_cast<uint16_t>(len));
+    if (tx_status != HAL_OK)
     {
-        Telemetry_Uart_Tx_Callback(false);
-        return false;
+        Telemetry_Tx_In_Flight = false;
+        Telemetry_Tx_Ack_Rx = false;
+        Telemetry_Tx_Ack_Can = false;
     }
-    return true;
+    __set_PRIMASK(arm_mask);
+    return (tx_status == HAL_OK);
 }
 
 static void Wait_For_Next_Period(uint32_t &wake_tick, uint32_t period)

@@ -33,6 +33,7 @@ from .protocol import (
     VIS_FLAG_MOTION_STALLED,
     VIS_FLAG_OPPONENT_NEAR,
     VIS_FLAG_OPPONENT_ZONE_NEAR,
+    VIS_FLAG_PRE_MATCH_GEN_SHIFT,
     VIS_FLAG_RAMP_VISIBLE,
     VIS_FLAG_REAR_CLEAR,
     VIS_FLAG_SWEEP_CLEAR,
@@ -784,6 +785,7 @@ class RescueVisionProcessor:
         gate_settled: Optional[bool] = None,
         drop_pushing: bool = False,
         wheels_moving: bool = False,
+        pre_match_settle_gen: int = 0,
     ) -> VisionState:
         self._frame_seq = (self._frame_seq + 1) & 0xFFFF
         view = CAMERA_VIEW_TRANSITION
@@ -853,6 +855,14 @@ class RescueVisionProcessor:
                 flags |= VIS_FLAG_HOME_HALF_MATCH
 
         if view == CAMERA_VIEW_FAR:
+            if (
+                not camera_near_cmd
+                and camera_settled
+                and gate_closed is False
+                and gate_settled is True
+                and 1 <= pre_match_settle_gen <= 3
+            ):
+                flags |= (pre_match_settle_gen & 0x3) << VIS_FLAG_PRE_MATCH_GEN_SHIFT
             best = self._select_best_target(blocks, first_green_unlocked, hazards)
             if best is not None:
                 flags |= VIS_FLAG_TARGET_VALID
@@ -2512,14 +2522,45 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                         other_fgs.append((cx, cy, cw, ch, cpx))
                 membership_uncertain = (not merge_fg and not matched_self) or (merge_fg and total_box_fg_px != px)
 
-                def _proven_on_fg(candidate: Blob) -> bool:
+                def _proven_sub_on_fg(candidate: Blob, thresh: Optional[Sequence[int]]) -> Optional[Blob]:
                     if membership_uncertain:
-                        return False
+                        return None
                     if not other_fgs:
-                        return True
-                    return not any(
-                        _rects_intersect(candidate.x, candidate.y, candidate.w, candidate.h, ox, oy, ow, oh)
-                        for ox, oy, ow, oh, _ in other_fgs
+                        return candidate
+                    overlap_other_px = 0
+                    for ox, oy, ow, oh, _ in other_fgs:
+                        inter = _rect_intersection(
+                            candidate.x, candidate.y, candidate.w, candidate.h, ox, oy, ow, oh
+                        )
+                        if inter is None:
+                            continue
+                        if thresh is None:
+                            # Cannot verify pixel occupancy inside other_fg without a threshold: fail closed.
+                            return None
+                        ix1, iy1, ix2, iy2 = inter
+                        iw, ih = max(1, ix2 - ix1), max(1, iy2 - iy1)
+                        hits = _find_blobs_unit_stride(
+                            img,
+                            [tuple(thresh)],
+                            roi=(ix1, iy1, iw, ih),
+                            pixels_threshold=1,
+                            area_threshold=1,
+                            merge=True,
+                        )
+                        overlap_other_px += sum(int(h.pixels()) for h in hits)
+                    if overlap_other_px <= 0:
+                        return candidate
+                    proven_px = max(0, candidate.pixels - overlap_other_px)
+                    if proven_px <= 0:
+                        return None
+                    return Blob(
+                        candidate.label,
+                        candidate.x,
+                        candidate.y,
+                        candidate.w,
+                        candidate.h,
+                        proven_px,
+                        min(1.0, proven_px / float(max(1, candidate.w * candidate.h))),
                     )
 
                 roi_surfaces: List[Blob] = []
@@ -2531,11 +2572,13 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                     if not parent_surfaces:
                         continue
                     for sub in _extract_roi_blobs_for_label(img, surface_label, thresh, fg_roi):
-                        if _proven_on_fg(sub) and any(
+                        if any(
                             _rects_intersect(sub.x, sub.y, sub.w, sub.h, p.x, p.y, p.w, p.h)
                             for p in parent_surfaces
                         ):
-                            roi_surfaces.append(sub)
+                            proven = _proven_sub_on_fg(sub, thresh)
+                            if proven is not None:
+                                roi_surfaces.append(proven)
 
                 roi_objects: List[Blob] = []
                 for obj_label in _OBJECT_LABELS:
@@ -2546,17 +2589,25 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                     if not parent_objs:
                         continue
                     for sub in _extract_roi_blobs_for_label(img, obj_label, thresh, fg_roi):
-                        if _proven_on_fg(sub) and any(
+                        if any(
                             _rects_intersect(sub.x, sub.y, sub.w, sub.h, p.x, p.y, p.w, p.h) for p in parent_objs
                         ):
-                            roi_objects.append(sub)
+                            proven = _proven_sub_on_fg(sub, thresh)
+                            if proven is not None:
+                                roi_objects.append(proven)
 
                 roi_accounted: List[Blob] = []
                 fx2, fy2 = fx + fg_w, fy + fg_h
                 for cl_pts, (ax1, ay1, ax2, ay2) in accounted_clusters:
-                    if not _rects_intersect(fx, fy, fg_w, fg_h, ax1, ay1, ax2 - ax1, ay2 - ay1):
+                    if membership_uncertain or not _rects_intersect(fx, fy, fg_w, fg_h, ax1, ay1, ax2 - ax1, ay2 - ay1):
                         continue
-                    in_fg = [(x, y) for x, y in cl_pts if fx <= x < fx2 and fy <= y < fy2]
+                    in_fg = [
+                        (x, y)
+                        for x, y in cl_pts
+                        if fx <= x < fx2
+                        and fy <= y < fy2
+                        and not any(ox <= x < ox + ow and oy <= y < oy + oh for ox, oy, ow, oh, _ in other_fgs)
+                    ]
                     if in_fg:
                         px1 = min(p[0] for p in in_fg)
                         py1 = min(p[1] for p in in_fg)
@@ -2564,23 +2615,26 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                         py2 = max(p[1] for p in in_fg) + 1
                         pw, ph = max(1, px2 - px1), max(1, py2 - py1)
                         pcnt = len(in_fg)
-                        acc_b = Blob("_accounted", px1, py1, pw, ph, pcnt, pcnt / float(pw * ph))
-                        if _proven_on_fg(acc_b):
-                            roi_accounted.append(acc_b)
+                        roi_accounted.append(Blob("_accounted", px1, py1, pw, ph, pcnt, pcnt / float(pw * ph)))
                 for rb in accounted_rejected_blobs:
                     inter = _rect_intersection(fx, fy, fg_w, fg_h, rb.x, rb.y, rb.w, rb.h)
                     if inter is None:
                         continue
                     ix1, iy1, ix2, iy2 = inter
                     iw, ih = max(1, ix2 - ix1), max(1, iy2 - iy1)
-                    if rb.pixels >= rb.w * rb.h:
-                        acc_b = Blob("_accounted", ix1, iy1, iw, ih, iw * ih, 1.0)
-                        if _proven_on_fg(acc_b):
-                            roi_accounted.append(acc_b)
-                    elif rb.label in cfg.lab_thresholds:
-                        for sub in _extract_roi_blobs_for_label(img, "_accounted", cfg.lab_thresholds[rb.label], (ix1, iy1, iw, ih)):
-                            if _proven_on_fg(sub):
-                                roi_accounted.append(sub)
+                    rb_thresh = cfg.lab_thresholds.get(rb.label)
+                    if rb.pixels >= rb.w * rb.h and not other_fgs:
+                        if not membership_uncertain:
+                            roi_accounted.append(Blob("_accounted", ix1, iy1, iw, ih, iw * ih, 1.0))
+                    elif rb_thresh is not None:
+                        for sub in _extract_roi_blobs_for_label(img, "_accounted", rb_thresh, (ix1, iy1, iw, ih)):
+                            proven = _proven_sub_on_fg(sub, rb_thresh)
+                            if proven is not None:
+                                roi_accounted.append(proven)
+                    elif rb.pixels >= rb.w * rb.h:
+                        proven = _proven_sub_on_fg(Blob("_accounted", ix1, iy1, iw, ih, iw * ih, 1.0), None)
+                        if proven is not None:
+                            roi_accounted.append(proven)
 
                 explained_px, union_area = _unique_explained_pixels(
                     fg, roi_objects + roi_surfaces + roi_accounted, cfg=cfg

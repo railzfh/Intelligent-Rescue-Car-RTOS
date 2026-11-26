@@ -2020,13 +2020,14 @@ class MaixcamVisionAndUITest(unittest.TestCase):
         self.assertEqual(ui.config.run_mode, MODE_BENCH_STRAIGHT)
 
     def test_round14_tier3_concave_unknown_around_disconnected_known_block(self) -> None:
-        """R14 P2-5: Tier 3 must never subtract a disconnected known component inside a concave unknown's AABB."""
+        """R14 P2-5 & R15 P2-4/P1-2: paired Tier-3 concave unknown vs concave known ramp, plus pre-match settle gen ack."""
         from types import SimpleNamespace
+        from maixcam.protocol import VIS_FLAG_PRE_MATCH_GEN_MASK, VIS_FLAG_PRE_MATCH_GEN_SHIFT
 
         cfg = RescueVisionConfig()
+        # 1. R14 P2-5: 128-pixel C-shaped unknown surrounding a disconnected 144-pixel green block -> MUST detect unknown!
         img = _FakeMaixImage(320, 240, (85, 0, 0))
         unknown_lab = (55, 0, 85)
-        # 128-pixel C-shaped unknown surrounding a disconnected 144-pixel green block.
         img.fill_rect(120, 40, 45, 1, unknown_lab)
         img.fill_rect(120, 41, 1, 38, unknown_lab)
         img.fill_rect(120, 79, 45, 1, unknown_lab)
@@ -2038,11 +2039,49 @@ class MaixcamVisionAndUITest(unittest.TestCase):
         )
         self.assertTrue(any(b.label == "unknown" and b.pixels == 128 for b in exact))
         self.assertTrue(any(b.label == "unknown" and b.pixels == 128 for b in fallback))
-        # The disconnected 144-pixel green block itself must remain recognized as green and NOT flagged as unknown!
         self.assertTrue(any(b.label == "green" and b.pixels == 144 for b in fallback))
         self.assertFalse(
             any(b.label == "unknown" and (b.x, b.y, b.w, b.h) == (135, 55, 12, 12) for b in fallback)
         )
+
+        # 2. R15 P2-4 paired regression: 1,312-pixel C-shaped calibrated purple_ramp surrounding a disconnected
+        #    144-pixel green block -> MUST emit ZERO unknowns in BOTH Tier 1 and Tier 3!
+        ramp_lab = (45, 25, -25)
+        img_ramp = _FakeMaixImage(320, 240, (85, 0, 0))
+        img_ramp.fill_rect(100, 30, 80, 10, ramp_lab)  # top bar: 800 px
+        img_ramp.fill_rect(100, 40, 10, 40, ramp_lab)  # left spine: 400 px
+        img_ramp.fill_rect(100, 80, 80, 10, ramp_lab)  # bottom bar: 800 px (total 2000 px C-shape; trim to ~1312)
+        img_ramp = _FakeMaixImage(320, 240, (85, 0, 0))
+        img_ramp.fill_rect(100, 30, 68, 8, ramp_lab)   # 544 px
+        img_ramp.fill_rect(100, 38, 8, 28, ramp_lab)   # 224 px
+        img_ramp.fill_rect(100, 66, 68, 8, ramp_lab)   # 544 px -> total = 1312 px C-shaped purple_ramp!
+        img_ramp.fill_rect(128, 46, 12, 12, (55, -35, 30))  # disconnected 144 px green inside the C hollow!
+        exact_ramp = extract_blobs_from_maix_image(img_ramp, cfg, scan_unknown_near=True)
+        fallback_ramp = extract_blobs_from_maix_image(
+            SimpleNamespace(find_blobs=img_ramp.find_blobs), cfg, scan_unknown_near=True
+        )
+        self.assertEqual([b for b in exact_ramp if b.label == "unknown"], [])
+        self.assertEqual([b for b in fallback_ramp if b.label == "unknown"], [])
+        self.assertTrue(any(b.label == "purple_ramp" and b.pixels == 1312 for b in fallback_ramp))
+        self.assertTrue(any(b.label == "green" and b.pixels == 144 for b in fallback_ramp))
+
+        # 3. R15 P1-2: MaixCAM echoes pre_match_settle_gen ONLY when FAR settled and gate is open & settled!
+        proc = RescueVisionProcessor(cfg)
+        st_closed = proc.process(
+            [], camera_near_cmd=False, camera_settled=True, team=TEAM_RED,
+            first_green_unlocked=False, gate_closed=True, gate_settled=True, pre_match_settle_gen=2,
+        )
+        self.assertEqual((st_closed.flags & VIS_FLAG_PRE_MATCH_GEN_MASK) >> VIS_FLAG_PRE_MATCH_GEN_SHIFT, 0)
+        st_unsettled = proc.process(
+            [], camera_near_cmd=False, camera_settled=True, team=TEAM_RED,
+            first_green_unlocked=False, gate_closed=False, gate_settled=False, pre_match_settle_gen=2,
+        )
+        self.assertEqual((st_unsettled.flags & VIS_FLAG_PRE_MATCH_GEN_MASK) >> VIS_FLAG_PRE_MATCH_GEN_SHIFT, 0)
+        st_open_settled = proc.process(
+            [], camera_near_cmd=False, camera_settled=True, team=TEAM_RED,
+            first_green_unlocked=False, gate_closed=False, gate_settled=True, pre_match_settle_gen=2,
+        )
+        self.assertEqual((st_open_settled.flags & VIS_FLAG_PRE_MATCH_GEN_MASK) >> VIS_FLAG_PRE_MATCH_GEN_SHIFT, 2)
 
 
 if __name__ == "__main__":

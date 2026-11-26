@@ -4,13 +4,18 @@
 #include <cstdio>
 
 static Struct_Vision_State Make_Far_Vision(uint16_t seq, uint8_t target, uint16_t flags,
-                                           int16_t err_mrad = 0, uint16_t dist_mm = 600U)
+                                           int16_t err_mrad = 0, uint16_t dist_mm = 600U,
+                                           uint8_t pre_match_gen = 1U)
 {
     Struct_Vision_State v{};
     v.frame_seq = seq;
     v.camera_view = CAMERA_VIEW_FAR;
     v.target_type = target;
     v.flags = flags;
+    if ((v.flags & VIS_FLAG_PRE_MATCH_GEN_MASK) == 0U && pre_match_gen != 0U)
+    {
+        v.flags |= static_cast<uint16_t>((pre_match_gen & 0x3U) << VIS_FLAG_PRE_MATCH_GEN_SHIFT);
+    }
     v.target_err_x_mrad = err_mrad;
     v.target_dist_mm = dist_mm;
     v.home_err_x_mrad = err_mrad;
@@ -1623,27 +1628,43 @@ static void Test_Round12_Push_Same_Drain_Standstill_Bench_Leave_And_Interrupted_
         assert(h.m.Get_State() == MISSION_INSPECT_CORRAL);
     }
 
-    // 5. Round 13 & Round 14 invariants:
-    //    5a. P1-1 & R14 P1-3: Bench exit + FAR frame in one drain MUST command open first, refuse launch on
-    //        that tick AND on the first tick observing open/FAR settled (even if a FAR frame was queued
-    //        before settling), and launch ONLY after a strictly newer post-settle FAR frame arrives!
+    // 5. Round 13, 14 & 15 invariants:
+    //    5a. P1-1, R14 P1-3, R15 P1-2: Bench exit + FAR frame in one drain MUST command open first,
+    //        refuse launch on that tick AND on the first tick observing open/FAR settled (raising the
+    //        RX fence and advancing the settle generation), reject FAR frames lacking the current
+    //        generation ack, and launch ONLY after a post-settle FAR frame echoes the new generation!
     {
         Harness h;
         h.in.hardware_ready = h.in.can_launch = h.in.wheels_still = h.in.gate_settled = h.in.camera_settled = true;
+        // First settle in competition (gen 1) before entering bench mode.
+        assert(h.m.On_Set_Config({RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION, 1U}));
+        h.tick();
+        const uint8_t gen_before_bench = h.m.Get_Pre_Match_Settle_Gen();
+        assert(gen_before_bench == 1U);
         assert(h.m.On_Set_Config({RESCUE_TEAM_RED, 1U, RESCUE_MODE_BENCH_STRAIGHT, 1U}));
         assert(h.m.On_Bench_Actuator({BENCH_SERVO_POS_B, BENCH_SERVO_POS_A, 0U}));
         assert(h.tick().gate_closed);
+        assert(h.m.Get_Pre_Match_Settle_Gen() == 0U);
         assert(h.m.On_Set_Config({RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION, 1U}));
         h.far(TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 190U);
         h.in.button_pressed = true;
         const auto out1 = h.tick();
         assert(!out1.gate_closed && out1.drive_action == DRIVE_ACTION_IDLE && out1.launch_rejected_cue);
-        // First tick observing open/FAR settled with a pre-boundary FAR frame -> records boundary and refuses!
+        assert(h.m.Get_Pre_Match_Settle_Gen() == 0U);
+        // First tick observing open/FAR settled -> advances generation (2 != 1), requests RX fence, and refuses!
         h.far(TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 190U);
         const auto out2 = h.tick();
         assert(out2.drive_action == DRIVE_ACTION_IDLE && out2.launch_rejected_cue);
-        // Strictly newer post-settle FAR frame on a later tick -> launch proceeds!
-        h.far(TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 190U);
+        assert(h.m.Consume_Pre_Match_Rx_Fence());
+        const uint8_t gen_after_bench = h.m.Get_Pre_Match_Settle_Gen();
+        assert(gen_after_bench == 2U && gen_after_bench != gen_before_bench);
+        // Pre-settle FAR frame echoing old gen=1 (or unacked gen=0) MUST STILL be rejected!
+        assert(h.m.On_Vision_State(Make_Far_Vision(h.seq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 0, 190U, 0U), h.t));
+        assert(h.tick().drive_action == DRIVE_ACTION_IDLE);
+        assert(h.m.On_Vision_State(Make_Far_Vision(h.seq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 0, 190U, gen_before_bench), h.t));
+        assert(h.tick().drive_action == DRIVE_ACTION_IDLE);
+        // Strictly newer post-settle FAR frame echoing gen_after_bench (2) -> launch proceeds!
+        assert(h.m.On_Vision_State(Make_Far_Vision(h.seq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 0, 190U, gen_after_bench), h.t));
         const auto out3 = h.tick();
         assert(out3.drive_action == DRIVE_ACTION_START_DISTANCE);
     }

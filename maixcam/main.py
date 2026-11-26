@@ -22,6 +22,8 @@ from .protocol import (
     TEL_FLAG_FIRST_GREEN_UNLOCKED,
     TEL_FLAG_GATE_CLOSED,
     TEL_FLAG_GATE_SETTLED,
+    TEL_FLAG_PRE_MATCH_GEN_MASK,
+    TEL_FLAG_PRE_MATCH_GEN_SHIFT,
     Telemetry,
     decode_telemetry,
     encode_bench_actuator,
@@ -93,6 +95,7 @@ def run_maixcam(config_path: Path | None = None) -> None:
         gate_closed = bool(telemetry.status_flags & TEL_FLAG_GATE_CLOSED)
         gate_settled = bool(telemetry.status_flags & TEL_FLAG_GATE_SETTLED)
         drop_pushing = bool(telemetry.status_flags & TEL_FLAG_DROP_PUSHING)
+        pre_match_settle_gen = (telemetry.status_flags & TEL_FLAG_PRE_MATCH_GEN_MASK) >> TEL_FLAG_PRE_MATCH_GEN_SHIFT
         wheels_moving = abs(telemetry.vx_mm_s) > 35 or abs(telemetry.omega_mrad_s) > 250
 
         if camera_near != prev_camera_near or not camera_settled:
@@ -119,6 +122,7 @@ def run_maixcam(config_path: Path | None = None) -> None:
             gate_closed=gate_closed,
             gate_settled=gate_settled,
             drop_pushing=drop_pushing,
+            pre_match_settle_gen=pre_match_settle_gen,
         )
 
         # 3. Poll touchscreen (locked automatically once MC02 confirms launch).

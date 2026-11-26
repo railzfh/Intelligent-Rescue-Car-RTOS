@@ -270,7 +270,7 @@ Struct_Rescue_Telemetry Decode_Last_Telemetry() {
     assert(Rescue_Decode_Telemetry(frame, tel));
     return tel;
 }
-void Feed_Vision(uint16_t frame_seq, uint16_t flags = VIS_FLAG_TARGET_VALID) {
+void Feed_Vision_Raw(uint16_t frame_seq, uint16_t flags) {
     uint8_t buf[RESCUE_PROTO_MAX_FRAME];
     static uint8_t seq = 10U;
     Struct_Vision_State vis{};
@@ -282,6 +282,12 @@ void Feed_Vision(uint16_t frame_seq, uint16_t flags = VIS_FLAG_TARGET_VALID) {
     vis.confidence = 90U;
     const size_t n = Rescue_Encode_Vision_State(seq++, vis, buf, sizeof(buf));
     Vision_Uart_RxCallback(buf, static_cast<uint16_t>(n));
+}
+void Feed_Vision(uint16_t frame_seq, uint16_t flags = VIS_FLAG_TARGET_VALID) {
+    if ((flags & VIS_FLAG_PRE_MATCH_GEN_MASK) == 0U) {
+        flags |= static_cast<uint16_t>(Telemetry_Snapshot.status_flags & TEL_FLAG_PRE_MATCH_GEN_MASK);
+    }
+    Feed_Vision_Raw(frame_seq, flags);
 }
 void Step(uint32_t t, bool pressed, bool imu = true, bool update_battery = true) {
     now_ms = t; key = pressed;
@@ -434,9 +440,11 @@ int main(int argc, char **argv) {
         Struct_Mission_Inputs min{};
         min.can_launch = min.hardware_ready = min.wheels_still = min.gate_settled = min.camera_settled = true;
         min.now_ms = 1U;
-        // First tick observing settled open/FAR anchors boundary; strictly newer FAR frame then authorizes launch.
+        // First tick observing settled open/FAR anchors boundary; strictly newer FAR frame echoing settle gen authorizes launch.
         Rescue_Mission.Update(min);
         vis.frame_seq++;
+        vis.flags = VIS_FLAG_TARGET_VALID | static_cast<uint16_t>(
+            (Rescue_Mission.Get_Pre_Match_Settle_Gen() & 0x3U) << VIS_FLAG_PRE_MATCH_GEN_SHIFT);
         assert(Rescue_Mission.On_Vision_State(vis, 1U));
         min.button_pressed = true;
         Rescue_Mission.Update(min);
@@ -535,7 +543,7 @@ int main(int argc, char **argv) {
             vis.frame_seq = s;
             vis.camera_view = CAMERA_VIEW_FAR;
             vis.target_type = target;
-            vis.flags = flags;
+            vis.flags = flags | static_cast<uint16_t>(Telemetry_Snapshot.status_flags & TEL_FLAG_PRE_MATCH_GEN_MASK);
             vis.target_dist_mm = dist_mm;
             vis.confidence = 95U;
             const size_t n = Rescue_Encode_Vision_State(pseq++, vis, buf, sizeof(buf));
@@ -843,63 +851,94 @@ int main(int argc, char **argv) {
 
     const bool bench_exit_settle = argc > 1 && std::strcmp(argv[1], "bench_exit_settle") == 0;
     if (bench_exit_settle) {
-        // Finding 1 (R13 P1-1) & Finding 3 (R14 P1-3): Leaving bench mode with Gate_Servo settled closed (1900 us)
-        // MUST NEVER launch while closed, AND a FAR frame queued in the UART ring right BEFORE Gate_Servo finishes
-        // settling MUST NOT launch on the first tick observing open settled!
-        Feed_Config(RESCUE_TEAM_UNSET, 0U, RESCUE_MODE_BENCH_STRAIGHT);
-        Feed_Bench_Cmd(BENCH_SERVO_POS_B, BENCH_SERVO_POS_A); // Gate closed (1900 us), Pitch FAR (1500 us)
+        // First settle in competition (gen 1) before entering bench mode so we verify bench-exit advances to gen 2.
+        Feed_Config(RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION);
         uint32_t bt = 0U;
-        for (; bt < 700U; ++bt) {
+        for (; bt < 200U; ++bt) {
+            Step(bt, false);
+        }
+        const uint16_t gen1_mask = static_cast<uint16_t>(Telemetry_Snapshot.status_flags & TEL_FLAG_PRE_MATCH_GEN_MASK);
+        assert(gen1_mask == (1U << TEL_FLAG_PRE_MATCH_GEN_SHIFT));
+
+        // Enter bench mode, close gate (1900 us) & pitch FAR (1500 us).
+        Feed_Config(RESCUE_TEAM_UNSET, 0U, RESCUE_MODE_BENCH_STRAIGHT);
+        Feed_Bench_Cmd(BENCH_SERVO_POS_B, BENCH_SERVO_POS_A);
+        for (; bt < 900U; ++bt) {
             Step(bt, false);
         }
         assert(Gate_Servo.Get_Current_Us() == Gate_Closed_Us && Gate_Servo.Is_Settled());
         assert(Pitch_Servo.Get_Current_Us() == Pitch_Far_Us && Pitch_Servo.Is_Settled());
+        assert((Telemetry_Snapshot.status_flags & TEL_FLAG_PRE_MATCH_GEN_MASK) == 0U);
 
         // Same drain: switch to competition + deliver FAR frame, with debounced button rising edge!
         Step(bt += 10U, true);
         uint16_t bseq = 1U;
         Feed_Config(RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION);
-        Feed_Vision(bseq++);
+        Feed_Vision_Raw(bseq++, VIS_FLAG_TARGET_VALID | gen1_mask);
         Step(bt += 30U, true);
         assert(Rescue_Mission.Get_State() == MISSION_PRE_MATCH);
         assert(!Rescue_Mission.Is_Config_Locked());
         assert(Gate_Servo.Get_Target_Us() == Gate_Open_Us);
         assert((Telemetry_Snapshot.status_flags & TEL_FLAG_GATE_SETTLED) == 0U);
+        assert((Telemetry_Snapshot.status_flags & TEL_FLAG_PRE_MATCH_GEN_MASK) == 0U);
         Stopped();
 
-        // Advance until 1 ms BEFORE Gate_Servo finishes its 120 ms settle hold at Gate_Open_Us (450 + 119 = 569 ticks)!
-        for (int k = 0; k < 568; ++k) {
+        // Advance until Gate_Servo reaches Gate_Open_Us (450 ms) while still unsettled, and inject all-but-last CRC byte
+        // of a pre-settle FAR frame (R15 P1-2 partial parser frame)!
+        for (int k = 0; k < 460; ++k) {
             ++bt;
-            Step(bt, k >= 543);
-            assert(!Gate_Servo.Is_Settled());
-            assert(Rescue_Mission.Get_State() == MISSION_PRE_MATCH);
-            Stopped();
+            Step(bt, false);
         }
         assert(!Gate_Servo.Is_Settled() && Gate_Servo.Get_Current_Us() == Gate_Open_Us);
+        uint8_t partial_pkt[RESCUE_PROTO_MAX_FRAME]{};
+        Struct_Vision_State pre_frame{};
+        pre_frame.frame_seq = ++bseq;
+        pre_frame.camera_view = CAMERA_VIEW_FAR;
+        pre_frame.target_type = TARGET_GREEN_MATERIAL;
+        pre_frame.flags = VIS_FLAG_TARGET_VALID | (2U << VIS_FLAG_PRE_MATCH_GEN_SHIFT);
+        pre_frame.confidence = 90U;
+        const size_t plen = Rescue_Encode_Vision_State(99U, pre_frame, partial_pkt, sizeof(partial_pkt));
+        assert(plen > 1U);
+        Vision_Uart_RxCallback(partial_pkt, static_cast<uint16_t>(plen - 1U));
 
-        // R14 P1-3 exact repro: queue the ONLY FAR frame AFTER RX drain, BEFORE Gate_Servo.Update_1ms() settles!
-        static unsigned b_unmasks = 0U;
-        static uint16_t b_pre_seq = 0U;
-        b_unmasks = 0U;
-        b_pre_seq = ++bseq;
-        each_unmask = [] {
-            if (++b_unmasks == 3U) {
-                assert(!Gate_Servo.Is_Settled());
-                Feed_Vision(b_pre_seq);
-                each_unmask = nullptr;
-            }
-        };
-        Step(++bt, true);
-        assert(b_unmasks == 3U && Gate_Servo.Is_Settled());
-        assert(Vision_Rx_Head != Vision_Rx_Tail);
+        // Finish settle hold while holding button -> first tick observing settled MUST fence parser & advance gen to 2!
+        for (int k = 0; k < 150 && !Gate_Servo.Is_Settled(); ++k) {
+            ++bt;
+            Step(bt, false);
+        }
+        assert(Gate_Servo.Is_Settled());
+        Step(++bt, false); // First tick observing open/FAR settled -> RX fence clears partial_pkt & publishes gen=2!
+        const uint16_t gen2_mask = static_cast<uint16_t>(Telemetry_Snapshot.status_flags & TEL_FLAG_PRE_MATCH_GEN_MASK);
+        assert(gen2_mask == (2U << TEL_FLAG_PRE_MATCH_GEN_SHIFT));
 
-        // First tick observing settled drains that pre-settle FAR frame -> MUST anchor boundary and REFUSE launch!
-        Step(++bt, true);
+        // Deliver the lone trailing CRC byte after the first settled tick -> MUST NOT complete pre-settle frame or launch!
+        Vision_Uart_RxCallback(partial_pkt + plen - 1U, 1U);
+        Step(bt += 10U, true);
+        Step(bt += 30U, true);
         assert(Rescue_Mission.Get_State() == MISSION_PRE_MATCH);
         assert(!Rescue_Mission.Is_Config_Locked());
         Stopped();
 
-        // Release button cleanly, deliver a strictly newer post-settle FAR frame, and press -> launches at 1000 us!
+        // Deliver complete FAR frames with unacked gen=0 or stale pre-bench gen=1 -> MUST STILL refuse launch!
+        Step(bt += 10U, false);
+        Step(bt += 30U, false);
+        Feed_Vision_Raw(++bseq, VIS_FLAG_TARGET_VALID);
+        Step(bt += 10U, true);
+        Step(bt += 30U, true);
+        assert(Rescue_Mission.Get_State() == MISSION_PRE_MATCH);
+        assert(!Rescue_Mission.Is_Config_Locked());
+        Stopped();
+
+        Step(bt += 10U, false);
+        Step(bt += 30U, false);
+        Feed_Vision_Raw(++bseq, VIS_FLAG_TARGET_VALID | gen1_mask);
+        Step(bt += 10U, true);
+        Step(bt += 30U, true);
+        assert(Rescue_Mission.Get_State() == MISSION_PRE_MATCH);
+        assert(!Rescue_Mission.Is_Config_Locked());
+        Stopped();
+
+        // Release button cleanly, deliver a strictly newer post-settle FAR frame echoing gen=2 -> launches at 1000 us!
         Step(bt += 10U, false);
         Step(bt += 30U, false);
         Feed_Vision(++bseq);
@@ -908,7 +947,7 @@ int main(int argc, char **argv) {
         assert(Rescue_Mission.Get_State() == MISSION_LAUNCH_CROSS_BUMPS);
         assert(Gate_Servo.Get_Current_Us() == Gate_Open_Us && Gate_Servo.Is_Settled());
         assert(M2006[0].torque < 0.0f && M2006[1].torque > 0.0f);
-        std::puts("PASS: bench exit commands open/FAR, rejects pre-settle buffered FAR on first settled tick, and launches only after post-settle FAR frame");
+        std::puts("PASS: bench exit fences partial/buffered RX, requires post-settle gen echo, and launches only at 1000 us");
         return 0;
     }
 
@@ -1009,8 +1048,20 @@ int main(int argc, char **argv) {
         Step(ct += 10U, false);
         assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_CAN_TX) != 0U);
 
-        // Part B (R14 P2-4): DMA submission MUST NOT clear FAULT_FLAG_CAN_TX; DMA error retains it for next TX!
+        // Part B (R14 P2-4 & R15 P2-3): Arming + DMA submission is atomic under __disable_irq(),
+        // so an RX error cannot fire in between while gState==READY to erase Telemetry_Tx_In_Flight;
+        // a genuine DMA failure retains FAULT_FLAG_CAN_TX, and ONLY complete_tx() clears it!
+        static bool saw_unmasked_ready_window = false;
+        saw_unmasked_ready_window = false;
+        each_unmask = [] {
+            if (Telemetry_Tx_In_Flight && huart1.gState == HAL_UART_STATE_READY) {
+                saw_unmasked_ready_window = true;
+                huart1.tx_cb(false);
+            }
+        };
         assert(Telemetry_Service_Tx());
+        each_unmask = nullptr;
+        assert(!saw_unmasked_ready_window);
         assert(huart1.gState == HAL_UART_STATE_BUSY_TX);
         assert((Decode_Last_Telemetry().fault_flags & FAULT_FLAG_CAN_TX) != 0U);
         // Simulate DMA transfer error after HAL accepted the buffer!
@@ -1023,32 +1074,71 @@ int main(int argc, char **argv) {
         Step(ct += 10U, false);
         assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_CAN_TX) != 0U); // Still BUSY_TX!
         huart1.complete_tx();
+        assert(Can_Tx_Fault_Reported_Seq == Can_Tx_Fault_Event_Seq);
         Step(ct += 10U, false);
         assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_CAN_TX) == 0U);
 
-        // Part C: Launch cleanly into active competition, then inject Bus-Off on FDCAN2 mid-run!
+        // Part C (R15 P1-1a): Bus-Off asserted on CAN1 right BETWEEN CAN1 TX and CAN2 TX MUST prevent
+        // ANY nonzero torque submission to CAN2, roll back launch (no Config_Locked), and zero CAN2!
+        Step(ct += 10U, false);
+        Step(ct += 30U, false);
         Feed_Vision(bseq++);
         Step(ct += 10U, true);
+        static bool peer_saw_nonzero_between = false;
+        static bool can1_fired = false;
+        peer_saw_nonzero_between = false;
+        can1_fired = false;
+        on_can_tx = [](FDCAN_HandleTypeDef *can) {
+            if (can == &hfdcan1 && !can1_fired) {
+                can1_fired = true;
+                hfdcan1.inject_hw_bus_off_pending();
+            } else if (can == &hfdcan2 && M2006[1].torque != 0.0f) {
+                peer_saw_nonzero_between = true;
+            }
+        };
         Step(ct += 30U, true);
-        assert(Rescue_Mission.Get_State() == MISSION_LAUNCH_CROSS_BUMPS);
-        assert(M2006[0].torque < 0.0f && M2006[1].torque > 0.0f);
-
-        hfdcan2.inject_bus_off();
-        Step(++ct, false);
-        assert(Rescue_Mission.Get_State() == MISSION_FAULT_STOP);
+        on_can_tx = nullptr;
+        assert(can1_fired && !peer_saw_nonzero_between);
+        assert(Rescue_Mission.Get_State() == MISSION_PRE_MATCH);
+        assert(!Rescue_Mission.Is_Config_Locked());
+        assert((Telemetry_Snapshot.status_flags & TEL_FLAG_CONFIG_LOCKED) == 0U);
+        assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_CAN_TX) != 0U);
         Stopped();
-        assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_CAN_TX) != 0U);
-        Step(++ct, false);
-        assert(Rescue_Mission.Get_State() == MISSION_FAULT_STOP);
-        assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_CAN_TX) != 0U);
+        hfdcan1.inject_bus_off();
+        Step(ct += 10U, false);
         assert(Telemetry_Service_Tx());
-        assert((Decode_Last_Telemetry().fault_flags & FAULT_FLAG_CAN_TX) != 0U);
         huart1.complete_tx();
-        Step(++ct, false);
+        Step(ct += 10U, false);
+
+        // Part D (R15 P1-1b): Bus-Off asserted on CAN1 DURING CAN2 TX MUST cancel pending torque,
+        // immediately transmit zero torque on healthy CAN2, suppress Config_Locked, and fault-stop!
+        Step(ct += 10U, false);
+        Step(ct += 30U, false);
+        Feed_Vision(bseq++);
+        Step(ct += 10U, true);
+        static int can2_zero_override_calls = 0;
+        static bool injected_during_can2 = false;
+        can2_zero_override_calls = 0;
+        injected_during_can2 = false;
+        on_can_tx = [](FDCAN_HandleTypeDef *can) {
+            if (can == &hfdcan2) {
+                if (!injected_during_can2) {
+                    injected_during_can2 = true;
+                    hfdcan1.inject_hw_bus_off_pending();
+                } else if (M2006[1].torque == 0.0f) {
+                    ++can2_zero_override_calls;
+                }
+            }
+        };
+        Step(ct += 30U, true);
+        on_can_tx = nullptr;
+        assert(injected_during_can2 && can2_zero_override_calls >= 1);
         assert(Rescue_Mission.Get_State() == MISSION_FAULT_STOP);
-        assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_CAN_TX) == 0U);
+        assert(!Rescue_Mission.Is_Config_Locked());
+        assert((Telemetry_Snapshot.status_flags & TEL_FLAG_CONFIG_LOCKED) == 0U);
+        assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_CAN_TX) != 0U);
         Stopped();
-        std::puts("PASS: FDCAN hardware/ISR Bus-Off blocks peer torque & latches fault, and fault telemetry clears only after DMA TX completion");
+        std::puts("PASS: FDCAN hardware/ISR/inter-TX Bus-Off suppresses launch lock & zeroes peer bus, and atomic DMA TX ack survives RX errors");
         return 0;
     }
 
@@ -1095,6 +1185,9 @@ int main(int argc, char **argv) {
             vis.target_type = TARGET_GREEN_MATERIAL;
             vis.target_dist_mm = 190U;
             vis.flags = flags;
+            if (view == CAMERA_VIEW_FAR) {
+                vis.flags |= static_cast<uint16_t>(Telemetry_Snapshot.status_flags & TEL_FLAG_PRE_MATCH_GEN_MASK);
+            }
             vis.corral_green_cnt = green;
             vis.confidence = 95U;
             const auto n = Rescue_Encode_Vision_State(1U, vis, wire, sizeof(wire));
@@ -1209,7 +1302,7 @@ int main(int argc, char **argv) {
             vis.frame_seq = s;
             vis.camera_view = CAMERA_VIEW_FAR;
             vis.target_type = target;
-            vis.flags = flags;
+            vis.flags = flags | static_cast<uint16_t>(Telemetry_Snapshot.status_flags & TEL_FLAG_PRE_MATCH_GEN_MASK);
             vis.target_dist_mm = dist_mm;
             vis.confidence = 95U;
             const size_t n = Rescue_Encode_Vision_State(pseq++, vis, buf, sizeof(buf));
@@ -1395,7 +1488,7 @@ int main(int argc, char **argv) {
             vis.frame_seq = fseq;
             vis.camera_view = CAMERA_VIEW_FAR;
             vis.target_type = target;
-            vis.flags = flags;
+            vis.flags = flags | static_cast<uint16_t>(Telemetry_Snapshot.status_flags & TEL_FLAG_PRE_MATCH_GEN_MASK);
             vis.target_dist_mm = dist_mm;
             vis.home_dist_mm = dist_mm;
             vis.confidence = 95U;
