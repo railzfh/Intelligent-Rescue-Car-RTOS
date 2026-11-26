@@ -61,7 +61,8 @@ private:
 class Class_PWM_Servo
 {
 public:
-    bool Init(TIM_HandleTypeDef *htim, uint32_t channel, const Struct_Servo_Config &config);
+    bool Init(TIM_HandleTypeDef *htim, uint32_t channel, const Struct_Servo_Config &config,
+              bool start_immediately = true);
     void Set_Target_Us(uint16_t pulse_us) { Controller.Set_Target_Us(pulse_us); }
     bool Set_Target_Angle_Deg(float angle_deg, float min_deg = 0.0f, float max_deg = 180.0f)
     {
@@ -69,7 +70,7 @@ public:
     }
     void Update_1ms();
     void Disable();
-    void Enable();
+    bool Enable();
 
     bool Is_Enabled() const { return Controller.Is_Enabled(); }
     bool Is_Settled() const { return Controller.Is_Settled(); }

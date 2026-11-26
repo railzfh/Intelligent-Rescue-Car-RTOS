@@ -66,7 +66,7 @@ public:
 
 private:
     bool Config_Valid() const;
-    void Prepare_Active_Mode(const std::array<float, 2> &measured_speed);
+    void Prepare_Active_Mode(const std::array<float, 2> &measured_speed, Enum_Chassis_Mode next_mode);
     std::array<float, 2> Mix_Wheel_Speeds(float linear_mps, float angular_rad_s) const;
     void Ramp_Wheel_Targets(const std::array<float, 2> &desired_rad_s);
     void Update_Stall_Detector(const std::array<float, 2> &speed, const std::array<float, 2> &torque);

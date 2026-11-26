@@ -202,6 +202,8 @@ void Class_Rescue_Mission::Enter_State(Enum_Mission_State next, uint32_t now_ms)
     Has_Confirm_Frame = false;
     Last_Confirm_Frame_Seq = 0U;
     Visual_Stall_Counter_Ms = 0U;
+    Pending_Escape_Reverse_M = 0.0f;
+    Standstill_Abrupt_Stop = false;
 }
 
 void Class_Rescue_Mission::Clear_Cargo()
@@ -235,14 +237,26 @@ float Class_Rescue_Mission::Available_Reverse_M(bool vision_fresh, bool rear_sen
     {
         return requested_abs_m;
     }
-    if (Proven_Rear_Clear_M >= Config.min_proven_reverse_m)
+    const float usable = Proven_Rear_Clear_M - Config.reverse_stop_margin_m;
+    if (usable >= Config.min_proven_reverse_m)
     {
-        return std::min(requested_abs_m, Proven_Rear_Clear_M);
+        return std::min(requested_abs_m, usable);
     }
     return 0.0f;
 }
 
-void Class_Rescue_Mission::Start_Escape(uint32_t now_ms, float reverse_abs_m, Struct_Mission_Output &out)
+bool Class_Rescue_Mission::Is_Reverse_Clearance_Lost(bool rear_sensor_clear) const
+{
+    if (rear_sensor_clear)
+    {
+        return false;
+    }
+    const float floor_m = std::max(0.001f, Config.reverse_stop_margin_m - 0.001f);
+    return Proven_Rear_Clear_M < floor_m;
+}
+
+void Class_Rescue_Mission::Start_Escape(uint32_t now_ms, float reverse_abs_m, bool chassis_active,
+                                        bool wheels_still, Struct_Mission_Output &out)
 {
     if (++Consecutive_Escapes > Config.max_consecutive_escapes)
     {
@@ -254,17 +268,26 @@ void Class_Rescue_Mission::Start_Escape(uint32_t now_ms, float reverse_abs_m, St
     }
 
     Enter_State(MISSION_ESCAPE_RECOVERY, now_ms);
-    if (reverse_abs_m >= Config.min_proven_reverse_m)
+    Pending_Escape_Reverse_M = (reverse_abs_m >= Config.min_proven_reverse_m) ? reverse_abs_m : 0.0f;
+    if (chassis_active || !wheels_still)
+    {
+        // Cancel active motion immediately and confirm standstill before reversing or turning.
+        Sub_Phase = (Pending_Escape_Reverse_M > 0.0f) ? 3U : 1U;
+        Standstill_Abrupt_Stop = true;
+        out.drive_action = DRIVE_ACTION_EMERGENCY_STOP;
+        return;
+    }
+    if (Pending_Escape_Reverse_M >= Config.min_proven_reverse_m)
     {
         Sub_Phase = 0U;
         out.drive_action = DRIVE_ACTION_START_DISTANCE;
-        out.distance_m = -reverse_abs_m;
+        out.distance_m = -Pending_Escape_Reverse_M;
         out.speed_mps = Config.drop_backout_speed_mps;
         out.motion_timeout_ms = 3500U;
     }
     else
     {
-        Sub_Phase = 1U;
+        Sub_Phase = 2U;
         out.drive_action = DRIVE_ACTION_START_TURN;
         out.delta_yaw_rad = Escape_Sign * Config.escape_turn_rad;
         out.angular_rad_s = Config.align_max_omega_rad_s;
@@ -411,7 +434,11 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                 out.drive_action = DRIVE_ACTION_EMERGENCY_STOP;
                 return out;
             }
-            out.drive_action = DRIVE_ACTION_SOFT_STOP;
+            const bool in_active_reverse =
+                (State == MISSION_BACK_OUT_SEPARATE && Sub_Phase == 1U) ||
+                (State == MISSION_DROP_BACKOUT_VERIFY && Sub_Phase == 1U) ||
+                (State == MISSION_ESCAPE_RECOVERY && Sub_Phase == 0U);
+            out.drive_action = in_active_reverse ? DRIVE_ACTION_EMERGENCY_STOP : DRIVE_ACTION_SOFT_STOP;
             return out;
         }
 
@@ -435,24 +462,26 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                 }
                 out.gate_closed = Gate_Closed_Cmd;
                 out.camera_near = Camera_Near_Cmd;
-                out.drive_action = DRIVE_ACTION_SOFT_STOP;
+                out.drive_action = DRIVE_ACTION_EMERGENCY_STOP;
                 return out;
             }
             if (State == MISSION_DROP_OPEN_AND_PUSH && Sub_Phase == 2U)
             {
                 // Verify in place after interrupted push without blind reversing.
                 Enter_State(MISSION_DROP_BACKOUT_VERIFY, in.now_ms);
-                Sub_Phase = 1U;
+                Sub_Phase = 2U;
+                Standstill_Abrupt_Stop = true;
                 out.gate_closed = Gate_Closed_Cmd;
                 out.camera_near = Camera_Near_Cmd;
-                out.drive_action = DRIVE_ACTION_SOFT_STOP;
+                out.drive_action = DRIVE_ACTION_EMERGENCY_STOP;
                 return out;
             }
-            if (State == MISSION_DROP_BACKOUT_VERIFY && Sub_Phase == 0U)
+            if (State == MISSION_DROP_BACKOUT_VERIFY && (Sub_Phase == 0U || Sub_Phase == 1U))
             {
-                Sub_Phase = 1U;
+                Sub_Phase = 2U;
                 State_Enter_Ms = in.now_ms;
-                out.drive_action = DRIVE_ACTION_SOFT_STOP;
+                Standstill_Abrupt_Stop = true;
+                out.drive_action = DRIVE_ACTION_EMERGENCY_STOP;
                 return out;
             }
         }
@@ -465,7 +494,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         if (opponent_alert && forward_motion_state)
         {
             // Never reverse blindly on opponent alert unless explicit rear sensor clears it (Available_Reverse_M returns 0).
-            Start_Escape(in.now_ms, 0.0f, out);
+            Start_Escape(in.now_ms, 0.0f, in.chassis_active, in.wheels_still, out);
             out.gate_closed = Gate_Closed_Cmd;
             out.camera_near = Camera_Near_Cmd;
             return out;
@@ -491,7 +520,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             {
                 const float rev_m = Available_Reverse_M(
                     vision_fresh, rear_sensor_clear, opponent_alert, std::fabs(Config.escape_backout_m));
-                Start_Escape(in.now_ms, rev_m, out);
+                Start_Escape(in.now_ms, rev_m, in.chassis_active, in.wheels_still, out);
                 out.gate_closed = Gate_Closed_Cmd;
                 out.camera_near = Camera_Near_Cmd;
                 return out;
@@ -560,7 +589,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         {
             const float rev_m = Available_Reverse_M(
                 vision_fresh, rear_sensor_clear, opponent_alert, std::fabs(Config.escape_backout_m));
-            Start_Escape(in.now_ms, rev_m, out);
+            Start_Escape(in.now_ms, rev_m, in.chassis_active, in.wheels_still, out);
         }
         else
         {
@@ -681,11 +710,24 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         Camera_Near_Cmd = false;
         if (Sub_Phase == 0U)
         {
+            if (in.chassis_active || !in.wheels_still)
+            {
+                if ((uint32_t)(in.now_ms - State_Enter_Ms) >= 1500U)
+                {
+                    Start_Escape(in.now_ms, 0.0f, in.chassis_active, in.wheels_still, out);
+                }
+                else
+                {
+                    out.drive_action = DRIVE_ACTION_EMERGENCY_STOP;
+                }
+                break;
+            }
             const float rev_m = Available_Reverse_M(
                 vision_fresh, rear_sensor_clear, opponent_alert, std::fabs(Config.separate_backout_m));
             if (rev_m >= Config.min_proven_reverse_m)
             {
                 Sub_Phase = 1U;
+                State_Enter_Ms = in.now_ms;
                 out.drive_action = DRIVE_ACTION_START_DISTANCE;
                 out.distance_m = -rev_m;
                 out.speed_mps = Config.drop_backout_speed_mps;
@@ -693,7 +735,8 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             }
             else
             {
-                Sub_Phase = 2U;
+                Sub_Phase = 3U;
+                State_Enter_Ms = in.now_ms;
                 out.drive_action = DRIVE_ACTION_START_TURN;
                 out.delta_yaw_rad = Escape_Sign * Config.separate_turn_rad;
                 out.angular_rad_s = Config.align_max_omega_rad_s;
@@ -703,33 +746,69 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         }
         else if (Sub_Phase == 1U)
         {
-            const bool reverse_clearance_lost = !rear_sensor_clear && Proven_Rear_Clear_M <= 0.001f;
+            const bool reverse_clearance_lost = Is_Reverse_Clearance_Lost(rear_sensor_clear);
             if (opponent_alert || in.chassis_stalled || in.chassis_motion_aborted || reverse_clearance_lost)
             {
-                // Abort reversal immediately on opponent/stall/lost clearance and switch to bounded turn.
+                // Cancel reverse immediately (zero torque) and confirm standstill before turning.
                 Sub_Phase = 2U;
-                out.drive_action = DRIVE_ACTION_START_TURN;
-                out.delta_yaw_rad = Escape_Sign * Config.separate_turn_rad;
-                out.angular_rad_s = Config.align_max_omega_rad_s;
-                out.motion_timeout_ms = 4000U;
-                Escape_Sign = -Escape_Sign;
+                State_Enter_Ms = in.now_ms;
+                Standstill_Abrupt_Stop = true;
+                out.drive_action = DRIVE_ACTION_EMERGENCY_STOP;
             }
             else if (in.chassis_motion_done)
             {
-                Sub_Phase = 2U;
-                out.drive_action = DRIVE_ACTION_START_TURN;
-                out.delta_yaw_rad = Escape_Sign * Config.separate_turn_rad;
-                out.angular_rad_s = Config.align_max_omega_rad_s;
-                out.motion_timeout_ms = 4000U;
-                Escape_Sign = -Escape_Sign;
+                if (!in.chassis_active && in.wheels_still)
+                {
+                    Sub_Phase = 3U;
+                    State_Enter_Ms = in.now_ms;
+                    out.drive_action = DRIVE_ACTION_START_TURN;
+                    out.delta_yaw_rad = Escape_Sign * Config.separate_turn_rad;
+                    out.angular_rad_s = Config.align_max_omega_rad_s;
+                    out.motion_timeout_ms = 4000U;
+                    Escape_Sign = -Escape_Sign;
+                }
+                else
+                {
+                    Sub_Phase = 2U;
+                    State_Enter_Ms = in.now_ms;
+                    Standstill_Abrupt_Stop = false;
+                    out.drive_action = DRIVE_ACTION_SOFT_STOP;
+                }
             }
             else if (!in.chassis_active)
             {
-                Start_Escape(in.now_ms, 0.0f, out);
+                Start_Escape(in.now_ms, 0.0f, in.chassis_active, in.wheels_still, out);
             }
             else
             {
                 out.drive_action = DRIVE_ACTION_KEEP;
+            }
+        }
+        else if (Sub_Phase == 2U)
+        {
+            const bool reverse_clearance_lost = Is_Reverse_Clearance_Lost(rear_sensor_clear);
+            if (in.chassis_active || !in.wheels_still)
+            {
+                if ((uint32_t)(in.now_ms - State_Enter_Ms) >= 1500U)
+                {
+                    Start_Escape(in.now_ms, 0.0f, in.chassis_active, in.wheels_still, out);
+                }
+                else
+                {
+                    const bool hard_stop =
+                        Standstill_Abrupt_Stop || reverse_clearance_lost || opponent_alert || in.chassis_stalled;
+                    out.drive_action = hard_stop ? DRIVE_ACTION_EMERGENCY_STOP : DRIVE_ACTION_SOFT_STOP;
+                }
+            }
+            else
+            {
+                Sub_Phase = 3U;
+                State_Enter_Ms = in.now_ms;
+                out.drive_action = DRIVE_ACTION_START_TURN;
+                out.delta_yaw_rad = Escape_Sign * Config.separate_turn_rad;
+                out.angular_rad_s = Config.align_max_omega_rad_s;
+                out.motion_timeout_ms = 4000U;
+                Escape_Sign = -Escape_Sign;
             }
         }
         else
@@ -741,7 +820,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             }
             else if (in.chassis_stalled || in.chassis_motion_aborted || !in.chassis_active)
             {
-                Start_Escape(in.now_ms, 0.0f, out);
+                Start_Escape(in.now_ms, 0.0f, in.chassis_active, in.wheels_still, out);
             }
             else
             {
@@ -922,6 +1001,9 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             }
             if (++Confirm_Count >= Config.confirm_frames_required)
             {
+                Cargo_Green = Latest_Vision.corral_green_cnt;
+                Cargo_Black = Latest_Vision.corral_black_cnt;
+                Cargo_Orange = Latest_Vision.corral_orange_cnt;
                 Gate_Closed_Cmd = false;
                 Sub_Phase = 1U;
                 State_Enter_Ms = in.now_ms;
@@ -931,46 +1013,105 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         {
             Gate_Closed_Cmd = false;
             out.drive_action = DRIVE_ACTION_SOFT_STOP;
-            if (in.gate_settled)
+            if ((uint32_t)(in.now_ms - State_Enter_Ms) >= 3000U)
             {
-                Sub_Phase = 2U;
-                out.drive_action = DRIVE_ACTION_START_DISTANCE;
-                out.distance_m = Config.drop_push_distance_m;
-                out.speed_mps = Config.drop_push_speed_mps;
-                out.motion_timeout_ms = 5000U;
-            }
-            else if ((uint32_t)(in.now_ms - State_Enter_Ms) >= 3000U)
-            {
+                Clear_Cargo();
                 Camera_Near_Cmd = false;
-                Enter_State(MISSION_FIND_HOME, in.now_ms);
+                Enter_State(MISSION_BACK_OUT_SEPARATE, in.now_ms);
+                out.drive_action = DRIVE_ACTION_EMERGENCY_STOP;
+                break;
+            }
+            // Continuously recheck latest NEAR frame for corral/sweep safety and half alignment
+            // while gate opens AND require a fresh post-open frame before starting the push.
+            if (in.camera_settled && Latest_Vision.camera_view == CAMERA_VIEW_NEAR)
+            {
+                const Enum_Corral_Verdict verdict = Validate_Corral(Latest_Vision);
+                const bool cargo_matches = (Cargo_Is_Casualty && verdict == CORRAL_VALID_CASUALTY) ||
+                                           (!Cargo_Is_Casualty && verdict == CORRAL_VALID_MATERIALS);
+                const bool half_ok = (Latest_Vision.flags & VIS_FLAG_HOME_HALF_MATCH) != 0U;
+                if (verdict == CORRAL_ILLEGAL_HAZARD_OR_EXCESS || !cargo_matches)
+                {
+                    Clear_Cargo();
+                    Gate_Closed_Cmd = false;
+                    Camera_Near_Cmd = false;
+                    Enter_State(MISSION_BACK_OUT_SEPARATE, in.now_ms);
+                    out.drive_action = DRIVE_ACTION_EMERGENCY_STOP;
+                    break;
+                }
+                if (!half_ok)
+                {
+                    Gate_Closed_Cmd = true;
+                    Camera_Near_Cmd = true;
+                    Enter_State(MISSION_CLOSE_GATE_VERIFY, in.now_ms);
+                    out.drive_action = DRIVE_ACTION_SOFT_STOP;
+                    break;
+                }
+                const bool fresh_post_open_frame =
+                    !Has_Confirm_Frame || Latest_Vision.frame_seq != Last_Confirm_Frame_Seq;
+                if (in.gate_settled && !in.chassis_active && in.wheels_still && fresh_post_open_frame)
+                {
+                    Cargo_Green = Latest_Vision.corral_green_cnt;
+                    Cargo_Black = Latest_Vision.corral_black_cnt;
+                    Cargo_Orange = Latest_Vision.corral_orange_cnt;
+                    Sub_Phase = 2U;
+                    State_Enter_Ms = in.now_ms;
+                    out.drive_action = DRIVE_ACTION_START_DISTANCE;
+                    out.distance_m = Config.drop_push_distance_m;
+                    out.speed_mps = Config.drop_push_speed_mps;
+                    out.motion_timeout_ms = 5000U;
+                }
             }
         }
         else
         {
             Gate_Closed_Cmd = false;
+            const bool near_view_ok = in.camera_settled && Latest_Vision.camera_view == CAMERA_VIEW_NEAR;
+            const bool push_safe = near_view_ok &&
+                                   (Latest_Vision.flags & VIS_FLAG_CORRAL_SAFE) != 0U &&
+                                   (Latest_Vision.flags & VIS_FLAG_SWEEP_CLEAR) != 0U &&
+                                   Latest_Vision.corral_cyan_cnt == 0U &&
+                                   Latest_Vision.corral_unknown_cnt == 0U;
+            const bool half_ok = (Latest_Vision.flags & VIS_FLAG_HOME_HALF_MATCH) != 0U;
+            if (!push_safe || !half_ok)
+            {
+                Clear_Cargo();
+                Gate_Closed_Cmd = false;
+                Camera_Near_Cmd = false;
+                Enter_State(MISSION_BACK_OUT_SEPARATE, in.now_ms);
+                out.drive_action = DRIVE_ACTION_EMERGENCY_STOP;
+                break;
+            }
             if (in.chassis_motion_done)
             {
-                const float rev_m = Available_Reverse_M(
-                    vision_fresh, rear_sensor_clear, opponent_alert, std::fabs(Config.drop_backout_distance_m));
                 Enter_State(MISSION_DROP_BACKOUT_VERIFY, in.now_ms);
-                if (rev_m >= Config.min_proven_reverse_m)
+                if (!in.chassis_active && in.wheels_still)
                 {
-                    Sub_Phase = 0U;
-                    out.drive_action = DRIVE_ACTION_START_DISTANCE;
-                    out.distance_m = -rev_m;
-                    out.speed_mps = Config.drop_backout_speed_mps;
-                    out.motion_timeout_ms = 5000U;
+                    const float rev_m = Available_Reverse_M(
+                        vision_fresh, rear_sensor_clear, opponent_alert, std::fabs(Config.drop_backout_distance_m));
+                    if (rev_m >= Config.min_proven_reverse_m)
+                    {
+                        Sub_Phase = 1U;
+                        out.drive_action = DRIVE_ACTION_START_DISTANCE;
+                        out.distance_m = -rev_m;
+                        out.speed_mps = Config.drop_backout_speed_mps;
+                        out.motion_timeout_ms = 5000U;
+                    }
+                    else
+                    {
+                        Sub_Phase = 2U;
+                        out.drive_action = DRIVE_ACTION_SOFT_STOP;
+                    }
                 }
                 else
                 {
-                    // No validated rear clearance: verify drop in place without blind reverse.
-                    Sub_Phase = 1U;
+                    // Confirm standstill from forward push before starting margin-bounded backout.
+                    Sub_Phase = 0U;
                     out.drive_action = DRIVE_ACTION_SOFT_STOP;
                 }
             }
             else if (in.chassis_motion_aborted || !in.chassis_active)
             {
-                Start_Escape(in.now_ms, 0.0f, out);
+                Start_Escape(in.now_ms, 0.0f, in.chassis_active, in.wheels_still, out);
             }
             else
             {
@@ -984,12 +1125,62 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         Camera_Near_Cmd = true;
         if (Sub_Phase == 0U)
         {
-            const bool reverse_clearance_lost = !rear_sensor_clear && Proven_Rear_Clear_M <= 0.001f;
-            if (opponent_alert || in.chassis_stalled || in.chassis_motion_aborted || in.chassis_motion_done ||
-                reverse_clearance_lost || !in.chassis_active)
+            if (in.chassis_active || !in.wheels_still)
             {
-                Sub_Phase = 1U;
+                if ((uint32_t)(in.now_ms - State_Enter_Ms) >= 1500U)
+                {
+                    Sub_Phase = 2U;
+                    State_Enter_Ms = in.now_ms;
+                    Standstill_Abrupt_Stop = true;
+                    out.drive_action = DRIVE_ACTION_EMERGENCY_STOP;
+                }
+                else
+                {
+                    out.drive_action = (opponent_alert || in.chassis_stalled)
+                                           ? DRIVE_ACTION_EMERGENCY_STOP
+                                           : DRIVE_ACTION_SOFT_STOP;
+                }
+            }
+            else
+            {
+                const float rev_m = Available_Reverse_M(
+                    vision_fresh, rear_sensor_clear, opponent_alert, std::fabs(Config.drop_backout_distance_m));
+                if (rev_m >= Config.min_proven_reverse_m)
+                {
+                    Sub_Phase = 1U;
+                    State_Enter_Ms = in.now_ms;
+                    out.drive_action = DRIVE_ACTION_START_DISTANCE;
+                    out.distance_m = -rev_m;
+                    out.speed_mps = Config.drop_backout_speed_mps;
+                    out.motion_timeout_ms = 5000U;
+                }
+                else
+                {
+                    Sub_Phase = 2U;
+                    State_Enter_Ms = in.now_ms;
+                    out.drive_action = DRIVE_ACTION_SOFT_STOP;
+                }
+            }
+        }
+        else if (Sub_Phase == 1U)
+        {
+            const bool reverse_clearance_lost = Is_Reverse_Clearance_Lost(rear_sensor_clear);
+            if (opponent_alert || in.chassis_stalled || in.chassis_motion_aborted || reverse_clearance_lost)
+            {
+                // Immediate zero-torque stop on abrupt clearance loss (never ramp into STOPPING).
+                Sub_Phase = 2U;
                 State_Enter_Ms = in.now_ms;
+                Standstill_Abrupt_Stop = true;
+                Confirm_Count = 0U;
+                Has_Confirm_Frame = false;
+                Last_Confirm_Frame_Seq = 0U;
+                out.drive_action = DRIVE_ACTION_EMERGENCY_STOP;
+            }
+            else if (in.chassis_motion_done || !in.chassis_active)
+            {
+                Sub_Phase = 2U;
+                State_Enter_Ms = in.now_ms;
+                Standstill_Abrupt_Stop = false;
                 Confirm_Count = 0U;
                 Has_Confirm_Frame = false;
                 Last_Confirm_Frame_Seq = 0U;
@@ -1002,13 +1193,22 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         }
         else
         {
-            out.drive_action = DRIVE_ACTION_SOFT_STOP;
+            const bool reverse_clearance_lost = Is_Reverse_Clearance_Lost(rear_sensor_clear);
+            const bool hard_stop =
+                Standstill_Abrupt_Stop || reverse_clearance_lost || opponent_alert || in.chassis_stalled;
+            out.drive_action = (in.chassis_active || !in.wheels_still)
+                                   ? (hard_stop ? DRIVE_ACTION_EMERGENCY_STOP : DRIVE_ACTION_SOFT_STOP)
+                                   : DRIVE_ACTION_SOFT_STOP;
             if ((uint32_t)(in.now_ms - State_Enter_Ms) >= Config.drop_verify_timeout_ms)
             {
                 // Drop NOT confirmed inside own correct half -> do NOT unlock first green.
                 Clear_Cargo();
                 Camera_Near_Cmd = false;
                 Enter_State(MISSION_SEARCH_TARGET, in.now_ms);
+                break;
+            }
+            if (in.chassis_active || !in.wheels_still)
+            {
                 break;
             }
             if (!in.camera_settled || Latest_Vision.camera_view != CAMERA_VIEW_NEAR ||
@@ -1044,22 +1244,107 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         break;
 
     case MISSION_ESCAPE_RECOVERY:
-        if (Sub_Phase == 0U)
+        if (Sub_Phase == 3U)
         {
-            const bool reverse_clearance_lost = !rear_sensor_clear && Proven_Rear_Clear_M <= 0.001f;
-            if (opponent_alert || in.chassis_stalled || in.chassis_motion_aborted || in.chassis_motion_done ||
-                reverse_clearance_lost || !in.chassis_active)
+            if (in.chassis_active || !in.wheels_still)
             {
+                if ((uint32_t)(in.now_ms - State_Enter_Ms) >= 1500U)
+                {
+                    Fault_Stop(in.now_ms);
+                    out.drive_action = DRIVE_ACTION_EMERGENCY_STOP;
+                }
+                else
+                {
+                    out.drive_action = DRIVE_ACTION_EMERGENCY_STOP;
+                }
+            }
+            else
+            {
+                const float rev_m = Available_Reverse_M(
+                    vision_fresh, rear_sensor_clear, opponent_alert, Pending_Escape_Reverse_M);
+                if (rev_m >= Config.min_proven_reverse_m)
+                {
+                    Sub_Phase = 0U;
+                    State_Enter_Ms = in.now_ms;
+                    out.drive_action = DRIVE_ACTION_START_DISTANCE;
+                    out.distance_m = -rev_m;
+                    out.speed_mps = Config.drop_backout_speed_mps;
+                    out.motion_timeout_ms = 3500U;
+                }
+                else
+                {
+                    Sub_Phase = 2U;
+                    State_Enter_Ms = in.now_ms;
+                    out.drive_action = DRIVE_ACTION_START_TURN;
+                    out.delta_yaw_rad = Escape_Sign * Config.escape_turn_rad;
+                    out.angular_rad_s = Config.align_max_omega_rad_s;
+                    out.motion_timeout_ms = 4000U;
+                    Escape_Sign = -Escape_Sign;
+                }
+            }
+        }
+        else if (Sub_Phase == 0U)
+        {
+            const bool reverse_clearance_lost = Is_Reverse_Clearance_Lost(rear_sensor_clear);
+            if (opponent_alert || in.chassis_stalled || in.chassis_motion_aborted || reverse_clearance_lost)
+            {
+                // Cancel reverse immediately and confirm standstill before turning.
                 Sub_Phase = 1U;
+                State_Enter_Ms = in.now_ms;
+                Standstill_Abrupt_Stop = true;
+                out.drive_action = DRIVE_ACTION_EMERGENCY_STOP;
+            }
+            else if (in.chassis_motion_done || !in.chassis_active)
+            {
+                if (!in.chassis_active && in.wheels_still)
+                {
+                    Sub_Phase = 2U;
+                    State_Enter_Ms = in.now_ms;
+                    out.drive_action = DRIVE_ACTION_START_TURN;
+                    out.delta_yaw_rad = Escape_Sign * Config.escape_turn_rad;
+                    out.angular_rad_s = Config.align_max_omega_rad_s;
+                    out.motion_timeout_ms = 4000U;
+                    Escape_Sign = -Escape_Sign;
+                }
+                else
+                {
+                    Sub_Phase = 1U;
+                    State_Enter_Ms = in.now_ms;
+                    Standstill_Abrupt_Stop = false;
+                    out.drive_action = DRIVE_ACTION_SOFT_STOP;
+                }
+            }
+            else
+            {
+                out.drive_action = DRIVE_ACTION_KEEP;
+            }
+        }
+        else if (Sub_Phase == 1U)
+        {
+            const bool reverse_clearance_lost = Is_Reverse_Clearance_Lost(rear_sensor_clear);
+            if (in.chassis_active || !in.wheels_still)
+            {
+                if ((uint32_t)(in.now_ms - State_Enter_Ms) >= 1500U)
+                {
+                    Fault_Stop(in.now_ms);
+                    out.drive_action = DRIVE_ACTION_EMERGENCY_STOP;
+                }
+                else
+                {
+                    const bool hard_stop =
+                        Standstill_Abrupt_Stop || reverse_clearance_lost || opponent_alert || in.chassis_stalled;
+                    out.drive_action = hard_stop ? DRIVE_ACTION_EMERGENCY_STOP : DRIVE_ACTION_SOFT_STOP;
+                }
+            }
+            else
+            {
+                Sub_Phase = 2U;
+                State_Enter_Ms = in.now_ms;
                 out.drive_action = DRIVE_ACTION_START_TURN;
                 out.delta_yaw_rad = Escape_Sign * Config.escape_turn_rad;
                 out.angular_rad_s = Config.align_max_omega_rad_s;
                 out.motion_timeout_ms = 4000U;
                 Escape_Sign = -Escape_Sign;
-            }
-            else
-            {
-                out.drive_action = DRIVE_ACTION_KEEP;
             }
         }
         else
@@ -1081,7 +1366,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             else if (in.chassis_stalled || in.chassis_motion_aborted || !in.chassis_active)
             {
                 // Turn failed/stalled/timed out: consume escape budget rather than treating as success.
-                Start_Escape(in.now_ms, 0.0f, out);
+                Start_Escape(in.now_ms, 0.0f, in.chassis_active, in.wheels_still, out);
             }
             else
             {

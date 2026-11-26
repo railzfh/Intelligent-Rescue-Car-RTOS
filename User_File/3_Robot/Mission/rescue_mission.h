@@ -69,6 +69,7 @@ struct Struct_Mission_Config
     uint16_t home_drop_dist_mm = 230U;
 
     float min_proven_reverse_m = 0.06f;        // Minimum proven swept corridor before reverse is authorized
+    float reverse_stop_margin_m = 0.04f;       // Reserved stopping buffer behind authorized reverse distance
     float max_proven_reverse_m = 0.26f;        // Maximum tracked forward swept corridor
     float separate_backout_m = -0.18f;
     float separate_turn_rad = 0.45f;
@@ -87,6 +88,7 @@ struct Struct_Mission_Inputs
     bool can_launch = false;
     bool button_pressed = false;
     bool chassis_active = false;
+    bool wheels_still = false;
     bool chassis_motion_done = false;
     bool chassis_motion_aborted = false;
     bool chassis_stalled = false;
@@ -152,7 +154,9 @@ private:
     void Record_Progress(uint32_t now_ms, bool reset_escapes);
     float Available_Reverse_M(bool vision_fresh, bool rear_sensor_clear,
                               bool opponent_alert, float requested_abs_m) const;
-    void Start_Escape(uint32_t now_ms, float reverse_abs_m, Struct_Mission_Output &out);
+    bool Is_Reverse_Clearance_Lost(bool rear_sensor_clear) const;
+    void Start_Escape(uint32_t now_ms, float reverse_abs_m, bool chassis_active,
+                      bool wheels_still, Struct_Mission_Output &out);
 
     const Struct_Mission_Config Config;
 
@@ -201,6 +205,8 @@ private:
     float Proven_Rear_Clear_M = 0.0f;
     float Proven_Rear_Yaw_Accum_Rad = 0.0f;
     uint32_t Last_Forward_Clear_Ms = 0U;
+    float Pending_Escape_Reverse_M = 0.0f;
+    bool Standstill_Abrupt_Stop = false;
 
     // Cargo locked upon gate closure for safe-zone half matching and score counting.
     bool Cargo_Already_Confirmed = false;

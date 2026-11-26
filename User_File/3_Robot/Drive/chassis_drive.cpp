@@ -25,9 +25,10 @@ bool Class_Chassis_Drive::Config_Valid() const
            Config.stall_duration_ms > 0U;
 }
 
-void Class_Chassis_Drive::Prepare_Active_Mode(const std::array<float, 2> &measured_speed)
+void Class_Chassis_Drive::Prepare_Active_Mode(const std::array<float, 2> &measured_speed,
+                                              Enum_Chassis_Mode next_mode)
 {
-    if (Mode == CHASSIS_MODE_IDLE)
+    if (Mode == CHASSIS_MODE_IDLE || Mode != next_mode)
     {
         for (uint8_t i = 0; i < 2; ++i)
         {
@@ -37,6 +38,7 @@ void Class_Chassis_Drive::Prepare_Active_Mode(const std::array<float, 2> &measur
             Wheel[i].Reset(seed);
             Wheel_Target_Rad_S[i] = seed;
         }
+        Forward_Profile_Rad_S = 0.5f * (Wheel_Target_Rad_S[0] + Wheel_Target_Rad_S[1]);
     }
     Motion_Done = false;
     Motion_Aborted = false;
@@ -125,7 +127,7 @@ bool Class_Chassis_Drive::Set_Velocity(float linear_mps, float angular_rad_s,
         return false;
     }
 
-    Prepare_Active_Mode(measured_speed);
+    Prepare_Active_Mode(measured_speed, CHASSIS_MODE_VELOCITY);
     Cmd_Linear_Mps = linear_mps;
     Cmd_Angular_Rad_S = angular_rad_s;
     Mode_Start_Ms = now_ms;
@@ -155,7 +157,7 @@ bool Class_Chassis_Drive::Start_Distance(float distance_m, float max_speed_mps,
         return true;
     }
 
-    Prepare_Active_Mode(speed);
+    Prepare_Active_Mode(speed, CHASSIS_MODE_DISTANCE);
     Clear_Stall();
     Start_Angle = angle;
     Target_Distance_M = distance_m;
@@ -187,7 +189,7 @@ bool Class_Chassis_Drive::Start_Turn(float delta_yaw_rad, float max_omega_rad_s,
         return true;
     }
 
-    Prepare_Active_Mode(speed);
+    Prepare_Active_Mode(speed, CHASSIS_MODE_TURN);
     Clear_Stall();
     Target_Heading_Rad = heading_rad + delta_yaw_rad;
     const float max_physical_omega = (2.0f * Config.wheel_radius_m * Config.max_wheel_rad_s) / Config.track_width_m;

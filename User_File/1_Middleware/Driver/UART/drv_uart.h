@@ -53,6 +53,8 @@ struct Struct_UART_Manage_Object
 
     // 接收时间戳
     uint64_t Rx_Time_Stamp;
+    // 中断上下文检测到 RX 停止或重装失败后，交由任务上下文终止旧 DMA 流并重装。
+    volatile bool Rx_Recovery_Pending;
 };
 
 /* Exported variables --------------------------------------------------------*/
@@ -75,6 +77,8 @@ extern struct Struct_UART_Manage_Object UART10_Manage_Object;
 void UART_Init(UART_HandleTypeDef *huart, UART_Callback Callback_Function);
 
 void UART_Reinit(UART_HandleTypeDef * huart);
+
+bool UART_Service_Rx_Recovery(UART_HandleTypeDef *huart);
 
 uint8_t UART_Transmit_Data(UART_HandleTypeDef *huart, uint8_t *Data, uint16_t Length);
 

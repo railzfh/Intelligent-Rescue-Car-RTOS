@@ -35,14 +35,44 @@ Struct_UART_Manage_Object UART10_Manage_Object = {nullptr};
 
 /* Private function declarations ---------------------------------------------*/
 
-static void UART_Start_Rx_DMA(UART_HandleTypeDef *huart, uint8_t *buffer)
+static Struct_UART_Manage_Object *UART_Get_Manage_Object(UART_HandleTypeDef *huart)
 {
-    if (HAL_UARTEx_ReceiveToIdle_DMA(huart, buffer, UART_BUFFER_SIZE) == HAL_OK &&
-        huart->hdmarx != nullptr)
+    if (huart == nullptr)
+    {
+        return nullptr;
+    }
+    if (huart->Instance == USART1) { return &UART1_Manage_Object; }
+    if (huart->Instance == USART2) { return &UART2_Manage_Object; }
+    if (huart->Instance == USART3) { return &UART3_Manage_Object; }
+    if (huart->Instance == UART4) { return &UART4_Manage_Object; }
+    if (huart->Instance == UART5) { return &UART5_Manage_Object; }
+    if (huart->Instance == USART6) { return &UART6_Manage_Object; }
+    if (huart->Instance == UART7) { return &UART7_Manage_Object; }
+    if (huart->Instance == UART8) { return &UART8_Manage_Object; }
+    if (huart->Instance == UART9) { return &UART9_Manage_Object; }
+    if (huart->Instance == USART10) { return &UART10_Manage_Object; }
+    return nullptr;
+}
+
+static bool UART_Start_Rx_DMA(Struct_UART_Manage_Object *obj)
+{
+    if (obj == nullptr || obj->UART_Handler == nullptr || obj->Rx_Buffer_Active == nullptr)
+    {
+        return false;
+    }
+    UART_HandleTypeDef *huart = obj->UART_Handler;
+    if (HAL_UARTEx_ReceiveToIdle_DMA(huart, obj->Rx_Buffer_Active, UART_BUFFER_SIZE) != HAL_OK)
+    {
+        // Never discard a failed rearm: defer full RX DMA abort + rearm to task context.
+        obj->Rx_Recovery_Pending = true;
+        return false;
+    }
+    if (huart->hdmarx != nullptr)
     {
         // Normal-mode double-buffered IDLE/TC reception must not swap buffers on HT.
         __HAL_DMA_DISABLE_IT(huart->hdmarx, DMA_IT_HT);
     }
+    return true;
 }
 
 /* function prototypes -------------------------------------------------------*/
@@ -52,149 +82,82 @@ static void UART_Start_Rx_DMA(UART_HandleTypeDef *huart, uint8_t *buffer)
  *
  * @param huart UART编号
  * @param Callback_Function 处理回调函数
- * @param Rx_Buffer_Length 接收缓冲区长度
  */
 void UART_Init(UART_HandleTypeDef *huart, UART_Callback Callback_Function)
 {
-    if (huart->Instance == USART1)
+    Struct_UART_Manage_Object *obj = UART_Get_Manage_Object(huart);
+    if (obj == nullptr)
     {
-        UART1_Manage_Object.UART_Handler = huart;
-        UART1_Manage_Object.Callback_Function = Callback_Function;
-
-        UART1_Manage_Object.Rx_Buffer_Active = UART1_Manage_Object.Rx_Buffer_0;
-        UART_Start_Rx_DMA(huart, UART1_Manage_Object.Rx_Buffer_Active);
+        return;
     }
-    else if (huart->Instance == USART2)
-    {
-        UART2_Manage_Object.UART_Handler = huart;
-        UART2_Manage_Object.Callback_Function = Callback_Function;
-
-        UART2_Manage_Object.Rx_Buffer_Active = UART2_Manage_Object.Rx_Buffer_0;
-        UART_Start_Rx_DMA(huart, UART2_Manage_Object.Rx_Buffer_Active);
-    }
-    else if (huart->Instance == USART3)
-    {
-        UART3_Manage_Object.UART_Handler = huart;
-        UART3_Manage_Object.Callback_Function = Callback_Function;
-
-        UART3_Manage_Object.Rx_Buffer_Active = UART3_Manage_Object.Rx_Buffer_0;
-        UART_Start_Rx_DMA(huart, UART3_Manage_Object.Rx_Buffer_Active);
-    }
-    else if (huart->Instance == UART4)
-    {
-        UART4_Manage_Object.UART_Handler = huart;
-        UART4_Manage_Object.Callback_Function = Callback_Function;
-
-        UART4_Manage_Object.Rx_Buffer_Active = UART4_Manage_Object.Rx_Buffer_0;
-        UART_Start_Rx_DMA(huart, UART4_Manage_Object.Rx_Buffer_Active);
-    }
-    else if (huart->Instance == UART5)
-    {
-        UART5_Manage_Object.UART_Handler = huart;
-        UART5_Manage_Object.Callback_Function = Callback_Function;
-
-        UART5_Manage_Object.Rx_Buffer_Active = UART5_Manage_Object.Rx_Buffer_0;
-        UART_Start_Rx_DMA(huart, UART5_Manage_Object.Rx_Buffer_Active);
-    }
-    else if (huart->Instance == USART6)
-    {
-        UART6_Manage_Object.UART_Handler = huart;
-        UART6_Manage_Object.Callback_Function = Callback_Function;
-
-        UART6_Manage_Object.Rx_Buffer_Active = UART6_Manage_Object.Rx_Buffer_0;
-        UART_Start_Rx_DMA(huart, UART6_Manage_Object.Rx_Buffer_Active);
-    }
-    else if (huart->Instance == UART7)
-    {
-        UART7_Manage_Object.UART_Handler = huart;
-        UART7_Manage_Object.Callback_Function = Callback_Function;
-
-        UART7_Manage_Object.Rx_Buffer_Active = UART7_Manage_Object.Rx_Buffer_0;
-        UART_Start_Rx_DMA(huart, UART7_Manage_Object.Rx_Buffer_Active);
-    }
-    else if (huart->Instance == UART8)
-    {
-        UART8_Manage_Object.UART_Handler = huart;
-        UART8_Manage_Object.Callback_Function = Callback_Function;
-
-        UART8_Manage_Object.Rx_Buffer_Active = UART8_Manage_Object.Rx_Buffer_0;
-        UART_Start_Rx_DMA(huart, UART8_Manage_Object.Rx_Buffer_Active);
-    }
-    else if (huart->Instance == UART9)
-    {
-        UART9_Manage_Object.UART_Handler = huart;
-        UART9_Manage_Object.Callback_Function = Callback_Function;
-
-        UART9_Manage_Object.Rx_Buffer_Active = UART9_Manage_Object.Rx_Buffer_0;
-        UART_Start_Rx_DMA(huart, UART9_Manage_Object.Rx_Buffer_Active);
-    }
-    else if (huart->Instance == USART10)
-    {
-        UART10_Manage_Object.UART_Handler = huart;
-        UART10_Manage_Object.Callback_Function = Callback_Function;
-
-        UART10_Manage_Object.Rx_Buffer_Active = UART10_Manage_Object.Rx_Buffer_0;
-        UART_Start_Rx_DMA(huart, UART10_Manage_Object.Rx_Buffer_Active);
-    }
+    obj->UART_Handler = huart;
+    obj->Callback_Function = Callback_Function;
+    obj->Rx_Buffer_Active = obj->Rx_Buffer_0;
+    obj->Rx_Buffer_Ready = nullptr;
+    obj->Rx_Recovery_Pending = false;
+    (void)UART_Start_Rx_DMA(obj);
 }
 
 /**
- * @brief 重新初始化UART
+ * @brief 重新初始化UART（任务上下文安全：先中止旧RX DMA再重装）
  *
  * @param huart UART编号
  */
 void UART_Reinit(UART_HandleTypeDef *huart)
 {
-    if (huart->Instance == USART1)
+    Struct_UART_Manage_Object *obj = UART_Get_Manage_Object(huart);
+    if (obj == nullptr)
     {
-        UART1_Manage_Object.Rx_Buffer_Active = UART1_Manage_Object.Rx_Buffer_0;
-        UART_Start_Rx_DMA(huart, UART1_Manage_Object.Rx_Buffer_Active);
+        return;
     }
-    else if (huart->Instance == USART2)
+    if (obj->UART_Handler == nullptr)
     {
-        UART2_Manage_Object.Rx_Buffer_Active = UART2_Manage_Object.Rx_Buffer_0;
-        UART_Start_Rx_DMA(huart, UART2_Manage_Object.Rx_Buffer_Active);
+        obj->UART_Handler = huart;
     }
-    else if (huart->Instance == USART3)
+    obj->Rx_Recovery_Pending = true;
+    (void)UART_Service_Rx_Recovery(huart);
+}
+
+/**
+ * @brief 在任务上下文中恢复因TX/RX DMA或UART错误而停止的RX接收流
+ *
+ * @param huart UART编号
+ * @return true RX DMA 处于有效运行态；false 恢复失败并保持待重试标志
+ */
+bool UART_Service_Rx_Recovery(UART_HandleTypeDef *huart)
+{
+    Struct_UART_Manage_Object *obj = UART_Get_Manage_Object(huart);
+    if (obj == nullptr || obj->UART_Handler != huart)
     {
-        UART3_Manage_Object.Rx_Buffer_Active = UART3_Manage_Object.Rx_Buffer_0;
-        UART_Start_Rx_DMA(huart, UART3_Manage_Object.Rx_Buffer_Active);
+        return false;
     }
-    else if (huart->Instance == UART4)
+    if (!obj->Rx_Recovery_Pending && huart->RxState == HAL_UART_STATE_BUSY_RX)
     {
-        UART4_Manage_Object.Rx_Buffer_Active = UART4_Manage_Object.Rx_Buffer_0;
-        UART_Start_Rx_DMA(huart, UART4_Manage_Object.Rx_Buffer_Active);
+        return true;
     }
-    else if (huart->Instance == UART5)
+
+    // Clear flag before recovery so any new error ISR arriving afterward re-asserts it.
+    obj->Rx_Recovery_Pending = false;
+    __DMB();
+
+    // Bundled STM32H7 HAL UART_DMAError can reset huart->RxState to READY on a TX DMA error
+    // while leaving hdmarx->State == HAL_DMA_STATE_BUSY. Stop the old RX stream completely first.
+    if (HAL_UART_AbortReceive(huart) != HAL_OK)
     {
-        UART5_Manage_Object.Rx_Buffer_Active = UART5_Manage_Object.Rx_Buffer_0;
-        UART_Start_Rx_DMA(huart, UART5_Manage_Object.Rx_Buffer_Active);
+        obj->Rx_Recovery_Pending = true;
+        return false;
     }
-    else if (huart->Instance == USART6)
+    if (huart->hdmarx != nullptr && huart->hdmarx->State != HAL_DMA_STATE_READY)
     {
-        UART6_Manage_Object.Rx_Buffer_Active = UART6_Manage_Object.Rx_Buffer_0;
-        UART_Start_Rx_DMA(huart, UART6_Manage_Object.Rx_Buffer_Active);
+        if (HAL_DMA_Abort(huart->hdmarx) != HAL_OK)
+        {
+            obj->Rx_Recovery_Pending = true;
+            return false;
+        }
     }
-    else if (huart->Instance == UART7)
-    {
-        UART7_Manage_Object.Rx_Buffer_Active = UART7_Manage_Object.Rx_Buffer_0;
-        UART_Start_Rx_DMA(huart, UART7_Manage_Object.Rx_Buffer_Active);
-    }
-    else if (huart->Instance == UART8)
-    {
-        UART8_Manage_Object.Rx_Buffer_Active = UART8_Manage_Object.Rx_Buffer_0;
-        UART_Start_Rx_DMA(huart, UART8_Manage_Object.Rx_Buffer_Active);
-    }
-    else if (huart->Instance == UART9)
-    {
-        UART9_Manage_Object.Rx_Buffer_Active = UART9_Manage_Object.Rx_Buffer_0;
-        UART_Start_Rx_DMA(huart, UART9_Manage_Object.Rx_Buffer_Active);
-    }
-    else if (huart->Instance == USART10)
-    {
-        UART10_Manage_Object.Rx_Buffer_Active = UART10_Manage_Object.Rx_Buffer_0;
-        UART_Start_Rx_DMA(huart, UART10_Manage_Object.Rx_Buffer_Active);
-    }
+
+    obj->Rx_Buffer_Active = obj->Rx_Buffer_0;
+    return UART_Start_Rx_DMA(obj);
 }
 
 /**
@@ -224,263 +187,29 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
         return;
     }
 
-    // 判断程序初始化完成
-    if (!init_finished)
+    Struct_UART_Manage_Object *obj = UART_Get_Manage_Object(huart);
+    if (obj == nullptr || obj->UART_Handler != huart)
     {
-        // 重启接收
-        if (huart->Instance == USART1)
-        {
-            UART_Start_Rx_DMA(huart, UART1_Manage_Object.Rx_Buffer_Active);
-        }
-        else if (huart->Instance == USART2)
-        {
-            UART_Start_Rx_DMA(huart, UART2_Manage_Object.Rx_Buffer_Active);
-        }
-        else if (huart->Instance == USART3)
-        {
-            UART_Start_Rx_DMA(huart, UART3_Manage_Object.Rx_Buffer_Active);
-        }
-        else if (huart->Instance == UART4)
-        {
-            UART_Start_Rx_DMA(huart, UART4_Manage_Object.Rx_Buffer_Active);
-        }
-        else if (huart->Instance == UART5)
-        {
-            UART_Start_Rx_DMA(huart, UART5_Manage_Object.Rx_Buffer_Active);
-        }
-        else if (huart->Instance == USART6)
-        {
-            UART_Start_Rx_DMA(huart, UART6_Manage_Object.Rx_Buffer_Active);
-        }
-        else if (huart->Instance == UART7)
-        {
-            UART_Start_Rx_DMA(huart, UART7_Manage_Object.Rx_Buffer_Active);
-        }
-        else if (huart->Instance == UART8)
-        {
-            UART_Start_Rx_DMA(huart, UART8_Manage_Object.Rx_Buffer_Active);
-        }
-        else if (huart->Instance == UART9)
-        {
-            UART_Start_Rx_DMA(huart, UART9_Manage_Object.Rx_Buffer_Active);
-        }
-        else if (huart->Instance == USART10)
-        {
-            UART_Start_Rx_DMA(huart, UART10_Manage_Object.Rx_Buffer_Active);
-        }
         return;
     }
 
-    // 选择回调函数
-    if (huart->Instance == USART1)
+    // 判断程序初始化完成
+    if (!init_finished)
     {
-        UART1_Manage_Object.Rx_Buffer_Ready = UART1_Manage_Object.Rx_Buffer_Active;
-        if (UART1_Manage_Object.Rx_Buffer_Active == UART1_Manage_Object.Rx_Buffer_0)
-        {
-            UART1_Manage_Object.Rx_Buffer_Active = UART1_Manage_Object.Rx_Buffer_1;
-        }
-        else
-        {
-            UART1_Manage_Object.Rx_Buffer_Active = UART1_Manage_Object.Rx_Buffer_0;
-        }
-
-        UART1_Manage_Object.Rx_Time_Stamp = SYS_Timestamp.Get_Current_Timestamp();
-
-        UART_Start_Rx_DMA(huart, UART1_Manage_Object.Rx_Buffer_Active);
-
-        if (UART1_Manage_Object.Callback_Function != nullptr)
-        {
-            UART1_Manage_Object.Callback_Function(UART1_Manage_Object.Rx_Buffer_Ready, Size);
-        }
+        (void)UART_Start_Rx_DMA(obj);
+        return;
     }
-    else if (huart->Instance == USART2)
+
+    obj->Rx_Buffer_Ready = obj->Rx_Buffer_Active;
+    obj->Rx_Buffer_Active =
+        (obj->Rx_Buffer_Active == obj->Rx_Buffer_0) ? obj->Rx_Buffer_1 : obj->Rx_Buffer_0;
+    obj->Rx_Time_Stamp = SYS_Timestamp.Get_Current_Timestamp();
+
+    (void)UART_Start_Rx_DMA(obj);
+
+    if (obj->Callback_Function != nullptr)
     {
-        UART2_Manage_Object.Rx_Buffer_Ready = UART2_Manage_Object.Rx_Buffer_Active;
-        if (UART2_Manage_Object.Rx_Buffer_Active == UART2_Manage_Object.Rx_Buffer_0)
-        {
-            UART2_Manage_Object.Rx_Buffer_Active = UART2_Manage_Object.Rx_Buffer_1;
-        }
-        else
-        {
-            UART2_Manage_Object.Rx_Buffer_Active = UART2_Manage_Object.Rx_Buffer_0;
-        }
-
-        UART2_Manage_Object.Rx_Time_Stamp = SYS_Timestamp.Get_Current_Timestamp();
-
-        UART_Start_Rx_DMA(huart, UART2_Manage_Object.Rx_Buffer_Active);
-
-        if (UART2_Manage_Object.Callback_Function != nullptr)
-        {
-            UART2_Manage_Object.Callback_Function(UART2_Manage_Object.Rx_Buffer_Ready, Size);
-        }
-    }
-    else if (huart->Instance == USART3)
-    {
-        UART3_Manage_Object.Rx_Buffer_Ready = UART3_Manage_Object.Rx_Buffer_Active;
-        if (UART3_Manage_Object.Rx_Buffer_Active == UART3_Manage_Object.Rx_Buffer_0)
-        {
-            UART3_Manage_Object.Rx_Buffer_Active = UART3_Manage_Object.Rx_Buffer_1;
-        }
-        else
-        {
-            UART3_Manage_Object.Rx_Buffer_Active = UART3_Manage_Object.Rx_Buffer_0;
-        }
-
-        UART3_Manage_Object.Rx_Time_Stamp = SYS_Timestamp.Get_Current_Timestamp();
-
-        UART_Start_Rx_DMA(huart, UART3_Manage_Object.Rx_Buffer_Active);
-
-        if (UART3_Manage_Object.Callback_Function != nullptr)
-        {
-            UART3_Manage_Object.Callback_Function(UART3_Manage_Object.Rx_Buffer_Ready, Size);
-        }
-    }
-    else if (huart->Instance == UART4)
-    {
-        UART4_Manage_Object.Rx_Buffer_Ready = UART4_Manage_Object.Rx_Buffer_Active;
-        if (UART4_Manage_Object.Rx_Buffer_Active == UART4_Manage_Object.Rx_Buffer_0)
-        {
-            UART4_Manage_Object.Rx_Buffer_Active = UART4_Manage_Object.Rx_Buffer_1;
-        }
-        else
-        {
-            UART4_Manage_Object.Rx_Buffer_Active = UART4_Manage_Object.Rx_Buffer_0;
-        }
-
-        UART4_Manage_Object.Rx_Time_Stamp = SYS_Timestamp.Get_Current_Timestamp();
-
-        UART_Start_Rx_DMA(huart, UART4_Manage_Object.Rx_Buffer_Active);
-
-        if (UART4_Manage_Object.Callback_Function != nullptr)
-        {
-            UART4_Manage_Object.Callback_Function(UART4_Manage_Object.Rx_Buffer_Ready, Size);
-        }
-    }
-    else if (huart->Instance == UART5)
-    {
-        UART5_Manage_Object.Rx_Buffer_Ready = UART5_Manage_Object.Rx_Buffer_Active;
-        if (UART5_Manage_Object.Rx_Buffer_Active == UART5_Manage_Object.Rx_Buffer_0)
-        {
-            UART5_Manage_Object.Rx_Buffer_Active = UART5_Manage_Object.Rx_Buffer_1;
-        }
-        else
-        {
-            UART5_Manage_Object.Rx_Buffer_Active = UART5_Manage_Object.Rx_Buffer_0;
-        }
-
-        UART5_Manage_Object.Rx_Time_Stamp = SYS_Timestamp.Get_Current_Timestamp();
-
-        UART_Start_Rx_DMA(huart, UART5_Manage_Object.Rx_Buffer_Active);
-
-        if (UART5_Manage_Object.Callback_Function != nullptr)
-        {
-            UART5_Manage_Object.Callback_Function(UART5_Manage_Object.Rx_Buffer_Ready, Size);
-        }
-    }
-    else if (huart->Instance == USART6)
-    {
-        UART6_Manage_Object.Rx_Buffer_Ready = UART6_Manage_Object.Rx_Buffer_Active;
-        if (UART6_Manage_Object.Rx_Buffer_Active == UART6_Manage_Object.Rx_Buffer_0)
-        {
-            UART6_Manage_Object.Rx_Buffer_Active = UART6_Manage_Object.Rx_Buffer_1;
-        }
-        else
-        {
-            UART6_Manage_Object.Rx_Buffer_Active = UART6_Manage_Object.Rx_Buffer_0;
-        }
-
-        UART6_Manage_Object.Rx_Time_Stamp = SYS_Timestamp.Get_Current_Timestamp();
-
-        UART_Start_Rx_DMA(huart, UART6_Manage_Object.Rx_Buffer_Active);
-
-        if (UART6_Manage_Object.Callback_Function != nullptr)
-        {
-            UART6_Manage_Object.Callback_Function(UART6_Manage_Object.Rx_Buffer_Ready, Size);
-        }
-    }
-    else if (huart->Instance == UART7)
-    {
-        UART7_Manage_Object.Rx_Buffer_Ready = UART7_Manage_Object.Rx_Buffer_Active;
-        if (UART7_Manage_Object.Rx_Buffer_Active == UART7_Manage_Object.Rx_Buffer_0)
-        {
-            UART7_Manage_Object.Rx_Buffer_Active = UART7_Manage_Object.Rx_Buffer_1;
-        }
-        else
-        {
-            UART7_Manage_Object.Rx_Buffer_Active = UART7_Manage_Object.Rx_Buffer_0;
-        }
-
-        UART7_Manage_Object.Rx_Time_Stamp = SYS_Timestamp.Get_Current_Timestamp();
-
-        UART_Start_Rx_DMA(huart, UART7_Manage_Object.Rx_Buffer_Active);
-
-        if (UART7_Manage_Object.Callback_Function != nullptr)
-        {
-            UART7_Manage_Object.Callback_Function(UART7_Manage_Object.Rx_Buffer_Ready, Size);
-        }
-    }
-    else if (huart->Instance == UART8)
-    {
-        UART8_Manage_Object.Rx_Buffer_Ready = UART8_Manage_Object.Rx_Buffer_Active;
-        if (UART8_Manage_Object.Rx_Buffer_Active == UART8_Manage_Object.Rx_Buffer_0)
-        {
-            UART8_Manage_Object.Rx_Buffer_Active = UART8_Manage_Object.Rx_Buffer_1;
-        }
-        else
-        {
-            UART8_Manage_Object.Rx_Buffer_Active = UART8_Manage_Object.Rx_Buffer_0;
-        }
-
-        UART8_Manage_Object.Rx_Time_Stamp = SYS_Timestamp.Get_Current_Timestamp();
-
-        UART_Start_Rx_DMA(huart, UART8_Manage_Object.Rx_Buffer_Active);
-
-        if (UART8_Manage_Object.Callback_Function != nullptr)
-        {
-            UART8_Manage_Object.Callback_Function(UART8_Manage_Object.Rx_Buffer_Ready, Size);
-        }
-    }
-    else if (huart->Instance == UART9)
-    {
-        UART9_Manage_Object.Rx_Buffer_Ready = UART9_Manage_Object.Rx_Buffer_Active;
-        if (UART9_Manage_Object.Rx_Buffer_Active == UART9_Manage_Object.Rx_Buffer_0)
-        {
-            UART9_Manage_Object.Rx_Buffer_Active = UART9_Manage_Object.Rx_Buffer_1;
-        }
-        else
-        {
-            UART9_Manage_Object.Rx_Buffer_Active = UART9_Manage_Object.Rx_Buffer_0;
-        }
-
-        UART9_Manage_Object.Rx_Time_Stamp = SYS_Timestamp.Get_Current_Timestamp();
-
-        UART_Start_Rx_DMA(huart, UART9_Manage_Object.Rx_Buffer_Active);
-
-        if (UART9_Manage_Object.Callback_Function != nullptr)
-        {
-            UART9_Manage_Object.Callback_Function(UART9_Manage_Object.Rx_Buffer_Ready, Size);
-        }
-    }
-    else if (huart->Instance == USART10)
-    {
-        UART10_Manage_Object.Rx_Buffer_Ready = UART10_Manage_Object.Rx_Buffer_Active;
-        if (UART10_Manage_Object.Rx_Buffer_Active == UART10_Manage_Object.Rx_Buffer_0)
-        {
-            UART10_Manage_Object.Rx_Buffer_Active = UART10_Manage_Object.Rx_Buffer_1;
-        }
-        else
-        {
-            UART10_Manage_Object.Rx_Buffer_Active = UART10_Manage_Object.Rx_Buffer_0;
-        }
-
-        UART10_Manage_Object.Rx_Time_Stamp = SYS_Timestamp.Get_Current_Timestamp();
-
-        UART_Start_Rx_DMA(huart, UART10_Manage_Object.Rx_Buffer_Active);
-
-        if (UART10_Manage_Object.Callback_Function != nullptr)
-        {
-            UART10_Manage_Object.Callback_Function(UART10_Manage_Object.Rx_Buffer_Ready, Size);
-        }
+        obj->Callback_Function(obj->Rx_Buffer_Ready, Size);
     }
 }
 
@@ -491,10 +220,16 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
  */
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
-    // Only re-arm RX when HAL has stopped RX; do not clobber active RX buffer on TX-only errors.
+    Struct_UART_Manage_Object *obj = UART_Get_Manage_Object(huart);
+    if (obj == nullptr || obj->UART_Handler != huart)
+    {
+        return;
+    }
+    // Only schedule task-context recovery when HAL has stopped RX (including TX DMA errors that
+    // cleared RxState to READY while leaving hdmarx BUSY). Preserve active RX on non-stopping errors.
     if (huart->RxState == HAL_UART_STATE_READY)
     {
-        UART_Reinit(huart);
+        obj->Rx_Recovery_Pending = true;
     }
 }
 

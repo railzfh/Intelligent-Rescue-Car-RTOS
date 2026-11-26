@@ -122,11 +122,21 @@ static void Test_Stale_Vision_And_Opponent_Interlock_During_Moving_States()
 
     in.button_pressed = false;
     in.chassis_active = true;
+    in.wheels_still = false;
     assert(opp_m.On_Vision_State(Make_Far_Vision(2U, TARGET_GREEN_MATERIAL, VIS_FLAG_OPPONENT_ZONE_NEAR), 150U));
     in.now_ms = 150U;
     out = opp_m.Update(in);
     assert(opp_m.Get_State() == MISSION_ESCAPE_RECOVERY);
-    // No rear clearance proven -> must turn in place, NOT blindly reverse!
+    // While still moving, must cancel immediately with EMERGENCY_STOP and confirm standstill before turning!
+    assert(out.drive_action == DRIVE_ACTION_EMERGENCY_STOP);
+
+    // Once stopped (chassis inactive and wheels still), escape starts bounded in-place turn (no blind reverse).
+    in.chassis_active = false;
+    in.wheels_still = true;
+    in.now_ms = 160U;
+    assert(opp_m.On_Vision_State(Make_Far_Vision(3U, TARGET_GREEN_MATERIAL, 0U), 160U));
+    out = opp_m.Update(in);
+    assert(opp_m.Get_State() == MISSION_ESCAPE_RECOVERY);
     assert(out.drive_action == DRIVE_ACTION_START_TURN);
 }
 
@@ -193,6 +203,7 @@ static void Test_Full_First_Green_Delivery_And_Proven_Rear_Corridor()
     in.hardware_ready = true;
     in.can_launch = true;
     in.button_pressed = true;
+    in.wheels_still = true;
     in.gate_settled = true;
     in.camera_settled = true;
     mission.Update(in);
@@ -261,24 +272,40 @@ static void Test_Full_First_Green_Delivery_And_Proven_Rear_Corridor()
 
     // Simulate straight forward push building 0.16 m proven swept rear corridor (NO fabricated rear_clear flag!).
     in.chassis_active = true;
+    in.wheels_still = false;
     in.forward_delta_m = 0.16f;
     in.chassis_motion_done = true;
     in.now_ms = (t += 100U);
-    assert(mission.On_Vision_State(Make_Near_Vision(seq++, 0U, 0U, 0U, 0U, 0U, safe), t));
+    assert(mission.On_Vision_State(
+        Make_Near_Vision(seq++, 0U, 0U, 0U, 0U, 0U, safe | VIS_FLAG_HOME_HALF_MATCH), t));
     out = mission.Update(in);
     assert(mission.Get_State() == MISSION_DROP_BACKOUT_VERIFY);
-    // Reverse distance must be bounded strictly by the proven 0.16 m swept corridor (<= 0.16 m)!
-    assert(out.drive_action == DRIVE_ACTION_START_DISTANCE);
-    assert(out.distance_m < -0.15f && out.distance_m >= -0.165f);
+    // Must confirm standstill from forward push before starting margin-bounded reverse!
+    assert(out.drive_action == DRIVE_ACTION_SOFT_STOP);
 
     in.forward_delta_m = 0.0f;
+    in.chassis_motion_done = false;
+    in.chassis_active = false;
+    in.wheels_still = true;
+    in.now_ms = (t += 20U);
+    assert(mission.On_Vision_State(Make_Near_Vision(seq++, 0U, 0U, 0U, 0U, 0U, safe), t));
+    out = mission.Update(in);
+    // Reverse distance must reserve reverse_stop_margin_m (0.04 m) out of 0.16 m -> <= 0.12 m!
+    assert(out.drive_action == DRIVE_ACTION_START_DISTANCE);
+    assert(out.distance_m <= -0.115f && out.distance_m >= -0.125f);
+
+    in.chassis_active = true;
+    in.wheels_still = false;
+    in.forward_delta_m = -0.12f;
     in.chassis_motion_done = true;
     in.now_ms = (t += 100U);
     assert(mission.On_Vision_State(Make_Near_Vision(seq++, 0U, 0U, 0U, 0U, 0U, VIS_FLAG_DROP_CONFIRMED), t));
     mission.Update(in);
 
+    in.forward_delta_m = 0.0f;
     in.chassis_motion_done = false;
     in.chassis_active = false;
+    in.wheels_still = true;
     for (int k = 0; k < 3; ++k)
     {
         in.now_ms = (t += 50U);
@@ -303,6 +330,7 @@ static void Test_Bounded_Recovery_Budget_And_Progress_Watchdog()
     in.hardware_ready = true;
     in.can_launch = true;
     in.button_pressed = true;
+    in.wheels_still = true;
     in.gate_settled = true;
     in.camera_settled = true;
     mission.Update(in);
@@ -311,13 +339,33 @@ static void Test_Bounded_Recovery_Budget_And_Progress_Watchdog()
     // Repeated stalls / aborted turns with zero physical progress must latch MISSION_FAULT_STOP strictly < 15 s!
     in.button_pressed = false;
     in.chassis_active = true;
-    for (int step = 0; step < 10 && mission.Get_State() != MISSION_FAULT_STOP; ++step)
+    in.wheels_still = false;
+    for (int step = 0; step < 20 && mission.Get_State() != MISSION_FAULT_STOP; ++step)
     {
         in.now_ms = (t += 100U);
         assert(mission.On_Vision_State(Make_Far_Vision(seq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), t));
-        in.chassis_stalled = true;
-        in.chassis_motion_aborted = true;
-        mission.Update(in);
+        const auto out = mission.Update(in);
+        if (out.drive_action == DRIVE_ACTION_EMERGENCY_STOP)
+        {
+            // Mirror real Chassis_Drive::Emergency_Stop(): becomes idle & wheels stop before next turn.
+            in.chassis_active = false;
+            in.wheels_still = true;
+            in.chassis_stalled = false;
+            in.chassis_motion_aborted = false;
+        }
+        else if (out.drive_action == DRIVE_ACTION_START_TURN)
+        {
+            // Next turn immediately stalls/aborts.
+            in.chassis_active = true;
+            in.wheels_still = false;
+            in.chassis_stalled = true;
+            in.chassis_motion_aborted = true;
+        }
+        else
+        {
+            in.chassis_stalled = true;
+            in.chassis_motion_aborted = true;
+        }
     }
     assert(mission.Get_State() == MISSION_FAULT_STOP);
     assert(t < 2000U);
@@ -336,6 +384,7 @@ static void Test_Cumulative_Yaw_Invalidates_Corridor_And_Active_Reverse_Stops()
     in.hardware_ready = true;
     in.can_launch = true;
     in.button_pressed = true;
+    in.wheels_still = true;
     in.gate_settled = true;
     in.camera_settled = true;
     mission.Update(in);
@@ -376,11 +425,297 @@ static void Test_Cumulative_Yaw_Invalidates_Corridor_And_Active_Reverse_Stops()
 
     in.forward_delta_m = 0.0f;
     in.chassis_stalled = true;
+    in.wheels_still = false;
     in.now_ms = (t += 20U);
     auto out = mission.Update(in);
-    // Note: stall resets Proven_Rear_Clear_M so escape turns in place without blind reverse!
+    // Stall resets Proven_Rear_Clear_M and immediately emergency-stops before confirming standstill to turn!
     assert(mission.Get_State() == MISSION_ESCAPE_RECOVERY);
+    assert(out.drive_action == DRIVE_ACTION_EMERGENCY_STOP);
+
+    in.chassis_stalled = false;
+    in.chassis_active = false;
+    in.wheels_still = true;
+    in.now_ms = (t += 20U);
+    assert(mission.On_Vision_State(Make_Far_Vision(seq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), t));
+    out = mission.Update(in);
     assert(out.drive_action == DRIVE_ACTION_START_TURN);
+}
+
+static void Test_Drop_Rechecks_Hazards_And_Alignment_While_Opening_And_Pushing()
+{
+    const uint16_t safe_aligned = VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR | VIS_FLAG_HOME_HALF_MATCH;
+
+    auto advance_to_gate_opening = [&](Class_Rescue_Mission &m, Struct_Mission_Inputs &in, uint32_t &t, uint16_t &seq) {
+        assert(m.On_Set_Config({RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION, 1U}));
+        assert(m.On_Vision_State(Make_Far_Vision(seq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), t));
+        in = {};
+        in.now_ms = t;
+        in.hardware_ready = true;
+        in.can_launch = true;
+        in.button_pressed = true;
+        in.wheels_still = true;
+        in.gate_settled = true;
+        in.camera_settled = true;
+        m.Update(in);
+
+        in.button_pressed = false;
+        in.chassis_motion_done = true;
+        in.now_ms = (t += 50U);
+        assert(m.On_Vision_State(Make_Far_Vision(seq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 0, 190U), t));
+        m.Update(in);
+        in.chassis_motion_done = false;
+        for (int i = 0; i < 2; ++i)
+        {
+            in.now_ms = (t += 50U);
+            assert(m.On_Vision_State(Make_Far_Vision(seq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 0, 190U), t));
+            m.Update(in);
+        }
+        for (int k = 0; k < 3; ++k)
+        {
+            in.now_ms = (t += 50U);
+            assert(m.On_Vision_State(Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U, VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR), t));
+            m.Update(in);
+        }
+        for (int k = 0; k < 3; ++k)
+        {
+            in.now_ms = (t += 50U);
+            assert(m.On_Vision_State(Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U, VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR), t));
+            m.Update(in);
+        }
+        in.now_ms = (t += 50U);
+        assert(m.On_Vision_State(Make_Far_Vision(seq++, TARGET_NONE, VIS_FLAG_HOME_VALID, 0, 500U), t));
+        m.Update(in);
+        in.now_ms = (t += 50U);
+        assert(m.On_Vision_State(Make_Far_Vision(seq++, TARGET_NONE, VIS_FLAG_HOME_VALID | VIS_FLAG_HOME_HALF_MATCH, 0, 200U), t));
+        m.Update(in);
+        assert(m.Get_State() == MISSION_DROP_OPEN_AND_PUSH);
+        for (int k = 0; k < 3; ++k)
+        {
+            in.now_ms = (t += 50U);
+            assert(m.On_Vision_State(Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U, safe_aligned), t));
+            auto out = m.Update(in);
+            if (k == 2)
+            {
+                assert(!out.gate_closed);
+            }
+        }
+    };
+
+    // Case 1A: Fresh cyan injected while gate is opening MUST abort and NEVER emit START_DISTANCE!
+    {
+        Class_Rescue_Mission m;
+        Struct_Mission_Inputs in{};
+        uint32_t t = 1000U;
+        uint16_t seq = 1U;
+        advance_to_gate_opening(m, in, t, seq);
+
+        in.gate_settled = false;
+        in.now_ms = (t += 50U);
+        assert(m.On_Vision_State(Make_Near_Vision(seq++, 1U, 0U, 0U, 1U, 0U, VIS_FLAG_HOME_HALF_MATCH), t));
+        auto out = m.Update(in);
+        assert(out.drive_action != DRIVE_ACTION_START_DISTANCE);
+        assert(out.drive_action == DRIVE_ACTION_EMERGENCY_STOP);
+        assert(m.Get_State() == MISSION_BACK_OUT_SEPARATE);
+    }
+
+    // Case 1B: Cyan injected on the exact tick gate settles MUST abort and NEVER start push!
+    {
+        Class_Rescue_Mission m;
+        Struct_Mission_Inputs in{};
+        uint32_t t = 1000U;
+        uint16_t seq = 1U;
+        advance_to_gate_opening(m, in, t, seq);
+
+        in.gate_settled = true;
+        in.now_ms = (t += 50U);
+        assert(m.On_Vision_State(Make_Near_Vision(seq++, 1U, 0U, 0U, 1U, 0U, VIS_FLAG_HOME_HALF_MATCH), t));
+        auto out = m.Update(in);
+        assert(out.drive_action == DRIVE_ACTION_EMERGENCY_STOP);
+        assert(m.Get_State() == MISSION_BACK_OUT_SEPARATE);
+    }
+
+    // Case 1C: Half alignment lost DURING active forward push MUST immediately EMERGENCY_STOP!
+    {
+        Class_Rescue_Mission m;
+        Struct_Mission_Inputs in{};
+        uint32_t t = 1000U;
+        uint16_t seq = 1U;
+        advance_to_gate_opening(m, in, t, seq);
+
+        in.gate_settled = true;
+        in.now_ms = (t += 50U);
+        assert(m.On_Vision_State(Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U, safe_aligned), t));
+        auto out = m.Update(in);
+        assert(out.drive_action == DRIVE_ACTION_START_DISTANCE && out.distance_m > 0.0f);
+
+        // Mid-push: robot loses VIS_FLAG_HOME_HALF_MATCH -> immediate EMERGENCY_STOP!
+        in.chassis_active = true;
+        in.wheels_still = false;
+        in.forward_delta_m = 0.05f;
+        in.now_ms = (t += 50U);
+        assert(m.On_Vision_State(Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U, VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR), t));
+        out = m.Update(in);
+        assert(out.drive_action == DRIVE_ACTION_EMERGENCY_STOP);
+        assert(m.Get_State() == MISSION_BACK_OUT_SEPARATE);
+    }
+}
+
+static void Test_Active_Reverse_Abrupt_Clearance_Loss_Cancels_Immediately_And_Waits_Standstill()
+{
+    Class_Rescue_Mission m;
+    assert(m.On_Set_Config({RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION, 1U}));
+    const uint16_t safe = VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR;
+    uint32_t t = 1000U;
+    uint16_t seq = 1U;
+    assert(m.On_Vision_State(Make_Far_Vision(seq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), t));
+
+    Struct_Mission_Inputs in{};
+    in.now_ms = t;
+    in.hardware_ready = true;
+    in.can_launch = true;
+    in.button_pressed = true;
+    in.wheels_still = true;
+    in.gate_settled = true;
+    in.camera_settled = true;
+    m.Update(in);
+
+    // Build 0.16 m straight forward corridor during LAUNCH_CROSS_BUMPS, then arrive at INSPECT_CORRAL.
+    in.button_pressed = false;
+    in.chassis_active = true;
+    in.wheels_still = false;
+    in.forward_delta_m = 0.16f;
+    in.chassis_motion_done = true;
+    in.now_ms = (t += 50U);
+    assert(m.On_Vision_State(Make_Far_Vision(seq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 0, 190U), t));
+    m.Update(in);
+
+    in.forward_delta_m = 0.0f;
+    in.chassis_motion_done = false;
+    in.chassis_active = false;
+    in.wheels_still = true;
+    for (int i = 0; i < 2; ++i)
+    {
+        in.now_ms = (t += 50U);
+        assert(m.On_Vision_State(Make_Far_Vision(seq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 0, 190U), t));
+        m.Update(in);
+    }
+    assert(m.Get_State() == MISSION_INSPECT_CORRAL);
+    assert(m.Get_Proven_Rear_Clear_M() >= 0.15f);
+
+    // Inject cyan in corral -> enters MISSION_BACK_OUT_SEPARATE.
+    in.now_ms = (t += 50U);
+    assert(m.On_Vision_State(Make_Near_Vision(seq++, 0U, 0U, 0U, 1U, 0U, 0U), t));
+    m.Update(in);
+    assert(m.Get_State() == MISSION_BACK_OUT_SEPARATE);
+
+    // First tick of BACK_OUT_SEPARATE while still -> starts margin-bounded reverse (-0.12 m out of 0.16 m).
+    in.now_ms = (t += 20U);
+    assert(m.On_Vision_State(Make_Far_Vision(seq++, TARGET_NONE, 0U), t));
+    auto out = m.Update(in);
+    assert(out.drive_action == DRIVE_ACTION_START_DISTANCE);
+    assert(out.distance_m <= -0.115f && out.distance_m >= -0.125f);
+
+    // Mid-reverse while wheels are moving: yaw drift >= 0.10 rad abruptly zeroes Proven_Rear_Clear_M!
+    in.chassis_active = true;
+    in.wheels_still = false;
+    in.forward_delta_m = -0.02f;
+    in.yaw_delta_rad = 0.12f;
+    in.now_ms = (t += 20U);
+    assert(m.On_Vision_State(Make_Far_Vision(seq++, TARGET_NONE, 0U), t));
+    out = m.Update(in);
+    assert(m.Get_Proven_Rear_Clear_M() == 0.0f);
+    // MUST cancel immediately with EMERGENCY_STOP (NOT START_TURN while wheels still moving!).
+    assert(out.drive_action == DRIVE_ACTION_EMERGENCY_STOP);
+
+    // Next tick: chassis idle, but wheels still spinning (wheels_still == false) -> MUST keep waiting!
+    in.chassis_active = false;
+    in.wheels_still = false;
+    in.forward_delta_m = 0.0f;
+    in.yaw_delta_rad = 0.0f;
+    in.now_ms = (t += 20U);
+    assert(m.On_Vision_State(Make_Far_Vision(seq++, TARGET_NONE, 0U), t));
+    out = m.Update(in);
+    assert(out.drive_action == DRIVE_ACTION_EMERGENCY_STOP);
+
+    // Standstill confirmed -> NOW starts turn cleanly!
+    in.wheels_still = true;
+    in.now_ms = (t += 20U);
+    assert(m.On_Vision_State(Make_Far_Vision(seq++, TARGET_NONE, 0U), t));
+    out = m.Update(in);
+    assert(out.drive_action == DRIVE_ACTION_START_TURN);
+
+    // Also verify abrupt clearance loss during MISSION_DROP_BACKOUT_VERIFY active reverse
+    // cancels IMMEDIATELY with DRIVE_ACTION_EMERGENCY_STOP (never DRIVE_ACTION_SOFT_STOP!).
+    {
+        Class_Rescue_Mission dm;
+        assert(dm.On_Set_Config({RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION, 1U}));
+        const uint16_t safe_aligned = VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR | VIS_FLAG_HOME_HALF_MATCH;
+        uint32_t dt = 1000U;
+        uint16_t dseq = 1U;
+        assert(dm.On_Vision_State(Make_Far_Vision(dseq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), dt));
+        Struct_Mission_Inputs din{};
+        din.now_ms = dt;
+        din.hardware_ready = true;
+        din.can_launch = true;
+        din.button_pressed = true;
+        din.wheels_still = true;
+        din.gate_settled = true;
+        din.camera_settled = true;
+        dm.Update(din);
+        din.button_pressed = false;
+        din.chassis_motion_done = true;
+        din.now_ms = (dt += 50U);
+        assert(dm.On_Vision_State(Make_Far_Vision(dseq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 0, 190U), dt));
+        dm.Update(din);
+        din.chassis_motion_done = false;
+        for (int i = 0; i < 2; ++i)
+        {
+            din.now_ms = (dt += 50U);
+            assert(dm.On_Vision_State(Make_Far_Vision(dseq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 0, 190U), dt));
+            dm.Update(din);
+        }
+        for (int k = 0; k < 6; ++k)
+        {
+            din.now_ms = (dt += 50U);
+            assert(dm.On_Vision_State(Make_Near_Vision(dseq++, 1U, 0U, 0U, 0U, 0U, safe), dt));
+            dm.Update(din);
+        }
+        din.now_ms = (dt += 50U);
+        assert(dm.On_Vision_State(Make_Far_Vision(dseq++, TARGET_NONE, VIS_FLAG_HOME_VALID, 0, 500U), dt));
+        dm.Update(din);
+        din.now_ms = (dt += 50U);
+        assert(dm.On_Vision_State(Make_Far_Vision(dseq++, TARGET_NONE, VIS_FLAG_HOME_VALID | VIS_FLAG_HOME_HALF_MATCH, 0, 200U), dt));
+        dm.Update(din);
+        for (int k = 0; k < 4; ++k)
+        {
+            din.now_ms = (dt += 50U);
+            assert(dm.On_Vision_State(Make_Near_Vision(dseq++, 1U, 0U, 0U, 0U, 0U, safe_aligned), dt));
+            dm.Update(din);
+        }
+        // Complete 0.16 m push -> standstill -> starts margin-bounded backout reverse (-0.12 m).
+        din.forward_delta_m = 0.16f;
+        din.chassis_motion_done = true;
+        din.chassis_active = false;
+        din.wheels_still = true;
+        din.now_ms = (dt += 50U);
+        assert(dm.On_Vision_State(Make_Near_Vision(dseq++, 0U, 0U, 0U, 0U, 0U, safe_aligned), dt));
+        auto dout = dm.Update(din);
+        assert(dm.Get_State() == MISSION_DROP_BACKOUT_VERIFY);
+        assert(dout.drive_action == DRIVE_ACTION_START_DISTANCE && dout.distance_m <= -0.115f && dout.distance_m >= -0.125f);
+
+        // Mid-reverse abrupt clearance loss via yaw jump -> MUST emit DRIVE_ACTION_EMERGENCY_STOP immediately!
+        din.chassis_motion_done = false;
+        din.chassis_active = true;
+        din.wheels_still = false;
+        din.forward_delta_m = -0.02f;
+        din.yaw_delta_rad = 0.12f;
+        din.now_ms = (dt += 20U);
+        assert(dm.On_Vision_State(Make_Near_Vision(dseq++, 0U, 0U, 0U, 0U, 0U, safe_aligned), dt));
+        dout = dm.Update(din);
+        assert(dm.Get_Proven_Rear_Clear_M() == 0.0f);
+        assert(dout.drive_action == DRIVE_ACTION_EMERGENCY_STOP);
+    }
+    (void)safe;
 }
 
 static void Test_Same_Cargo_Reverify_After_Escape_Cannot_Bypass_Recovery_Budget()
@@ -431,7 +766,9 @@ static void Test_Same_Cargo_Reverify_After_Escape_Cannot_Bypass_Recovery_Budget(
     // Repeatedly escape while holding the SAME cargo, finish turn, re-confirm same cargo -> MUST hit fault <= 4 escapes!
     for (int cycle = 0; cycle < 5 && mission.Get_State() != MISSION_FAULT_STOP; ++cycle)
     {
-        // Trigger escape in FIND_HOME via opponent alert.
+        // Trigger escape in FIND_HOME via opponent alert (from standstill).
+        in.chassis_active = false;
+        in.wheels_still = true;
         in.now_ms = (t += 50U);
         assert(mission.On_Vision_State(Make_Far_Vision(seq++, TARGET_NONE, VIS_FLAG_OPPONENT_NEAR), t));
         mission.Update(in);
@@ -470,6 +807,8 @@ int main()
     Test_Full_First_Green_Delivery_And_Proven_Rear_Corridor();
     Test_Bounded_Recovery_Budget_And_Progress_Watchdog();
     Test_Cumulative_Yaw_Invalidates_Corridor_And_Active_Reverse_Stops();
+    Test_Drop_Rechecks_Hazards_And_Alignment_While_Opening_And_Pushing();
+    Test_Active_Reverse_Abrupt_Clearance_Loss_Cancels_Immediately_And_Waits_Standstill();
     Test_Same_Cargo_Reverify_After_Escape_Cannot_Bypass_Recovery_Budget();
-    std::puts("PASS: rescue mission replay/wrap, stale/opponent interlock, gate cyan abort, proven reverse, bounded recovery");
+    std::puts("PASS: rescue mission replay/wrap, stale/opponent interlock, gate/push hazard abort, margin reverse + standstill, bounded recovery");
 }

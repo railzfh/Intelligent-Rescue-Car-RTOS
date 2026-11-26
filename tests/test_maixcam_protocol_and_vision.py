@@ -15,6 +15,9 @@ from maixcam.protocol import (
     CAMERA_VIEW_FAR,
     CAMERA_VIEW_NEAR,
     CAMERA_VIEW_TRANSITION,
+    MISSION_DROP_BACKOUT_VERIFY,
+    MISSION_DROP_OPEN_AND_PUSH,
+    MISSION_SEARCH_TARGET,
     MODE_BENCH_STRAIGHT,
     MODE_COMPETITION,
     RescueProtocolParser,
@@ -40,7 +43,111 @@ from maixcam.protocol import (
     encode_vision_state,
 )
 from maixcam.ui import TouchUIController
-from maixcam.vision import Blob, RescueVisionProcessor, SpatialMotionEstimator, classify_unknown_foreground
+from maixcam.vision import (
+    Blob,
+    RescueVisionProcessor,
+    SpatialMotionEstimator,
+    classify_unknown_foreground,
+    extract_blobs_from_maix_image,
+)
+
+
+class _FakeMaixBlob:
+    def __init__(self, x: int, y: int, w: int, h: int, pixels: int) -> None:
+        self._x, self._y, self._w, self._h, self._px = x, y, w, h, pixels
+
+    def x(self) -> int:
+        return self._x
+
+    def y(self) -> int:
+        return self._y
+
+    def w(self) -> int:
+        return self._w
+
+    def h(self) -> int:
+        return self._h
+
+    def pixels(self) -> int:
+        return self._px
+
+
+class _FakeMaixImage:
+    """Exact LAB pixel-grid image implementing MaixPy find_blobs() for extraction-path tests."""
+
+    def __init__(self, width: int, height: int, fill_lab: tuple[int, int, int]) -> None:
+        self.width = width
+        self.height = height
+        self._grid = [[fill_lab for _ in range(width)] for _ in range(height)]
+
+    def fill_rect(self, x: int, y: int, w: int, h: int, lab: tuple[int, int, int]) -> None:
+        for yy in range(max(0, y), min(self.height, y + h)):
+            row = self._grid[yy]
+            for xx in range(max(0, x), min(self.width, x + w)):
+                row[xx] = lab
+
+    def find_blobs(
+        self,
+        thresholds: list[tuple[int, int, int, int, int, int]],
+        roi: tuple[int, int, int, int] | None = None,
+        pixels_threshold: int = 1,
+        area_threshold: int = 1,
+        invert: bool = False,
+        merge: bool = False,
+    ) -> list[_FakeMaixBlob]:
+        rx, ry, rw, rh = roi if roi is not None else (0, 0, self.width, self.height)
+        x1, y1 = max(0, rx), max(0, ry)
+        x2, y2 = min(self.width, rx + rw), min(self.height, ry + rh)
+        t = thresholds[0]
+
+        def matches(px: tuple[int, int, int]) -> bool:
+            inside = (t[0] <= px[0] <= t[1]) and (t[2] <= px[1] <= t[3]) and (t[4] <= px[2] <= t[5])
+            return (not inside) if invert else inside
+
+        visited = [[False] * (x2 - x1) for _ in range(y2 - y1)]
+        comps: list[tuple[int, int, int, int, int]] = []
+        for yy in range(y1, y2):
+            for xx in range(x1, x2):
+                if visited[yy - y1][xx - x1] or not matches(self._grid[yy][xx]):
+                    continue
+                stack = [(xx, yy)]
+                visited[yy - y1][xx - x1] = True
+                min_x = max_x = xx
+                min_y = max_y = yy
+                cnt = 0
+                while stack:
+                    cx, cy = stack.pop()
+                    cnt += 1
+                    if cx < min_x:
+                        min_x = cx
+                    if cx > max_x:
+                        max_x = cx
+                    if cy < min_y:
+                        min_y = cy
+                    if cy > max_y:
+                        max_y = cy
+                    for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+                        if x1 <= nx < x2 and y1 <= ny < y2 and not visited[ny - y1][nx - x1]:
+                            if matches(self._grid[ny][nx]):
+                                visited[ny - y1][nx - x1] = True
+                                stack.append((nx, ny))
+                bw = max_x - min_x + 1
+                bh = max_y - min_y + 1
+                comps.append((min_x, min_y, bw, bh, cnt))
+
+        if merge and comps:
+            mx1 = min(c[0] for c in comps)
+            my1 = min(c[1] for c in comps)
+            mx2 = max(c[0] + c[2] for c in comps)
+            my2 = max(c[1] + c[3] for c in comps)
+            total_px = sum(c[4] for c in comps)
+            comps = [(mx1, my1, mx2 - mx1, my2 - my1, total_px)]
+
+        out: list[_FakeMaixBlob] = []
+        for bx, by, bw, bh, cnt in comps:
+            if cnt >= pixels_threshold and (bw * bh) >= area_threshold:
+                out.append(_FakeMaixBlob(bx, by, bw, bh, cnt))
+        return out
 
 
 class MaixcamProtocolTest(unittest.TestCase):
@@ -258,63 +365,275 @@ class MaixcamVisionAndUITest(unittest.TestCase):
         self.assertTrue(st_sw.flags & VIS_FLAG_CORRAL_SAFE)
         self.assertFalse(st_sw.flags & VIS_FLAG_SWEEP_CLEAR)
 
-    def test_strict_drop_verification_requires_zone_ramp_and_full_correct_half_outline(self) -> None:
+    def test_strict_drop_verification_requires_baseline_zone_ramp_and_trip_delta(self) -> None:
         # Red safe zone x=40..280 (cx=160); material half LEFT => x in [40, 142], casualty half RIGHT => x in [178, 280].
         home = Blob("red_zone", 40, 20, 240, 100, 15000)
         ramp = Blob("purple_ramp", 40, 100, 240, 26, 3000)
+        corral_green = Blob("green", 140, 150, 24, 24, 500)
+        corral_black = Blob("black", 170, 150, 24, 24, 480, density=0.83)
+        corral_orange = Blob("orange", 140, 150, 36, 24, 700)
+
+        # 0. Without a pre-push baseline, drop confirmation MUST fail closed!
+        st_no_base = self.proc.process(
+            [home, ramp, Blob("green", 80, 50, 24, 24, 500)],
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=False,
+        )
+        self.assertFalse(st_no_base.flags & VIS_FLAG_DROP_CONFIRMED)
+
+        # Capture clean pre-push baseline for first-green trip (empty home, 1 green in corral).
+        self.proc.process(
+            [home, ramp, corral_green],
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=False,
+            mission_state=MISSION_DROP_OPEN_AND_PUSH,
+            gate_closed=True,
+        )
 
         # 1. No zone / no ramp visible -> MUST NOT confirm drop!
-        no_zone = [Blob("green", 80, 50, 24, 24, 500)]
-        st0 = self.proc.process(no_zone, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False)
+        st0 = self.proc.process(
+            [Blob("green", 80, 50, 24, 24, 500)],
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=False,
+            mission_state=MISSION_DROP_BACKOUT_VERIFY,
+        )
         self.assertFalse(st0.flags & VIS_FLAG_DROP_CONFIRMED)
 
         # 2. Block straddling the 20 mm center divider (x=135..165 crosses 142) -> MUST NOT confirm!
-        divider_cross = [home, ramp, Blob("green", 135, 50, 30, 24, 600)]
-        st_div = self.proc.process(divider_cross, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False)
+        st_div = self.proc.process(
+            [home, ramp, Blob("green", 135, 50, 30, 24, 600)],
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=False,
+            mission_state=MISSION_DROP_BACKOUT_VERIFY,
+        )
         self.assertFalse(st_div.flags & VIS_FLAG_DROP_CONFIRMED)
 
         # 3. Block straddling purple ramp (y2 = 108 > ramp.y = 100) -> MUST NOT confirm!
-        straddle = [home, ramp, Blob("green", 80, 82, 24, 26, 520)]
-        st_str = self.proc.process(straddle, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False)
+        st_str = self.proc.process(
+            [home, ramp, Blob("green", 80, 82, 24, 26, 520)],
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=False,
+            mission_state=MISSION_DROP_BACKOUT_VERIFY,
+        )
         self.assertFalse(st_str.flags & VIS_FLAG_DROP_CONFIRMED)
 
-        # 4. Two green blocks before first-green unlock -> MUST NOT confirm!
-        two_green = [home, ramp, Blob("green", 60, 50, 24, 24, 500), Blob("green", 100, 50, 24, 24, 500)]
-        st_two = self.proc.process(two_green, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False)
-        self.assertFalse(st_two.flags & VIS_FLAG_DROP_CONFIRMED)
-
-        # 5. Old green already in safe zone while current green is STILL inside corral -> MUST NOT confirm!
-        still_in_corral = [home, ramp, Blob("green", 80, 50, 24, 24, 500), Blob("green", 140, 150, 24, 24, 500)]
-        st_still = self.proc.process(still_in_corral, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False)
+        # 4. Old green already in safe zone while current green is STILL inside corral -> MUST NOT confirm!
+        st_still = self.proc.process(
+            [home, ramp, Blob("green", 80, 50, 24, 24, 500), corral_green],
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=False,
+            mission_state=MISSION_DROP_BACKOUT_VERIFY,
+        )
         self.assertFalse(st_still.flags & VIS_FLAG_DROP_CONFIRMED)
 
-        # 6. Exactly 1 green block completely inside own MATERIAL half past ramp & corral empty -> CONFIRMED!
-        valid_first = [home, ramp, Blob("green", 80, 50, 24, 24, 500)]
-        st_ok = self.proc.process(valid_first, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False)
+        # 5. Exactly +1 green inside own MATERIAL half past ramp & corral empty -> CONFIRMED!
+        st_ok = self.proc.process(
+            [home, ramp, Blob("green", 80, 50, 24, 24, 500)],
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=False,
+            mission_state=MISSION_DROP_BACKOUT_VERIFY,
+        )
         self.assertTrue(st_ok.flags & VIS_FLAG_DROP_CONFIRMED)
 
-        # 7. Orange casualty in MATERIAL (left) half rejected; in CASUALTY (right) half confirmed!
-        cas_wrong = [home, ramp, Blob("orange", 80, 50, 36, 24, 700)]
-        st_cw = self.proc.process(cas_wrong, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=True, carrying_casualty=True)
-        self.assertFalse(st_cw.flags & VIS_FLAG_DROP_CONFIRMED)
+        # Return to FAR / search clears previous trip baseline.
+        self.proc.process(
+            [],
+            camera_near_cmd=False,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=True,
+            mission_state=MISSION_SEARCH_TARGET,
+        )
 
-        cas_right = [home, ramp, Blob("orange", 200, 50, 36, 24, 700)]
-        st_cr = self.proc.process(cas_right, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=True, carrying_casualty=True)
+        # 6. Finding 6A: Prior green block already in material half + Trip 2's new green dropped OUTSIDE
+        #    -> delta is (0, 0, 0) != (1, 0, 0) -> MUST NOT falsely confirm!
+        prior_green = Blob("green", 60, 45, 24, 24, 500)
+        self.proc.process(
+            [home, ramp, prior_green, corral_green],
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=True,
+            carrying_casualty=False,
+            max_materials_per_trip=2,
+            mission_state=MISSION_DROP_OPEN_AND_PUSH,
+            gate_closed=True,
+        )
+        st_missed = self.proc.process(
+            [home, ramp, prior_green],
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=True,
+            carrying_casualty=False,
+            max_materials_per_trip=2,
+            mission_state=MISSION_DROP_BACKOUT_VERIFY,
+        )
+        self.assertFalse(st_missed.flags & VIS_FLAG_DROP_CONFIRMED)
+
+        # Same trip when the new green ACTUALLY lands inside material half -> delta (+1, 0, 0) -> CONFIRMED!
+        st_second_green = self.proc.process(
+            [home, ramp, prior_green, Blob("green", 100, 50, 24, 24, 500)],
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=True,
+            carrying_casualty=False,
+            max_materials_per_trip=2,
+            mission_state=MISSION_DROP_BACKOUT_VERIFY,
+        )
+        self.assertTrue(st_second_green.flags & VIS_FLAG_DROP_CONFIRMED)
+
+        # 7. Finding 6B: Prior green block sitting in MATERIAL (left) half MUST NOT block
+        #    confirmation of a correctly placed orange casualty in CASUALTY (right) half!
+        self.proc.reset_drop_baseline()
+        self.proc.process(
+            [home, ramp, prior_green, corral_orange],
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=True,
+            carrying_casualty=True,
+            mission_state=MISSION_DROP_OPEN_AND_PUSH,
+            gate_closed=True,
+        )
+        # Casualty dropped into WRONG (left) half -> REJECTED!
+        st_cw = self.proc.process(
+            [home, ramp, prior_green, Blob("orange", 95, 50, 36, 24, 700)],
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=True,
+            carrying_casualty=True,
+            mission_state=MISSION_DROP_BACKOUT_VERIFY,
+        )
+        self.assertFalse(st_cw.flags & VIS_FLAG_DROP_CONFIRMED)
+        # Casualty dropped cleanly into RIGHT half while prior_green stays in LEFT half -> CONFIRMED!
+        st_cr = self.proc.process(
+            [home, ramp, prior_green, Blob("orange", 200, 50, 36, 24, 700)],
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=True,
+            carrying_casualty=True,
+            mission_state=MISSION_DROP_BACKOUT_VERIFY,
+        )
         self.assertTrue(st_cr.flags & VIS_FLAG_DROP_CONFIRMED)
 
-    def test_unknown_foreground_not_masked_by_edge_contact_or_zone(self) -> None:
-        # Unknown object barely overlapping a green block (~12% area) and fully inside red_zone MUST be flagged unknown!
+        # 8. Multi-block trip (1 green + 1 black): partial drop (only green) REJECTED; full (1g+1b) CONFIRMED!
+        self.proc.reset_drop_baseline()
+        self.proc.process(
+            [home, ramp, prior_green, corral_green, corral_black],
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=True,
+            carrying_casualty=False,
+            max_materials_per_trip=2,
+            mission_state=MISSION_DROP_OPEN_AND_PUSH,
+            gate_closed=True,
+        )
+        st_partial = self.proc.process(
+            [home, ramp, prior_green, Blob("green", 100, 50, 24, 24, 500)],
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=True,
+            carrying_casualty=False,
+            max_materials_per_trip=2,
+            mission_state=MISSION_DROP_BACKOUT_VERIFY,
+        )
+        self.assertFalse(st_partial.flags & VIS_FLAG_DROP_CONFIRMED)
+        st_both = self.proc.process(
+            [home, ramp, prior_green, Blob("green", 100, 50, 24, 24, 500), Blob("black", 60, 72, 22, 22, 420, density=0.86)],
+            camera_near_cmd=True,
+            camera_settled=True,
+            team=TEAM_RED,
+            first_green_unlocked=True,
+            carrying_casualty=False,
+            max_materials_per_trip=2,
+            mission_state=MISSION_DROP_BACKOUT_VERIFY,
+        )
+        self.assertTrue(st_both.flags & VIS_FLAG_DROP_CONFIRMED)
+
+    def test_unknown_foreground_unique_pixels_and_extraction_path_surface_distinction(self) -> None:
+        # 1. Edge-contacting unknown object inside red_zone MUST be flagged unknown.
         known = [
             Blob("green", 100, 140, 24, 24, 500),
             Blob("red_zone", 80, 120, 160, 100, 12000),
         ]
         fg = [
             Blob("unknown", 100, 140, 24, 24, 500),  # 100% covered by green -> NOT unknown
-            Blob("unknown", 121, 140, 24, 24, 500),  # only 3x24 overlap (12.5%) -> MUST stay unknown!
+            Blob("unknown", 121, 140, 24, 24, 500),  # only 3x24 overlap -> MUST stay unknown!
         ]
         unknowns = classify_unknown_foreground(fg, known, min_pixels=60)
         self.assertEqual(len(unknowns), 1)
         self.assertEqual(unknowns[0].x, 121)
+
+        # 2. Finding 5A: Two overlapping known boxes covering the SAME 40% of fg MUST NOT sum to 80%!
+        overlap_known = [
+            Blob("green", 100, 140, 20, 50, 1000),
+            Blob("orange", 100, 140, 20, 50, 1000),
+        ]
+        overlap_fg = [Blob("unknown", 100, 140, 50, 50, 2500)]
+        self.assertEqual(len(classify_unknown_foreground(overlap_fg, overlap_known, min_pixels=60, cfg=self.cfg)), 1)
+        self.assertEqual(len(classify_unknown_foreground(overlap_fg, overlap_known, min_pixels=60)), 1)
+
+        # 3. Finding 5B through the ACTUAL extract_blobs_from_maix_image() extraction path:
+        floor_lab = (85, 0, 0)
+        ramp_lab = (45, 40, -35)   # inside purple_ramp [20, 68, 18, 62, -55, -14]
+        green_lab = (55, -35, 30)  # inside green [30, 82, -60, -18, 12, 55]
+        unknown_lab = (55, 0, 45)  # yellow/olive foreign object: outside floor and ALL calibrated bands
+
+        # 3a. Calibrated purple ramp ALONE intersecting near_corral_roi ([88, 128, 144, 96]) -> NOT unknown!
+        img_ramp_only = _FakeMaixImage(320, 240, floor_lab)
+        img_ramp_only.fill_rect(40, 105, 240, 35, ramp_lab)  # y=105..140 overlaps corral y=128..140
+        blobs_ramp = extract_blobs_from_maix_image(img_ramp_only, self.cfg, scan_unknown_near=True)
+        self.assertTrue(any(b.label == "purple_ramp" for b in blobs_ramp))
+        self.assertEqual([b for b in blobs_ramp if b.label == "unknown"], [])
+        st_ramp = self.proc.process(blobs_ramp, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False)
+        self.assertEqual(st_ramp.corral_unknown_cnt, 0)
+        self.assertTrue(st_ramp.flags & VIS_FLAG_CORRAL_SAFE)
+
+        # 3b. Unknown foreign object sitting ON TOP OF the purple ramp inside near_corral_roi -> FLAGGED unknown!
+        img_ramp_unk = _FakeMaixImage(320, 240, floor_lab)
+        img_ramp_unk.fill_rect(40, 105, 240, 35, ramp_lab)
+        img_ramp_unk.fill_rect(140, 128, 18, 12, unknown_lab)  # 216 px >= min_hazard_pixels (60)
+        blobs_ramp_unk = extract_blobs_from_maix_image(img_ramp_unk, self.cfg, scan_unknown_near=True)
+        self.assertTrue(any(b.label == "unknown" for b in blobs_ramp_unk))
+        st_ramp_unk = self.proc.process(blobs_ramp_unk, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False)
+        self.assertGreaterEqual(st_ramp_unk.corral_unknown_cnt, 1)
+        self.assertFalse(st_ramp_unk.flags & VIS_FLAG_CORRAL_SAFE)
+
+        # 3c. Green block touching unknown object inside near_corral_roi -> FLAGGED unknown!
+        img_green_unk = _FakeMaixImage(320, 240, floor_lab)
+        img_green_unk.fill_rect(120, 145, 20, 30, green_lab)    # 600 px valid green
+        img_green_unk.fill_rect(140, 145, 30, 30, unknown_lab)  # 900 px touching unknown -> merged fg=1500 px
+        blobs_gu = extract_blobs_from_maix_image(img_green_unk, self.cfg, scan_unknown_near=True)
+        self.assertTrue(any(b.label == "unknown" for b in blobs_gu))
+        st_gu = self.proc.process(blobs_gu, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False)
+        self.assertGreaterEqual(st_gu.corral_unknown_cnt, 1)
+        self.assertFalse(st_gu.flags & VIS_FLAG_CORRAL_SAFE)
+
+        # 3d. Small unverified purple speck (< min_ramp_pixels=350, no full ramp) inside corral -> FLAGGED unknown!
+        img_small_purple = _FakeMaixImage(320, 240, floor_lab)
+        img_small_purple.fill_rect(140, 150, 14, 14, ramp_lab)  # 196 px >= 60, < 350
+        blobs_sp = extract_blobs_from_maix_image(img_small_purple, self.cfg, scan_unknown_near=True)
+        self.assertTrue(any(b.label == "unknown" for b in blobs_sp))
 
     def test_home_half_match_checks_full_corral_width_and_opponent_zone(self) -> None:
         # Home x=100..320 (cx=210, left material half=[100, 192]).

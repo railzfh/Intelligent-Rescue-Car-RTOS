@@ -125,7 +125,8 @@ uint16_t Class_Servo_Controller::Get_Current_Us() const
 }
 
 #ifdef USE_HAL_DRIVER
-bool Class_PWM_Servo::Init(TIM_HandleTypeDef *htim, uint32_t channel, const Struct_Servo_Config &config)
+bool Class_PWM_Servo::Init(TIM_HandleTypeDef *htim, uint32_t channel, const Struct_Servo_Config &config,
+                           bool start_immediately)
 {
     if (htim == nullptr)
     {
@@ -142,7 +143,18 @@ bool Class_PWM_Servo::Init(TIM_HandleTypeDef *htim, uint32_t channel, const Stru
     __HAL_TIM_ENABLE_OCxPRELOAD(Htim, Channel);
     __HAL_TIM_SET_COMPARE(Htim, Channel, Controller.Get_Current_Us());
     HAL_TIM_GenerateEvent(Htim, TIM_EVENTSOURCE_UPDATE);
-    return HAL_TIM_PWM_Start(Htim, Channel) == HAL_OK;
+    if (!start_immediately)
+    {
+        Controller.Disable();
+        return true;
+    }
+    if (HAL_TIM_PWM_Start(Htim, Channel) != HAL_OK)
+    {
+        Controller.Disable();
+        __HAL_TIM_SET_COMPARE(Htim, Channel, 0U);
+        return false;
+    }
+    return true;
 }
 
 void Class_PWM_Servo::Update_1ms()
@@ -165,14 +177,25 @@ void Class_PWM_Servo::Disable()
     }
 }
 
-void Class_PWM_Servo::Enable()
+bool Class_PWM_Servo::Enable()
 {
-    if (Htim == nullptr || Controller.Is_Enabled())
+    if (Htim == nullptr)
     {
-        return;
+        return false;
+    }
+    if (Controller.Is_Enabled())
+    {
+        return true;
+    }
+    __HAL_TIM_SET_COMPARE(Htim, Channel, Controller.Get_Current_Us());
+    HAL_TIM_GenerateEvent(Htim, TIM_EVENTSOURCE_UPDATE);
+    if (HAL_TIM_PWM_Start(Htim, Channel) != HAL_OK)
+    {
+        Controller.Disable();
+        __HAL_TIM_SET_COMPARE(Htim, Channel, 0U);
+        return false;
     }
     Controller.Enable_At_Current();
-    __HAL_TIM_SET_COMPARE(Htim, Channel, Controller.Get_Current_Us());
-    HAL_TIM_PWM_Start(Htim, Channel);
+    return true;
 }
 #endif

@@ -155,6 +155,26 @@ static void Test_Stall_Detection_And_Nan_Safety()
     const auto safe_torque = chassis.Update(zero, zero, nan_v, 0.0f, 2001);
     assert(!chassis.Is_Active());
     assert(safe_torque[0] == 0.0f && safe_torque[1] == 0.0f);
+    // Mode switch from active reverse DISTANCE directly to TURN must re-seed from measured speed
+    // and never retain old negative wheel targets from the prior reverse.
+    Class_Chassis_Drive switch_chassis(Default_Config, 40.0f, 40.0f);
+    std::array<float, 2> angle{};
+    std::array<float, 2> rev_speed{};
+    assert(switch_chassis.Start_Distance(-0.20f, 0.10f, angle, rev_speed, 0.0f, 0));
+    for (uint32_t ms = 1; ms <= 250; ++ms)
+    {
+        const auto tq = switch_chassis.Update(angle, rev_speed, 0.0f, 0.0f, ms);
+        for (unsigned i = 0; i < 2; ++i)
+        {
+            angle[i] += rev_speed[i] * 0.001f;
+            rev_speed[i] += 40.0f * tq[i] * 0.001f;
+        }
+    }
+    assert(rev_speed[0] < -0.5f && rev_speed[1] < -0.5f);
+    // Switch to left turn (+yaw) from standstill speeds: right wheel torque must be positive immediately.
+    assert(switch_chassis.Start_Turn(0.5f, 0.7f, zero, 0.0f, 251, 4000));
+    const auto turn_tq = switch_chassis.Update(angle, zero, 0.0f, 0.0f, 252);
+    assert(turn_tq[0] > 0.0f && turn_tq[1] < 0.0f);
 }
 
 int main()
@@ -163,5 +183,5 @@ int main()
     Test_Signed_Forward_And_Reverse_Distance();
     Test_Closed_Loop_Turn_Left_And_Right();
     Test_Stall_Detection_And_Nan_Safety();
-    std::puts("PASS: chassis twist, signed distance, closed-loop turn, stall detection, NaN guards");
+    std::puts("PASS: chassis twist, signed distance, closed-loop turn, stall detection, mode-switch reset, NaN guards");
 }

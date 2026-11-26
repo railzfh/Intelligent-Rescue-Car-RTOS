@@ -100,6 +100,8 @@ static const Struct_Servo_Config Gate_Servo_Config = {900U, 2100U, Gate_Open_Us,
 static const Struct_Servo_Config Pitch_Servo_Config = {900U, 2100U, Pitch_Far_Us, 1800.0f, 150U};
 static Class_PWM_Servo Gate_Servo;
 static Class_PWM_Servo Pitch_Servo;
+static bool Servos_Started = false;
+static bool Servos_Fault_Latched = false;
 
 // 舵机与 MaixCAM 推荐由外接独立 5V BEC 供电；板载 PC15 (2A 整轨) 默认不开启。
 static constexpr bool Board_Enable_DC5_Rail = false;
@@ -378,15 +380,54 @@ static void Drive_Control()
     const float heading = Heading_Rad;
     const float yaw_rate = Yaw_Rate_Rad_S;
     const bool battery_ready = Battery.Can_Run();
+    const bool battery_fault = Battery.Is_Fault_Latched();
     const float pack_voltage = Battery.Get_Pack_Voltage();
     __set_PRIMASK(primask);
 
+    // 任务上下文恢复任何被 TX/RX DMA 或 UART 错误中断停止的 RX DMA 接收流。
+    (void)UART_Service_Rx_Recovery(&huart1);
     Vision_Drain_Rx(now_ms);
 
+    // 舵机控制：等待首帧有效电池采样后再启动 PWM；真实电池故障或 PWM 启动失败则永久锁停。
+    if (battery_fault || Servos_Fault_Latched)
+    {
+        Servos_Fault_Latched = true;
+        Gate_Servo.Disable();
+        Pitch_Servo.Disable();
+    }
+    else if (battery_ready)
+    {
+        if (!Servos_Started)
+        {
+            const bool gate_ok = Gate_Servo.Enable();
+            const bool pitch_ok = Pitch_Servo.Enable();
+            if (gate_ok && pitch_ok)
+            {
+                Servos_Started = true;
+            }
+            else
+            {
+                Servos_Fault_Latched = true;
+                Gate_Servo.Disable();
+                Pitch_Servo.Disable();
+            }
+        }
+    }
+    else
+    {
+        // 冷启动尚未收到首帧有效 ADC 采样：保持 PWM 关闭，但不锁死故障。
+        Gate_Servo.Disable();
+        Pitch_Servo.Disable();
+    }
+
+    const bool servos_ready =
+        Servos_Started && !Servos_Fault_Latched && Gate_Servo.Is_Enabled() && Pitch_Servo.Is_Enabled();
     const bool wheels_still = feedback_fresh && std::fabs(speed[0]) < 0.1f && std::fabs(speed[1]) < 0.1f;
     const bool can1_ready = Drive_Tx_Ready(hfdcan1);
     const bool can2_ready = Drive_Tx_Ready(hfdcan2);
-    const bool ready = battery_ready && feedback_fresh && attitude_fresh && can1_ready && can2_ready;
+    const bool is_bench_mode = (Rescue_Mission.Get_Run_Mode() == RESCUE_MODE_BENCH_STRAIGHT);
+    const bool ready =
+        battery_ready && feedback_fresh && attitude_fresh && can1_ready && can2_ready && (is_bench_mode || servos_ready);
     const bool can_start = ready && wheels_still && imu_quiet;
     const bool button_pressed = Drive_Button_Pressed(now_ms);
 
@@ -418,6 +459,7 @@ static void Drive_Control()
     mission_in.chassis_active = (prev_state == MISSION_BENCH_STRAIGHT)
                                     ? Straight_Drive.Is_Running()
                                     : Chassis_Drive.Is_Active();
+    mission_in.wheels_still = wheels_still;
     mission_in.chassis_motion_done = Chassis_Drive.Is_Motion_Done();
     mission_in.chassis_motion_aborted = Chassis_Drive.Is_Motion_Aborted();
     mission_in.chassis_stalled = Chassis_Drive.Is_Stalled();
@@ -429,13 +471,7 @@ static void Drive_Control()
     const Struct_Mission_Output cmd = Rescue_Mission.Update(mission_in);
     Drive_Notify_Buzzer(can_start, cmd.launch_rejected_cue, now_ms);
 
-    // 舵机控制：欠压保护立即关闭 PWM，正常状态执行 1 ms 缓动插补。
-    if (!battery_ready)
-    {
-        Gate_Servo.Disable();
-        Pitch_Servo.Disable();
-    }
-    else
+    if (servos_ready)
     {
         Gate_Servo.Set_Target_Us(cmd.gate_closed ? Gate_Closed_Us : Gate_Open_Us);
         Pitch_Servo.Set_Target_Us(cmd.camera_near ? Pitch_Near_Us : Pitch_Far_Us);
@@ -602,9 +638,11 @@ void Task_Init()
     // MaixCAM UART1 双向通信（115200 8N1，仅信号与共地，不跨接供电）。
     UART_Init(&huart1, Vision_Uart_RxCallback);
 
-    // 50 Hz 三线 PWM 舵机初始化（预装安全初始脉宽并开启 OCxPE）。
-    Gate_Servo.Init(&htim1, TIM_CHANNEL_1, Gate_Servo_Config);
-    Pitch_Servo.Init(&htim2, TIM_CHANNEL_1, Pitch_Servo_Config);
+    // 50 Hz 三线 PWM 舵机初始化（预装 50 Hz 周期与安全脉宽，但保持停波直到电池电压采样校验通过）。
+    Servos_Started = false;
+    Servos_Fault_Latched =
+        !(Gate_Servo.Init(&htim1, TIM_CHANNEL_1, Gate_Servo_Config, false) &&
+          Pitch_Servo.Init(&htim2, TIM_CHANNEL_1, Pitch_Servo_Config, false));
 
     // 电池采样有效前关闭电调与外设供电；主控继续运行以显示低压/故障红灯。
     BSP_Power.Init(false, false, false);

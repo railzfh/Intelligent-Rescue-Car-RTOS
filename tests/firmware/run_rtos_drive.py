@@ -1,4 +1,4 @@
-"""Exercise the actual task's drive, mission, servo, and protocol gates with mocks."""
+"""Exercise the actual task's drive, mission, servo cold-boot, and protocol gates with mocks."""
 import os
 from pathlib import Path
 import subprocess
@@ -28,23 +28,49 @@ constexpr float BASIC_MATH_RPM_TO_RADPS = 3.14159265358979323846f / 30.0f;
 enum Enum_Motor_DJI_ID { Motor_DJI_ID_0x201 = 1, Motor_DJI_ID_0x202 = 2 };
 struct Struct_WS2812_Color { uint8_t Red, Green, Blue; };
 struct Class_Motor_DJI_C610 {
+    float angle = 0;
+    float omega = 0;
     float torque = 0;
-    float Get_Now_Angle() const { return 0; }
-    float Get_Now_Omega() const { return 0; }
+    float Get_Now_Angle() const { return angle; }
+    float Get_Now_Omega() const { return omega; }
     void Set_Target_Torque(float t) { torque = t; }
     void TIM_Calculate_PeriodElapsedCallback() {}
 };
 struct Class_PWM_Servo {
     Class_Servo_Controller ctrl;
     bool initialized = false;
-    void Init_Mock(const Struct_Servo_Config &cfg) { ctrl.Init(cfg); initialized = true; }
+    bool fail_enable = false;
+    int enable_calls = 0;
+    int disable_calls = 0;
+    bool Init_Mock(const Struct_Servo_Config &cfg, bool start_immediately = false) {
+        ctrl.Init(cfg);
+        initialized = true;
+        if (!start_immediately) {
+            ctrl.Disable();
+        }
+        return true;
+    }
     void Set_Target_Us(uint16_t us) { ctrl.Set_Target_Us(us); }
     void Update_1ms() { ctrl.Update_1ms(); }
-    void Disable() { ctrl.Disable(); }
+    void Disable() { ++disable_calls; ctrl.Disable(); }
+    bool Enable() {
+        ++enable_calls;
+        if (!initialized || fail_enable) {
+            ctrl.Disable();
+            return false;
+        }
+        if (!ctrl.Is_Enabled()) {
+            ctrl.Enable_At_Current();
+        }
+        return true;
+    }
     bool Is_Enabled() const { return ctrl.Is_Enabled(); }
     bool Is_Settled() const { return ctrl.Is_Settled(); }
     uint16_t Get_Current_Us() const { return ctrl.Get_Current_Us(); }
 };
+struct UART_HandleTypeDef {};
+UART_HandleTypeDef huart1;
+bool UART_Service_Rx_Recovery(UART_HandleTypeDef *) { return true; }
 struct FDCAN_HandleTypeDef { bool pending = false, fail = false; int tx_calls = 0; };
 FDCAN_HandleTypeDef hfdcan1, hfdcan2;
 uint8_t CAN1_0x200_Tx_Data[8], CAN2_0x200_Tx_Data[8];
@@ -84,9 +110,11 @@ void Feed_Vision(uint16_t frame_seq, uint16_t flags = VIS_FLAG_TARGET_VALID) {
     const size_t n = Rescue_Encode_Vision_State(seq++, vis, buf, sizeof(buf));
     Vision_Uart_RxCallback(buf, static_cast<uint16_t>(n));
 }
-void Step(uint32_t t, bool pressed, bool imu = true) {
+void Step(uint32_t t, bool pressed, bool imu = true, bool update_battery = true) {
     now_ms = t; key = pressed;
-    Battery.Update(24.0f, t);
+    if (update_battery) {
+        Battery.Update(24.0f, t);
+    }
     M2006_Feedback_Received[0] = M2006_Feedback_Received[1] = true;
     M2006_Last_Feedback_Ms[0] = M2006_Last_Feedback_Ms[1] = t;
     Attitude_Valid = imu; Attitude_Sample_Ms = t; Imu_Quiet = true;
@@ -99,16 +127,188 @@ void Stopped() {
     assert(M2006[0].torque == 0 && M2006[1].torque == 0);
 }
 int main(int argc, char **argv) {
-    Gate_Servo.Init_Mock(Gate_Servo_Config);
-    Pitch_Servo.Init_Mock(Pitch_Servo_Config);
+    // Match Task_Init(): configure timers with PWM stopped until first valid battery ADC sample.
+    Gate_Servo.Init_Mock(Gate_Servo_Config, false);
+    Pitch_Servo.Init_Mock(Pitch_Servo_Config, false);
     const bool held = argc > 1 && std::strcmp(argv[1], "held") == 0;
     const bool comp = argc > 1 && std::strcmp(argv[1], "comp") == 0;
     const bool can_fault = argc > 1 && std::strcmp(argv[1], "can_fault") == 0;
     const bool frozen = argc > 1 && std::strcmp(argv[1], "frozen") == 0;
+    const bool cold_boot = argc > 1 && std::strcmp(argv[1], "cold_boot") == 0;
+    const bool servo_fail = argc > 1 && std::strcmp(argv[1], "servo_fail") == 0;
+    const bool reverse_abort = argc > 1 && std::strcmp(argv[1], "reverse_abort") == 0;
+
+    if (reverse_abort) {
+        // Coupled Drive_Control + Rescue_Mission + Chassis_Drive probe:
+        // Active reverse losing rear clearance MUST cancel immediately to CHASSIS_MODE_IDLE
+        // with ZERO torque (never entering CHASSIS_MODE_STOPPING with nonzero reverse torque).
+        auto feed_near = [&](uint16_t fseq, uint8_t g, uint8_t c, uint16_t flags) {
+            uint8_t buf[RESCUE_PROTO_MAX_FRAME];
+            static uint8_t seq = 100U;
+            Struct_Vision_State vis{};
+            vis.frame_seq = fseq;
+            vis.camera_view = CAMERA_VIEW_NEAR;
+            vis.flags = flags;
+            vis.corral_green_cnt = g;
+            vis.corral_cyan_cnt = c;
+            vis.confidence = 95U;
+            const size_t n = Rescue_Encode_Vision_State(seq++, vis, buf, sizeof(buf));
+            Vision_Uart_RxCallback(buf, static_cast<uint16_t>(n));
+        };
+        auto feed_far = [&](uint16_t fseq, uint8_t target, uint16_t flags, uint16_t dist_mm) {
+            uint8_t buf[RESCUE_PROTO_MAX_FRAME];
+            static uint8_t seq = 200U;
+            Struct_Vision_State vis{};
+            vis.frame_seq = fseq;
+            vis.camera_view = CAMERA_VIEW_FAR;
+            vis.target_type = target;
+            vis.flags = flags;
+            vis.target_dist_mm = dist_mm;
+            vis.home_dist_mm = dist_mm;
+            vis.confidence = 95U;
+            const size_t n = Rescue_Encode_Vision_State(seq++, vis, buf, sizeof(buf));
+            Vision_Uart_RxCallback(buf, static_cast<uint16_t>(n));
+        };
+
+        Feed_Config(RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION);
+        uint16_t fseq = 1U;
+        uint32_t t = 0U;
+        // Cold boot -> settle both servos.
+        for (; t < 200U; ++t) {
+            if ((t % 40U) == 0U) { feed_far(fseq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 500U); }
+            Step(t, false);
+        }
+        // Launch LAUNCH_CROSS_BUMPS and physically integrate straight forward motion to build proven corridor.
+        Step(t += 10U, true);
+        Step(t += 30U, true);
+        assert(Rescue_Mission.Get_State() == MISSION_LAUNCH_CROSS_BUMPS);
+        for (int step = 0; step < 8000 && Rescue_Mission.Get_State() == MISSION_LAUNCH_CROSS_BUMPS; ++step) {
+            ++t;
+            if ((t % 40U) == 0U) { feed_far(fseq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 190U); }
+            Step(t, false);
+            for (int i = 0; i < 2; ++i) {
+                M2006[i].angle += M2006[i].omega * 0.001f;
+                M2006[i].omega += 40.0f * M2006[i].torque * 0.001f;
+            }
+        }
+        assert(Rescue_Mission.Get_State() == MISSION_SEARCH_TARGET);
+        // Settle wheels to standstill and transition SEARCH -> APPROACH -> INSPECT -> cyan -> BACK_OUT_SEPARATE.
+        M2006[0].omega = M2006[1].omega = 0.0f;
+        for (int step = 0; step < 300; ++step) {
+            ++t;
+            if ((t % 30U) == 0U) { feed_far(fseq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 190U); }
+            Step(t, false);
+            if (Rescue_Mission.Get_State() == MISSION_INSPECT_CORRAL) { break; }
+        }
+        assert(Rescue_Mission.Get_State() == MISSION_INSPECT_CORRAL);
+        // Wait for pitch servo to settle near, then inject cyan to trigger margin-bounded reverse!
+        for (int step = 0; step < 600 && !Pitch_Servo.Is_Settled(); ++step) {
+            ++t;
+            if ((t % 30U) == 0U) { feed_near(fseq++, 1U, 0U, VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR); }
+            Step(t, false);
+        }
+        assert(Rescue_Mission.Get_Proven_Rear_Clear_M() >= 0.15f);
+        feed_near(fseq++, 0U, 1U, 0U);
+        Step(++t, false);
+        assert(Rescue_Mission.Get_State() == MISSION_BACK_OUT_SEPARATE);
+
+        // Advance active reverse until wheels are visibly reversing (nonzero reverse speed & torque).
+        bool saw_active_reverse = false;
+        for (int step = 0; step < 300; ++step) {
+            ++t;
+            if ((t % 30U) == 0U) { feed_far(fseq++, TARGET_NONE, 0U, 500U); }
+            Step(t, false);
+            for (int i = 0; i < 2; ++i) {
+                M2006[i].angle += M2006[i].omega * 0.001f;
+                M2006[i].omega += 40.0f * M2006[i].torque * 0.001f;
+            }
+            if (Chassis_Drive.Get_Mode() == CHASSIS_MODE_DISTANCE &&
+                M2006_Direction[0] * M2006[0].omega < -0.5f) {
+                saw_active_reverse = true;
+                break;
+            }
+        }
+        assert(saw_active_reverse);
+
+        // Abruptly lose rear clearance via yaw jump >= 0.10 rad -> MUST cancel IMMEDIATELY to IDLE with ZERO torque!
+        Heading_Rad += 0.15f;
+        Step(++t, false);
+        assert(Rescue_Mission.Get_Proven_Rear_Clear_M() == 0.0f);
+        assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_IDLE);
+        assert(M2006[0].torque == 0.0f && M2006[1].torque == 0.0f);
+        // While wheels still spin, MUST stay IDLE with zero torque (NOT jump directly into CHASSIS_MODE_TURN!).
+        Step(++t, false);
+        assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_IDLE);
+        assert(M2006[0].torque == 0.0f && M2006[1].torque == 0.0f);
+        // Once wheels reach standstill, separation cleanly enters CHASSIS_MODE_TURN!
+        M2006[0].omega = M2006[1].omega = 0.0f;
+        Step(++t, false);
+        assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_TURN);
+        std::puts("PASS: coupled active-reverse abrupt clearance loss cancels to IDLE zero-torque and confirms standstill before turn");
+        return 0;
+    }
+
+    if (cold_boot) {
+        // Normal cold-boot sequence: first control ticks arrive BEFORE the first ADC DMA callback.
+        Feed_Config(RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION);
+        Feed_Vision(1U);
+        for (uint32_t t = 0U; t < 5U; ++t) {
+            Step(t, false, true, /*update_battery=*/false);
+            assert(!Gate_Servo.Is_Enabled() && !Pitch_Servo.Is_Enabled());
+            assert(!Servos_Started && !Servos_Fault_Latched);
+            Stopped();
+        }
+        // First valid 24 V ADC sample arrives -> both servos MUST enable cleanly and settle!
+        for (uint32_t t = 5U; t <= 200U; ++t) {
+            if ((t % 40U) == 0U) {
+                Feed_Vision(static_cast<uint16_t>(t));
+            }
+            Step(t, false, true, /*update_battery=*/true);
+        }
+        assert(Servos_Started && !Servos_Fault_Latched);
+        assert(Gate_Servo.Is_Enabled() && Pitch_Servo.Is_Enabled());
+        assert(Gate_Servo.Is_Settled() && Pitch_Servo.Is_Settled());
+
+        // Competition launch now succeeds cleanly.
+        Step(210U, true);
+        Step(240U, true);
+        assert(Rescue_Mission.Get_State() == MISSION_LAUNCH_CROSS_BUMPS);
+        assert(M2006[0].torque < 0 && M2006[1].torque > 0);
+
+        // Actual battery undervoltage fault must disable servos and remain latched forever.
+        Battery.Update(19.0f, 250U);
+        now_ms = 250U;
+        Drive_Control();
+        Stopped();
+        assert(!Gate_Servo.Is_Enabled() && !Pitch_Servo.Is_Enabled());
+        assert(Servos_Fault_Latched);
+        // Even if voltage bounces back, battery & servos MUST remain latched off!
+        Step(260U, false, true, /*update_battery=*/true);
+        assert(!Gate_Servo.Is_Enabled() && !Pitch_Servo.Is_Enabled());
+        assert(Servos_Fault_Latched);
+        Stopped();
+        std::puts("PASS: cold-boot deferred servo PWM startup, settling, launch, and latched battery fault");
+        return 0;
+    }
+
+    if (servo_fail) {
+        // If either servo fails to start PWM, both servos stay disabled and competition launch is blocked.
+        Pitch_Servo.fail_enable = true;
+        Feed_Config(RESCUE_TEAM_BLUE, 3U, RESCUE_MODE_COMPETITION);
+        Feed_Vision(1U);
+        Step(0U, false);
+        assert(Servos_Fault_Latched && !Servos_Started);
+        assert(!Gate_Servo.Is_Enabled() && !Pitch_Servo.Is_Enabled());
+        Step(30U, false);
+        Step(40U, true);
+        Step(70U, true);
+        assert(Rescue_Mission.Get_State() == MISSION_PRE_MATCH);
+        Stopped();
+        std::puts("PASS: servo PWM start failure latches fault and blocks competition launch");
+        return 0;
+    }
 
     if (can_fault) {
-        // Adversarial probe: single CAN TX failure during active competition must latch MISSION_FAULT_STOP
-        // and never auto-resume torque on the next tick.
         Feed_Config(RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION);
         Feed_Vision(1U);
         Step(0, false); Step(30, false);
@@ -116,14 +316,12 @@ int main(int argc, char **argv) {
         assert(Rescue_Mission.Get_State() == MISSION_LAUNCH_CROSS_BUMPS);
         assert(M2006[0].torque < 0 && M2006[1].torque > 0);
 
-        // Inject single-bus CAN1 TX failure.
         hfdcan1.fail = true;
         Feed_Vision(2U);
         Step(80, false);
         assert(Rescue_Mission.Get_State() == MISSION_FAULT_STOP);
         Stopped();
 
-        // Next tick CAN1 recovers -> must STAY latched in MISSION_FAULT_STOP with zero torque!
         hfdcan1.fail = false;
         Feed_Vision(3U);
         Step(90, false);
@@ -134,7 +332,6 @@ int main(int argc, char **argv) {
     }
 
     if (frozen) {
-        // Adversarial probe: frozen wheel/IMU feedback must exhaust bounded recovery and fault < 15 s!
         Feed_Config(RESCUE_TEAM_BLUE, 2U, RESCUE_MODE_COMPETITION);
         uint16_t fseq = 1U;
         Feed_Vision(fseq++);
@@ -263,5 +460,5 @@ cmd = ["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-Wno-unused-variable
 if os.name == "nt":
     cmd.append("-static")
 subprocess.run(cmd, check=True)
-for mode in ([], ["held"], ["comp"], ["can_fault"], ["frozen"]):
+for mode in ([], ["held"], ["comp"], ["can_fault"], ["frozen"], ["cold_boot"], ["servo_fail"], ["reverse_abort"]):
     subprocess.run([str(exe), *mode], check=True)

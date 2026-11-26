@@ -37,6 +37,11 @@ public:
         return Sample_Received && !Stop_Latched;
     }
 
+    bool Is_Fault_Latched() const
+    {
+        return Stop_Latched;
+    }
+
     float Get_Pack_Voltage() const
     {
         return Pack_Voltage;
