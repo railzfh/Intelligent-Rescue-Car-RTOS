@@ -127,9 +127,44 @@ static void Test_Corruption_Resync_And_Split_Packets()
     assert(parser.Get_Valid_Frame_Count() == 1U);
 }
 
+static void Test_Resync_Drains_All_Buffered_Frames_Without_Extra_Byte()
+{
+    uint8_t inner[64] = {};
+    const size_t first = Rescue_Encode_Set_Config(
+        1U, {RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION, 1U}, inner, sizeof(inner));
+    const size_t second = Rescue_Encode_Vision_State(2U, {}, inner + first, sizeof(inner) - first);
+    assert(first == 12U && second == 28U);
+
+    uint8_t wire[RESCUE_PROTO_MAX_FRAME] = {};
+    const size_t total = Rescue_Build_Frame(0x99U, 0U, inner, sizeof(inner), wire, sizeof(wire));
+    assert(total == RESCUE_PROTO_MAX_FRAME);
+    wire[total - 1U] ^= 0x01U;
+
+    Class_Rescue_Protocol_Parser parser;
+    Struct_Rescue_Frame frame;
+    std::vector<uint8_t> received_types;
+    for (size_t i = 0; i < total; ++i)
+    {
+        if (parser.Feed_Byte(wire[i], frame))
+        {
+            received_types.push_back(frame.msg_type);
+            while (parser.Poll_Buffered_Frame(frame))
+            {
+                received_types.push_back(frame.msg_type);
+            }
+        }
+    }
+    assert(received_types.size() == 2U);
+    assert(received_types[0] == RESCUE_MSG_SET_CONFIG);
+    assert(received_types[1] == RESCUE_MSG_VISION_STATE);
+    assert(!parser.Poll_Buffered_Frame(frame));
+    assert(parser.Get_Valid_Frame_Count() == 2U);
+}
+
 int main()
 {
     Test_Roundtrip_All_Messages();
     Test_Corruption_Resync_And_Split_Packets();
-    std::puts("PASS: rescue binary protocol CRC16, roundtrip, corruption resync");
+    Test_Resync_Drains_All_Buffered_Frames_Without_Extra_Byte();
+    std::puts("PASS: rescue binary protocol CRC16, roundtrip, corruption resync, multi-frame buffered drain");
 }

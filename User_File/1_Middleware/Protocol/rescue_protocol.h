@@ -202,6 +202,9 @@ class Class_Rescue_Protocol_Parser
 public:
     void Reset();
     bool Feed_Byte(uint8_t byte, Struct_Rescue_Frame &out_frame);
+    // Drain any complete frame already buffered inside the parser after resynchronization,
+    // without waiting for another incoming byte.
+    bool Poll_Buffered_Frame(Struct_Rescue_Frame &out_frame);
 
     uint32_t Get_Valid_Frame_Count() const { return Valid_Frames; }
     uint32_t Get_Bad_Crc_Count() const { return Bad_Crc_Frames; }

@@ -303,47 +303,24 @@ bool Class_Rescue_Protocol_Parser::Try_Shift_And_Resync()
     return false;
 }
 
-bool Class_Rescue_Protocol_Parser::Feed_Byte(uint8_t byte, Struct_Rescue_Frame &out_frame)
+bool Class_Rescue_Protocol_Parser::Poll_Buffered_Frame(Struct_Rescue_Frame &out_frame)
 {
-    if (Count == 0U)
-    {
-        if (byte == RESCUE_PROTO_SOF0)
-        {
-            Buffer[0] = byte;
-            Count = 1U;
-        }
-        return false;
-    }
-
-    if (Count == 1U)
-    {
-        if (byte == RESCUE_PROTO_SOF1)
-        {
-            Buffer[1] = byte;
-            Count = 2U;
-        }
-        else if (byte == RESCUE_PROTO_SOF0)
-        {
-            Buffer[0] = RESCUE_PROTO_SOF0;
-            Count = 1U;
-        }
-        else
-        {
-            Count = 0U;
-        }
-        return false;
-    }
-
-    if (Count >= RESCUE_PROTO_MAX_FRAME)
-    {
-        Reset();
-        return false;
-    }
-
-    Buffer[Count++] = byte;
-
     while (true)
     {
+        if (Count >= 1U && Buffer[0] != RESCUE_PROTO_SOF0)
+        {
+            if (!Try_Shift_And_Resync())
+            {
+                return false;
+            }
+        }
+        if (Count >= 2U && Buffer[1] != RESCUE_PROTO_SOF1)
+        {
+            if (!Try_Shift_And_Resync())
+            {
+                return false;
+            }
+        }
         if (Count < RESCUE_PROTO_HEADER_LEN)
         {
             return false;
@@ -407,4 +384,45 @@ bool Class_Rescue_Protocol_Parser::Feed_Byte(uint8_t byte, Struct_Rescue_Frame &
         }
         return true;
     }
+}
+
+bool Class_Rescue_Protocol_Parser::Feed_Byte(uint8_t byte, Struct_Rescue_Frame &out_frame)
+{
+    if (Count == 0U)
+    {
+        if (byte == RESCUE_PROTO_SOF0)
+        {
+            Buffer[0] = byte;
+            Count = 1U;
+        }
+        return false;
+    }
+
+    if (Count == 1U)
+    {
+        if (byte == RESCUE_PROTO_SOF1)
+        {
+            Buffer[1] = byte;
+            Count = 2U;
+        }
+        else if (byte == RESCUE_PROTO_SOF0)
+        {
+            Buffer[0] = RESCUE_PROTO_SOF0;
+            Count = 1U;
+        }
+        else
+        {
+            Count = 0U;
+        }
+        return false;
+    }
+
+    if (Count >= RESCUE_PROTO_MAX_FRAME)
+    {
+        Reset();
+        return false;
+    }
+
+    Buffer[Count++] = byte;
+    return Poll_Buffered_Frame(out_frame);
 }

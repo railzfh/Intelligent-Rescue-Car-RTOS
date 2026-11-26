@@ -1472,6 +1472,51 @@ class MaixcamVisionAndUITest(unittest.TestCase):
             self.assertEqual(st_pv.corral_unknown_cnt, 0, cls.__name__)
             self.assertTrue(st_pv.flags & VIS_FLAG_CORRAL_SAFE, cls.__name__)
 
+        # 5. Finding 3 (R9): Nested disconnected same-label components where an UNVERIFIED 262-px
+        #    green C outside corral encloses the bounding box of a CLIPPED, disconnected VERIFIED
+        #    green E arm inside corral (125 px <= 262 px). ALL tiers MUST preserve exact parent
+        #    component identity -> unknown_count == 0, VIS_FLAG_CORRAL_SAFE == 1!
+        #    And when an actual unverified green blob is ALSO added inside corral, ALL tiers MUST
+        #    report ONLY that unverified blob and mark corral unsafe!
+        nested_cfg = RescueVisionConfig()
+        nested_cfg.near_corral_roi = [100, 126, 30, 24]
+        nested_cfg.near_drop_roi = [40, 20, 240, 85]
+        nested_cfg.min_block_pixels = 300
+        for cls in (_FakeMaixImage, _FakeMaixBinaryImage, _FakeMaixNativeStrideImage):
+            img_ce = cls(320, 240, floor_lab)
+            # Sub-minimum green C (262 px), completely outside corral [100..130, 126..150].
+            for rect in ((90, 120, 51, 2), (90, 122, 2, 29), (90, 151, 51, 2)):
+                img_ce.fill_rect(*rect, green_lab)
+            # Disconnected verified green E (776 px), with middle arm clipped into corral at (105, 136, 25, 5).
+            for rect in ((85, 115, 65, 3), (147, 118, 3, 37), (105, 136, 42, 5), (85, 155, 65, 4)):
+                img_ce.fill_rect(*rect, green_lab)
+            blobs_ce = extract_blobs_from_maix_image(img_ce, nested_cfg, scan_unknown_near=True)
+            self.assertEqual([b for b in blobs_ce if b.label == "unknown"], [], cls.__name__)
+            st_ce = RescueVisionProcessor(nested_cfg).process(blobs_ce, **kw)
+            self.assertEqual(st_ce.corral_unknown_cnt, 0, cls.__name__)
+            self.assertTrue(st_ce.flags & VIS_FLAG_CORRAL_SAFE, cls.__name__)
+
+            # Positive hazard control: extend unverified green C with a real 80-px stub INSIDE corral
+            # (still < 300 px total? Use 18-px? Total 262 + 30 = 292 < 300, >= 25? Actually min_hazard_pixels=64 ->
+            # shrink C outer bars by 50 px and add 72-px stub inside corral so total C = 284 < 300!)
+            img_ce_haz = cls(320, 240, floor_lab)
+            for rect in ((90, 120, 41, 2), (90, 122, 2, 29), (90, 151, 41, 2)):
+                img_ce_haz.fill_rect(*rect, green_lab)
+            # Connect a 72-px (9x8) unverified stub of the C into corral at (100, 127, 9, 8) (y=127..134,
+            # strictly separated from verified E's middle arm at y=136..140) via bridge at x=92..100, y=128..130!
+            img_ce_haz.fill_rect(92, 128, 8, 2, green_lab)
+            img_ce_haz.fill_rect(100, 127, 9, 8, green_lab)
+            # Trim 20 px from bottom bar -> total C = 290 < 300 (strictly unverified!), 72 px inside corral >= 64!
+            img_ce_haz.fill_rect(121, 151, 10, 2, floor_lab)
+            for rect in ((85, 115, 65, 3), (147, 118, 3, 37), (105, 136, 42, 5), (85, 155, 65, 4)):
+                img_ce_haz.fill_rect(*rect, green_lab)
+            blobs_ce_haz = extract_blobs_from_maix_image(img_ce_haz, nested_cfg, scan_unknown_near=True)
+            unks = [(b.x, b.y, b.w, b.h, b.pixels) for b in blobs_ce_haz if b.label == "unknown"]
+            self.assertEqual(unks, [(100, 127, 9, 8, 72)], cls.__name__)
+            st_ce_haz = RescueVisionProcessor(nested_cfg).process(blobs_ce_haz, **kw)
+            self.assertEqual(st_ce_haz.corral_unknown_cnt, 1, cls.__name__)
+            self.assertFalse(st_ce_haz.flags & VIS_FLAG_CORRAL_SAFE, cls.__name__)
+
     def test_home_half_match_checks_full_corral_width_and_opponent_zone(self) -> None:
         # Home x=100..320 (cx=210, left material half=[100, 192]).
         # Center=160, corral_align_half_w_px=24 => footprint [136, 184] strictly inside [100, 192]!

@@ -15,6 +15,7 @@
 #include "tsk_config_and_callback.h"
 #include "cmsis_os2.h"
 
+#include "1_Middleware/Driver/CAN/drv_can.h"
 #include "1_Middleware/Driver/UART/drv_uart.h"
 #include "1_Middleware/Driver/WDG/drv_wdg.h"
 #include "1_Middleware/Protocol/rescue_protocol.h"
@@ -120,9 +121,7 @@ static uint32_t Last_Uart_Rx_Epoch = 0U;
 static bool Vision_Rx_Was_Healthy = true;
 static bool Standstill_Zero_Tx_Armed[2] = {};
 static uint32_t Standstill_Zero_Tx_Buffer[2] = {};
-static bool Standstill_Zero_Tx_Done[2] = {};
-static std::array<uint32_t, 2> Standstill_Zero_Tx_Post_Seq = {};
-static std::array<uint32_t, 2> Standstill_Zero_Tx_Post_Ms = {};
+static bool Standstill_Zero_Tx_Occurred[2] = {};
 
 static bool Drive_Prev_Odom_Valid = false;
 static std::array<float, 2> Drive_Prev_Angle = {};
@@ -284,12 +283,91 @@ static bool Vision_Sample_Rx_State(bool &healthy, bool &fault_latched, uint32_t 
     return healthy && !fault_latched;
 }
 
+static bool Vision_Commit_Frame(const Struct_Rescue_Frame &frame, uint32_t now_ms, uint32_t expected_epoch)
+{
+    Struct_Vision_Heartbeat hb{};
+    Struct_Match_Config_Cmd cfg{};
+    Struct_Vision_State vis{};
+    Struct_Bench_Actuator_Cmd cmd{};
+    bool decoded = false;
+    if (frame.msg_type == RESCUE_MSG_HEARTBEAT)
+    {
+        decoded = Rescue_Decode_Heartbeat(frame, hb);
+    }
+    else if (frame.msg_type == RESCUE_MSG_SET_CONFIG)
+    {
+        decoded = Rescue_Decode_Set_Config(frame, cfg);
+    }
+    else if (frame.msg_type == RESCUE_MSG_VISION_STATE)
+    {
+        decoded = Rescue_Decode_Vision_State(frame, vis);
+    }
+    else if (frame.msg_type == RESCUE_MSG_BENCH_ACTUATOR)
+    {
+        decoded = Rescue_Decode_Bench_Actuator(frame, cmd);
+    }
+    if (!decoded)
+    {
+        return true;
+    }
+
+    // Atomic validation + frame commit with UART error ISR masked.
+    bool commit_ok = false;
+    const uint32_t mask = __get_PRIMASK();
+    __disable_irq();
+    bool rx_h = false;
+    bool rx_f = false;
+    uint32_t rx_ep = 0U;
+    if (Vision_Sample_Rx_State(rx_h, rx_f, rx_ep) && rx_ep == expected_epoch)
+    {
+        commit_ok = true;
+        if (frame.msg_type == RESCUE_MSG_HEARTBEAT)
+        {
+            Rescue_Mission.On_Heartbeat(hb, now_ms);
+        }
+        else if (frame.msg_type == RESCUE_MSG_SET_CONFIG)
+        {
+            Rescue_Mission.On_Set_Config(cfg);
+        }
+        else if (frame.msg_type == RESCUE_MSG_VISION_STATE)
+        {
+            Rescue_Mission.On_Vision_State(vis, now_ms);
+        }
+        else if (frame.msg_type == RESCUE_MSG_BENCH_ACTUATOR)
+        {
+            Rescue_Mission.On_Bench_Actuator(cmd);
+        }
+    }
+    else
+    {
+        Last_Uart_Rx_Epoch = UART_Get_Rx_Epoch(&huart1);
+        Vision_Rx_Tail = Vision_Rx_Head;
+        Rescue_Mission.On_Uart_Rx_Fault();
+        Vision_Rx_Was_Healthy = false;
+    }
+    __set_PRIMASK(mask);
+    if (!commit_ok)
+    {
+        Vision_Parser.Reset();
+        return false;
+    }
+    return true;
+}
+
 static bool Vision_Drain_Rx(uint32_t now_ms, uint32_t expected_epoch)
 {
     uint16_t tail = Vision_Rx_Tail;
     const uint16_t head = Vision_Rx_Head;
     __DMB();
     Struct_Rescue_Frame frame;
+    // Drain any complete frame already buffered inside the parser before consuming new UART bytes.
+    while (Vision_Parser.Poll_Buffered_Frame(frame))
+    {
+        if (!Vision_Commit_Frame(frame, now_ms, expected_epoch))
+        {
+            return false;
+        }
+    }
     while (tail != head)
     {
         const uint8_t byte = Vision_Rx_Ring[tail];
@@ -298,72 +376,13 @@ static bool Vision_Drain_Rx(uint32_t now_ms, uint32_t expected_epoch)
         {
             continue;
         }
-        Struct_Vision_Heartbeat hb{};
-        Struct_Match_Config_Cmd cfg{};
-        Struct_Vision_State vis{};
-        Struct_Bench_Actuator_Cmd cmd{};
-        bool decoded = false;
-        if (frame.msg_type == RESCUE_MSG_HEARTBEAT)
+        do
         {
-            decoded = Rescue_Decode_Heartbeat(frame, hb);
-        }
-        else if (frame.msg_type == RESCUE_MSG_SET_CONFIG)
-        {
-            decoded = Rescue_Decode_Set_Config(frame, cfg);
-        }
-        else if (frame.msg_type == RESCUE_MSG_VISION_STATE)
-        {
-            decoded = Rescue_Decode_Vision_State(frame, vis);
-        }
-        else if (frame.msg_type == RESCUE_MSG_BENCH_ACTUATOR)
-        {
-            decoded = Rescue_Decode_Bench_Actuator(frame, cmd);
-        }
-        if (!decoded)
-        {
-            continue;
-        }
-
-        // Atomic validation + frame commit with UART error ISR masked.
-        bool commit_ok = false;
-        const uint32_t mask = __get_PRIMASK();
-        __disable_irq();
-        bool rx_h = false;
-        bool rx_f = false;
-        uint32_t rx_ep = 0U;
-        if (Vision_Sample_Rx_State(rx_h, rx_f, rx_ep) && rx_ep == expected_epoch)
-        {
-            commit_ok = true;
-            if (frame.msg_type == RESCUE_MSG_HEARTBEAT)
+            if (!Vision_Commit_Frame(frame, now_ms, expected_epoch))
             {
-                Rescue_Mission.On_Heartbeat(hb, now_ms);
+                return false;
             }
-            else if (frame.msg_type == RESCUE_MSG_SET_CONFIG)
-            {
-                Rescue_Mission.On_Set_Config(cfg);
-            }
-            else if (frame.msg_type == RESCUE_MSG_VISION_STATE)
-            {
-                Rescue_Mission.On_Vision_State(vis, now_ms);
-            }
-            else if (frame.msg_type == RESCUE_MSG_BENCH_ACTUATOR)
-            {
-                Rescue_Mission.On_Bench_Actuator(cmd);
-            }
-        }
-        else
-        {
-            Last_Uart_Rx_Epoch = UART_Get_Rx_Epoch(&huart1);
-            Vision_Rx_Tail = Vision_Rx_Head;
-            Rescue_Mission.On_Uart_Rx_Fault();
-            Vision_Rx_Was_Healthy = false;
-        }
-        __set_PRIMASK(mask);
-        if (!commit_ok)
-        {
-            Vision_Parser.Reset();
-            return false;
-        }
+        } while (Vision_Parser.Poll_Buffered_Frame(frame));
     }
     __DMB();
     Vision_Rx_Tail = tail;
@@ -435,25 +454,29 @@ static void Drive_Control()
         fb_ms[i] = M2006_Last_Feedback_Ms[i];
         feedback_fresh &= M2006_Feedback_Received[i] &&
                           (uint32_t)(now_ms - fb_ms[i]) < M2006_Feedback_Timeout_Ms;
-        if (Standstill_Zero_Tx_Armed[i] && !Standstill_Zero_Tx_Done[i])
+        if (Standstill_Zero_Tx_Armed[i] && !Standstill_Zero_Tx_Occurred[i])
         {
             FDCAN_HandleTypeDef &can = (i == 0U) ? hfdcan1 : hfdcan2;
-            if (!HAL_FDCAN_IsTxBufferMessagePending(&can, Standstill_Zero_Tx_Buffer[i]))
+            if (CAN_Is_Tx_Buffer_Occurred(&can, Standstill_Zero_Tx_Buffer[i]))
             {
-                Standstill_Zero_Tx_Done[i] = true;
-                Standstill_Zero_Tx_Post_Seq[i] = fb_seq[i];
-                Standstill_Zero_Tx_Post_Ms[i] = fb_ms[i];
+                Standstill_Zero_Tx_Occurred[i] = true;
+            }
+            else if (!HAL_FDCAN_IsTxBufferMessagePending(&can, Standstill_Zero_Tx_Buffer[i]))
+            {
+                // Request cleared without TXBTO (cancelled/reset) -> never transmitted!
+                Standstill_Zero_Tx_Armed[i] = false;
             }
         }
     }
-    if (Standstill_Zero_Tx_Armed[0] && Standstill_Zero_Tx_Armed[1] &&
-        Standstill_Zero_Tx_Done[0] && Standstill_Zero_Tx_Done[1])
+    if (Standstill_Zero_Tx_Armed[0] && Standstill_Zero_Tx_Occurred[0] &&
+        Standstill_Zero_Tx_Armed[1] && Standstill_Zero_Tx_Occurred[1] &&
+        CAN_Is_Rx_Fifo0_Empty(&hfdcan1) && CAN_Is_Rx_Fifo0_Empty(&hfdcan2))
     {
         latch_standstill_now = true;
-        latch_seq = Standstill_Zero_Tx_Post_Seq;
-        latch_ms = Standstill_Zero_Tx_Post_Ms;
+        latch_seq = fb_seq;
+        latch_ms = fb_ms;
         Standstill_Zero_Tx_Armed[0] = Standstill_Zero_Tx_Armed[1] = false;
-        Standstill_Zero_Tx_Done[0] = Standstill_Zero_Tx_Done[1] = false;
+        Standstill_Zero_Tx_Occurred[0] = Standstill_Zero_Tx_Occurred[1] = false;
     }
     const bool attitude_fresh = Attitude_Valid && (uint32_t)(now_ms - Attitude_Sample_Ms) < 30U;
     const bool imu_quiet = Imu_Quiet;
@@ -471,7 +494,7 @@ static void Drive_Control()
     else if (!Rescue_Mission.Is_Standstill_Gate_Pending_Boundary())
     {
         Standstill_Zero_Tx_Armed[0] = Standstill_Zero_Tx_Armed[1] = false;
-        Standstill_Zero_Tx_Done[0] = Standstill_Zero_Tx_Done[1] = false;
+        Standstill_Zero_Tx_Occurred[0] = Standstill_Zero_Tx_Occurred[1] = false;
     }
 
     // 1 ms 控制任务仅做非阻塞 RX 健康与纪元检查，绝不阻塞调用 HAL DMA 中止/重初始化；
@@ -575,9 +598,10 @@ static void Drive_Control()
         Drive_Prev_Odom_Valid = false;
     }
 
-    // Atomic critical section (<2 us on 480 MHz H7) pairing final RX generation validation with
-    // mission update and servo/chassis/M2006 torque commitment so no UART error ISR can slip between
-    // validation, match lock, and actuator command application.
+    // Atomic critical section (~3 us on 550 MHz H7) pairing final RX generation validation with
+    // mission update, servo/chassis/M2006 torque calculation, BOTH FDCAN submissions, standstill
+    // TXBTO+FIFO boundary arming, and telemetry/LED publication so no UART error ISR can ever run
+    // between validation, match lock, CAN enqueue, and telemetry publication.
     bool is_bench_mode = false;
     bool ready = false;
     bool can_launch_commit = false;
@@ -695,6 +719,137 @@ static void Drive_Control()
             M2006[i].Set_Target_Torque(M2006_Direction[i] * torque[i]);
             M2006[i].TIM_Calculate_PeriodElapsedCallback();
         }
+
+        const auto can1_status = can1_ready ? CAN_Transmit_Data(&hfdcan1, 0x200, CAN1_0x200_Tx_Data, FDCAN_DLC_BYTES_8) : HAL_OK;
+        const auto can2_status = can2_ready ? CAN_Transmit_Data(&hfdcan2, 0x200, CAN2_0x200_Tx_Data, FDCAN_DLC_BYTES_8) : HAL_OK;
+        const bool can_tx_ok = (can1_status == HAL_OK && can2_status == HAL_OK);
+        if (!can_tx_ok)
+        {
+            // CAN 发送失败必须立即锁停任务，防止下一周期自动恢复扭矩；并在可用总线上立刻补发零扭矩。
+            Straight_Drive.Stop();
+            Chassis_Drive.Emergency_Stop();
+            Rescue_Mission.Fault_Stop(now_ms);
+            for (uint8_t i = 0; i < 2; ++i)
+            {
+                M2006[i].Set_Target_Torque(0.0f);
+                M2006[i].TIM_Calculate_PeriodElapsedCallback();
+            }
+            const bool can1_zero_ok = Drive_Tx_Ready(hfdcan1);
+            const bool can2_zero_ok = Drive_Tx_Ready(hfdcan2);
+            if (can1_status == HAL_OK && can1_zero_ok)
+            {
+                CAN_Transmit_Data(&hfdcan1, 0x200, CAN1_0x200_Tx_Data, FDCAN_DLC_BYTES_8);
+            }
+            if (can2_status == HAL_OK && can2_zero_ok)
+            {
+                CAN_Transmit_Data(&hfdcan2, 0x200, CAN2_0x200_Tx_Data, FDCAN_DLC_BYTES_8);
+            }
+        }
+
+        // Keep the reverse standstill gate closed until BOTH specific zero-torque CAN commands
+        // positively complete transmission (TXBTO == 1, TXBRP == 0, TXBCF == 0) AND BOTH hardware
+        // RX FIFO0 queues are completely empty, so cancelled TXs or buffered pre-completion RX
+        // frames (even with a deferred RX IRQ) can NEVER release the standstill interlock!
+        if (can_tx_ok && can1_ready && can2_ready &&
+            torque[0] == 0.0f && torque[1] == 0.0f &&
+            Rescue_Mission.Is_Standstill_Gate_Pending_Boundary())
+        {
+            for (uint8_t i = 0; i < 2; ++i)
+            {
+                FDCAN_HandleTypeDef &can = (i == 0U) ? hfdcan1 : hfdcan2;
+                if (!Standstill_Zero_Tx_Armed[i])
+                {
+                    const uint32_t buf = HAL_FDCAN_GetLatestTxFifoQRequestBuffer(&can);
+                    if (buf != 0U)
+                    {
+                        Standstill_Zero_Tx_Buffer[i] = buf;
+                        Standstill_Zero_Tx_Armed[i] = true;
+                        Standstill_Zero_Tx_Occurred[i] = false;
+                    }
+                }
+                if (Standstill_Zero_Tx_Armed[i] && !Standstill_Zero_Tx_Occurred[i])
+                {
+                    if (CAN_Is_Tx_Buffer_Occurred(&can, Standstill_Zero_Tx_Buffer[i]))
+                    {
+                        Standstill_Zero_Tx_Occurred[i] = true;
+                    }
+                    else if (!HAL_FDCAN_IsTxBufferMessagePending(&can, Standstill_Zero_Tx_Buffer[i]))
+                    {
+                        Standstill_Zero_Tx_Armed[i] = false;
+                    }
+                }
+            }
+            if (Standstill_Zero_Tx_Armed[0] && Standstill_Zero_Tx_Occurred[0] &&
+                Standstill_Zero_Tx_Armed[1] && Standstill_Zero_Tx_Occurred[1] &&
+                CAN_Is_Rx_Fifo0_Empty(&hfdcan1) && CAN_Is_Rx_Fifo0_Empty(&hfdcan2))
+            {
+                const uint32_t post_stop_seq[2] = {M2006_Feedback_Seq[0], M2006_Feedback_Seq[1]};
+                const uint32_t post_stop_ms[2] = {M2006_Last_Feedback_Ms[0], M2006_Last_Feedback_Ms[1]};
+                Rescue_Mission.Latch_Standstill_Boundary(post_stop_seq, post_stop_ms);
+                Standstill_Zero_Tx_Armed[0] = Standstill_Zero_Tx_Armed[1] = false;
+                Standstill_Zero_Tx_Occurred[0] = Standstill_Zero_Tx_Occurred[1] = false;
+            }
+        }
+        else if (!Rescue_Mission.Is_Standstill_Gate_Pending_Boundary())
+        {
+            Standstill_Zero_Tx_Armed[0] = Standstill_Zero_Tx_Armed[1] = false;
+            Standstill_Zero_Tx_Occurred[0] = Standstill_Zero_Tx_Occurred[1] = false;
+        }
+
+        // 发布灯光颜色与遥测快照，与本周期决策及 CAN 入队保持同一原子快照。
+        Struct_Rescue_Telemetry tel{};
+        tel.uptime_ms = now_ms;
+        tel.match_elapsed_ms = Rescue_Mission.Get_Match_Elapsed_Ms(now_ms);
+        tel.mission_state = static_cast<uint8_t>(Rescue_Mission.Get_State());
+        tel.team = Rescue_Mission.Get_Team();
+        tel.start_zone = Rescue_Mission.Get_Start_Zone();
+        tel.run_mode = Rescue_Mission.Get_Run_Mode();
+
+        const bool pub_rx_ok = uart_rx_healthy && UART_Is_Rx_Healthy(&huart1) && !UART_Is_Rx_Fault_Latched(&huart1);
+        uint16_t status_flags = 0U;
+        if (Rescue_Mission.Is_Config_Locked()) { status_flags |= TEL_FLAG_CONFIG_LOCKED; }
+        if (battery_ready) { status_flags |= TEL_FLAG_BATTERY_OK; }
+        if (attitude_fresh) { status_flags |= TEL_FLAG_IMU_OK; }
+        if (feedback_fresh) { status_flags |= TEL_FLAG_MOTORS_OK; }
+        if (Rescue_Mission.Is_Vision_Fresh(now_ms) && pub_rx_ok) { status_flags |= TEL_FLAG_VISION_FRESH; }
+        if (Rescue_Mission.Is_First_Green_Unlocked()) { status_flags |= TEL_FLAG_FIRST_GREEN_UNLOCKED; }
+        if (Rescue_Mission.Is_Gate_Closed_Cmd()) { status_flags |= TEL_FLAG_GATE_CLOSED; }
+        if (Gate_Servo.Is_Settled()) { status_flags |= TEL_FLAG_GATE_SETTLED; }
+        if (Rescue_Mission.Is_Camera_Near_Cmd()) { status_flags |= TEL_FLAG_CAMERA_NEAR; }
+        if (Pitch_Servo.Is_Settled()) { status_flags |= TEL_FLAG_CAMERA_SETTLED; }
+        if (Chassis_Drive.Is_Stalled()) { status_flags |= TEL_FLAG_STALLED; }
+        if (Rescue_Mission.Is_Link_Alive(now_ms)) { status_flags |= TEL_FLAG_LINK_ALIVE; }
+        if (Rescue_Mission.Is_Carrying_Casualty()) { status_flags |= TEL_FLAG_CARRYING_CASUALTY; }
+        if (Rescue_Mission.Is_Drop_Pushing()) { status_flags |= TEL_FLAG_DROP_PUSHING; }
+        tel.status_flags = status_flags;
+
+        uint16_t fault_flags = 0U;
+        if (!battery_ready) { fault_flags |= FAULT_FLAG_BATTERY; }
+        if (!feedback_fresh) { fault_flags |= FAULT_FLAG_MOTOR_TIMEOUT; }
+        if (!attitude_fresh) { fault_flags |= FAULT_FLAG_IMU_TIMEOUT; }
+        if (!can1_ready || !can2_ready || !can_tx_ok) { fault_flags |= FAULT_FLAG_CAN_TX; }
+        if (!Rescue_Mission.Is_Vision_Fresh(now_ms)) { fault_flags |= FAULT_FLAG_VISION_TIMEOUT; }
+        if (Servos_Fault_Latched) { fault_flags |= FAULT_FLAG_SERVO; }
+        if (uart_rx_fault || !pub_rx_ok) { fault_flags |= FAULT_FLAG_UART_RX; }
+        tel.fault_flags = fault_flags;
+
+        tel.battery_mv = (pack_voltage > 0.0f && std::isfinite(pack_voltage))
+                             ? static_cast<uint16_t>(std::min(65535.0f, pack_voltage * 1000.0f))
+                             : 0U;
+        tel.yaw_cdeg = Wrap_Heading_Cdeg(heading);
+        const float lin_mm_s = Chassis_Drive.Get_Linear_Speed_Mps(speed) * 1000.0f;
+        const float ang_mrad_s = Chassis_Drive.Get_Angular_Speed_Rad_S(speed) * 1000.0f;
+        tel.vx_mm_s = static_cast<int16_t>(std::clamp(std::lround(lin_mm_s), -32000L, 32000L));
+        tel.omega_mrad_s = static_cast<int16_t>(std::clamp(std::lround(ang_mrad_s), -32000L, 32000L));
+        tel.delivered_green = Rescue_Mission.Get_Delivered_Green();
+        tel.delivered_black = Rescue_Mission.Get_Delivered_Black();
+        tel.delivered_orange = Rescue_Mission.Get_Delivered_Orange();
+        tel.max_materials_per_trip = Rescue_Mission.Get_Max_Materials_Per_Trip();
+
+        const Struct_WS2812_Color led =
+            Compute_Status_LED(battery_ready, ready && (is_bench_mode || pub_rx_ok), now_ms);
+        Status_LED_Color = led;
+        Telemetry_Snapshot = tel;
         __set_PRIMASK(commit_mask);
     }
     if (reset_parser_after_commit)
@@ -702,147 +857,6 @@ static void Drive_Control()
         Vision_Parser.Reset();
     }
     Drive_Notify_Buzzer(can_launch_commit, cmd.launch_rejected_cue, now_ms);
-
-    const auto can1_status = can1_ready ? CAN_Transmit_Data(&hfdcan1, 0x200, CAN1_0x200_Tx_Data, FDCAN_DLC_BYTES_8) : HAL_OK;
-    const auto can2_status = can2_ready ? CAN_Transmit_Data(&hfdcan2, 0x200, CAN2_0x200_Tx_Data, FDCAN_DLC_BYTES_8) : HAL_OK;
-    const bool can_tx_ok = (can1_status == HAL_OK && can2_status == HAL_OK);
-    if (!can_tx_ok)
-    {
-        // CAN 发送失败必须立即锁停任务，防止下一周期自动恢复扭矩；并在可用总线上立刻补发零扭矩。
-        Straight_Drive.Stop();
-        Chassis_Drive.Emergency_Stop();
-        Rescue_Mission.Fault_Stop(now_ms);
-        for (uint8_t i = 0; i < 2; ++i)
-        {
-            M2006[i].Set_Target_Torque(0.0f);
-            M2006[i].TIM_Calculate_PeriodElapsedCallback();
-        }
-        const bool can1_zero_ok = Drive_Tx_Ready(hfdcan1);
-        const bool can2_zero_ok = Drive_Tx_Ready(hfdcan2);
-        if (can1_status == HAL_OK && can1_zero_ok)
-        {
-            CAN_Transmit_Data(&hfdcan1, 0x200, CAN1_0x200_Tx_Data, FDCAN_DLC_BYTES_8);
-        }
-        if (can2_status == HAL_OK && can2_zero_ok)
-        {
-            CAN_Transmit_Data(&hfdcan2, 0x200, CAN2_0x200_Tx_Data, FDCAN_DLC_BYTES_8);
-        }
-    }
-
-    // Keep the reverse standstill gate closed until BOTH specific zero-torque CAN commands complete
-    // transmission (!HAL_FDCAN_IsTxBufferMessagePending), and only THEN latch each motor's post-TX
-    // feedback boundary so in-flight feedback received before TX completion can NEVER release the gate!
-    if (can_tx_ok && can1_ready && can2_ready && Rescue_Mission.Is_Standstill_Gate_Pending_Boundary())
-    {
-        if (!Standstill_Zero_Tx_Armed[0] && !Standstill_Zero_Tx_Armed[1])
-        {
-            Standstill_Zero_Tx_Buffer[0] = HAL_FDCAN_GetLatestTxFifoQRequestBuffer(&hfdcan1);
-            Standstill_Zero_Tx_Buffer[1] = HAL_FDCAN_GetLatestTxFifoQRequestBuffer(&hfdcan2);
-            Standstill_Zero_Tx_Armed[0] = true;
-            Standstill_Zero_Tx_Armed[1] = true;
-            Standstill_Zero_Tx_Done[0] = false;
-            Standstill_Zero_Tx_Done[1] = false;
-        }
-        std::array<uint32_t, 2> post_stop_seq = {};
-        std::array<uint32_t, 2> post_stop_ms = {};
-        bool both_tx_done = false;
-        const uint32_t stop_mask = __get_PRIMASK();
-        __disable_irq();
-        for (uint8_t i = 0; i < 2; ++i)
-        {
-            if (Standstill_Zero_Tx_Armed[i] && !Standstill_Zero_Tx_Done[i])
-            {
-                FDCAN_HandleTypeDef &can = (i == 0U) ? hfdcan1 : hfdcan2;
-                if (!HAL_FDCAN_IsTxBufferMessagePending(&can, Standstill_Zero_Tx_Buffer[i]))
-                {
-                    Standstill_Zero_Tx_Done[i] = true;
-                    Standstill_Zero_Tx_Post_Seq[i] = M2006_Feedback_Seq[i];
-                    Standstill_Zero_Tx_Post_Ms[i] = M2006_Last_Feedback_Ms[i];
-                }
-            }
-        }
-        if (Standstill_Zero_Tx_Done[0] && Standstill_Zero_Tx_Done[1])
-        {
-            both_tx_done = true;
-            post_stop_seq = Standstill_Zero_Tx_Post_Seq;
-            post_stop_ms = Standstill_Zero_Tx_Post_Ms;
-            Standstill_Zero_Tx_Armed[0] = Standstill_Zero_Tx_Armed[1] = false;
-            Standstill_Zero_Tx_Done[0] = Standstill_Zero_Tx_Done[1] = false;
-        }
-        __set_PRIMASK(stop_mask);
-        if (both_tx_done)
-        {
-            Rescue_Mission.Latch_Standstill_Boundary(post_stop_seq.data(), post_stop_ms.data());
-        }
-    }
-    else if (!Rescue_Mission.Is_Standstill_Gate_Pending_Boundary())
-    {
-        Standstill_Zero_Tx_Armed[0] = Standstill_Zero_Tx_Armed[1] = false;
-        Standstill_Zero_Tx_Done[0] = Standstill_Zero_Tx_Done[1] = false;
-    }
-
-    // 发布灯光颜色与遥测快照，供 statusTask 消费。
-    Struct_Rescue_Telemetry tel{};
-    tel.uptime_ms = now_ms;
-    tel.match_elapsed_ms = Rescue_Mission.Get_Match_Elapsed_Ms(now_ms);
-    tel.mission_state = static_cast<uint8_t>(Rescue_Mission.Get_State());
-    tel.team = Rescue_Mission.Get_Team();
-    tel.start_zone = Rescue_Mission.Get_Start_Zone();
-    tel.run_mode = Rescue_Mission.Get_Run_Mode();
-
-    uint16_t status_flags = 0U;
-    if (Rescue_Mission.Is_Config_Locked()) { status_flags |= TEL_FLAG_CONFIG_LOCKED; }
-    if (battery_ready) { status_flags |= TEL_FLAG_BATTERY_OK; }
-    if (attitude_fresh) { status_flags |= TEL_FLAG_IMU_OK; }
-    if (feedback_fresh) { status_flags |= TEL_FLAG_MOTORS_OK; }
-    if (Rescue_Mission.Is_Vision_Fresh(now_ms) && uart_rx_healthy) { status_flags |= TEL_FLAG_VISION_FRESH; }
-    if (Rescue_Mission.Is_First_Green_Unlocked()) { status_flags |= TEL_FLAG_FIRST_GREEN_UNLOCKED; }
-    if (Rescue_Mission.Is_Gate_Closed_Cmd()) { status_flags |= TEL_FLAG_GATE_CLOSED; }
-    if (Gate_Servo.Is_Settled()) { status_flags |= TEL_FLAG_GATE_SETTLED; }
-    if (Rescue_Mission.Is_Camera_Near_Cmd()) { status_flags |= TEL_FLAG_CAMERA_NEAR; }
-    if (Pitch_Servo.Is_Settled()) { status_flags |= TEL_FLAG_CAMERA_SETTLED; }
-    if (Chassis_Drive.Is_Stalled()) { status_flags |= TEL_FLAG_STALLED; }
-    if (Rescue_Mission.Is_Link_Alive(now_ms)) { status_flags |= TEL_FLAG_LINK_ALIVE; }
-    if (Rescue_Mission.Is_Carrying_Casualty()) { status_flags |= TEL_FLAG_CARRYING_CASUALTY; }
-    if (Rescue_Mission.Is_Drop_Pushing()) { status_flags |= TEL_FLAG_DROP_PUSHING; }
-    tel.status_flags = status_flags;
-
-    uint16_t fault_flags = 0U;
-    if (!battery_ready) { fault_flags |= FAULT_FLAG_BATTERY; }
-    if (!feedback_fresh) { fault_flags |= FAULT_FLAG_MOTOR_TIMEOUT; }
-    if (!attitude_fresh) { fault_flags |= FAULT_FLAG_IMU_TIMEOUT; }
-    if (!can1_ready || !can2_ready || !can_tx_ok) { fault_flags |= FAULT_FLAG_CAN_TX; }
-    if (!Rescue_Mission.Is_Vision_Fresh(now_ms)) { fault_flags |= FAULT_FLAG_VISION_TIMEOUT; }
-    if (Servos_Fault_Latched) { fault_flags |= FAULT_FLAG_SERVO; }
-    if (uart_rx_fault || !uart_rx_healthy) { fault_flags |= FAULT_FLAG_UART_RX; }
-    tel.fault_flags = fault_flags;
-
-    tel.battery_mv = (pack_voltage > 0.0f && std::isfinite(pack_voltage))
-                         ? static_cast<uint16_t>(std::min(65535.0f, pack_voltage * 1000.0f))
-                         : 0U;
-    tel.yaw_cdeg = Wrap_Heading_Cdeg(heading);
-    const float lin_mm_s = Chassis_Drive.Get_Linear_Speed_Mps(speed) * 1000.0f;
-    const float ang_mrad_s = Chassis_Drive.Get_Angular_Speed_Rad_S(speed) * 1000.0f;
-    tel.vx_mm_s = static_cast<int16_t>(std::clamp(std::lround(lin_mm_s), -32000L, 32000L));
-    tel.omega_mrad_s = static_cast<int16_t>(std::clamp(std::lround(ang_mrad_s), -32000L, 32000L));
-    tel.delivered_green = Rescue_Mission.Get_Delivered_Green();
-    tel.delivered_black = Rescue_Mission.Get_Delivered_Black();
-    tel.delivered_orange = Rescue_Mission.Get_Delivered_Orange();
-    tel.max_materials_per_trip = Rescue_Mission.Get_Max_Materials_Per_Trip();
-
-    const uint32_t pub_mask = __get_PRIMASK();
-    __disable_irq();
-    const bool pub_rx_ok = uart_rx_healthy && UART_Is_Rx_Healthy(&huart1) && !UART_Is_Rx_Fault_Latched(&huart1);
-    if (!pub_rx_ok)
-    {
-        tel.status_flags &= static_cast<uint16_t>(~TEL_FLAG_VISION_FRESH);
-        tel.fault_flags |= FAULT_FLAG_UART_RX;
-    }
-    const Struct_WS2812_Color led =
-        Compute_Status_LED(battery_ready, ready && (is_bench_mode || pub_rx_ok), now_ms);
-    Status_LED_Color = led;
-    Telemetry_Snapshot = tel;
-    __set_PRIMASK(pub_mask);
 }
 
 static void Wait_For_Next_Period(uint32_t &wake_tick, uint32_t period)

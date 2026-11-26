@@ -92,6 +92,10 @@ void CAN_Init(FDCAN_HandleTypeDef *hfdcan, CAN_Callback Callback_Function);
 
 uint8_t CAN_Transmit_Data(FDCAN_HandleTypeDef *hfdcan, uint16_t ID, uint8_t *Data, uint16_t Length);
 
+bool CAN_Is_Tx_Buffer_Occurred(const FDCAN_HandleTypeDef *hfdcan, uint32_t tx_buffer_mask);
+
+bool CAN_Is_Rx_Fifo0_Empty(const FDCAN_HandleTypeDef *hfdcan);
+
 void TIM_100us_CAN_PeriodElapsedCallback();
 
 void TIM_1ms_CAN_PeriodElapsedCallback();

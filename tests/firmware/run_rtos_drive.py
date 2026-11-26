@@ -93,7 +93,28 @@ uint32_t UART_Get_Rx_Epoch(UART_HandleTypeDef *h) {
     }
     return sampled;
 }
-struct FDCAN_HandleTypeDef { bool pending = false, fail = false, hold_tx = false; int tx_calls = 0; };
+struct FDCAN_HandleTypeDef {
+    bool fail = false;
+    bool hold_tx = false;
+    uint8_t next_slot = 0U;
+    uint32_t latest_tx_buf = 0U;
+    uint32_t txbrp = 0U;
+    uint32_t txbto = 0U;
+    uint32_t txbcf = 0U;
+    uint32_t rx_fifo0_level = 0U;
+    int tx_calls = 0;
+    int cancels = 0;
+    void complete_tx() {
+        txbto |= txbrp;
+        txbrp = 0U;
+    }
+    void cancel_tx(uint32_t mask) {
+        const uint32_t hit = txbrp & mask;
+        txbrp &= ~hit;
+        txbcf |= hit;
+        if (hit != 0U) { ++cancels; }
+    }
+};
 FDCAN_HandleTypeDef hfdcan1, hfdcan2;
 uint8_t CAN1_0x200_Tx_Data[8], CAN2_0x200_Tx_Data[8];
 constexpr int FDCAN_DLC_BYTES_8 = 8, HAL_OK = 0;
@@ -102,10 +123,15 @@ bool key = false;
 constexpr int KEY__INPUT_GPIO_Port = 0, KEY__INPUT_Pin = 0, GPIO_PIN_RESET = 0;
 uint32_t HAL_GetTick() { return now_ms; }
 void (*irq_after_unmask)() = nullptr;
+void (*each_unmask)() = nullptr;
+void (*on_can_tx)(FDCAN_HandleTypeDef *) = nullptr;
 uint32_t __get_PRIMASK() { return irq_mask; }
 void __disable_irq() { irq_mask = 1; }
 void __set_PRIMASK(uint32_t mask) {
     irq_mask = mask;
+    if (mask == 0U && each_unmask != nullptr) {
+        each_unmask();
+    }
     if (mask == 0U && irq_after_unmask != nullptr) {
         auto fn = irq_after_unmask;
         irq_after_unmask = nullptr;
@@ -114,13 +140,31 @@ void __set_PRIMASK(uint32_t mask) {
 }
 void __DMB() {}
 int HAL_GPIO_ReadPin(int, int) { return key ? 0 : 1; }
-uint32_t HAL_FDCAN_GetLatestTxFifoQRequestBuffer(FDCAN_HandleTypeDef *) { return 0; }
-bool HAL_FDCAN_IsTxBufferMessagePending(FDCAN_HandleTypeDef *c, uint32_t) { return c->pending; }
-void HAL_FDCAN_AbortTxRequest(FDCAN_HandleTypeDef *c, uint32_t) { c->pending = false; }
+uint32_t HAL_FDCAN_GetLatestTxFifoQRequestBuffer(FDCAN_HandleTypeDef *c) { return c->latest_tx_buf; }
+bool HAL_FDCAN_IsTxBufferMessagePending(FDCAN_HandleTypeDef *c, uint32_t buf) {
+    return buf != 0U && (c->txbrp & buf) != 0U;
+}
+void HAL_FDCAN_AbortTxRequest(FDCAN_HandleTypeDef *c, uint32_t buf) { c->cancel_tx(buf); }
+bool CAN_Is_Tx_Buffer_Occurred(const FDCAN_HandleTypeDef *c, uint32_t buf) {
+    return buf != 0U && (c->txbto & buf) != 0U && (c->txbrp & buf) == 0U && (c->txbcf & buf) == 0U;
+}
+bool CAN_Is_Rx_Fifo0_Empty(const FDCAN_HandleTypeDef *c) { return c->rx_fifo0_level == 0U; }
 int CAN_Transmit_Data(FDCAN_HandleTypeDef *c, int, uint8_t *, int) {
     ++c->tx_calls;
-    if (c->hold_tx) { c->pending = true; }
-    return c->fail ? 1 : 0;
+    if (on_can_tx != nullptr) { on_can_tx(c); }
+    if (c->fail) { return 1; }
+    const uint32_t mask = (1U << (c->next_slot & 7U));
+    c->next_slot = static_cast<uint8_t>((c->next_slot + 1U) & 7U);
+    c->latest_tx_buf = mask;
+    c->txbto &= ~mask;
+    c->txbcf &= ~mask;
+    if (c->hold_tx) {
+        c->txbrp |= mask;
+    } else {
+        c->txbrp &= ~mask;
+        c->txbto |= mask;
+    }
+    return 0;
 }
 struct { float volume = 0; void Set_Loudness(float v) { volume = v; } } BSP_Buzzer;
 '''
@@ -534,29 +578,102 @@ int main(int argc, char **argv) {
         assert((Telemetry_Snapshot.status_flags & TEL_FLAG_VISION_FRESH) == 0U);
         Stopped();
 
-        // Case 2: Fault at atomic mission+actuator commit MUST NOT lock match, start chassis, or publish VISION_FRESH!
+        // Case 2: Fault at atomic mission+actuator+CAN commit MUST NOT lock match, start chassis,
+        // submit nonzero CAN commands, or publish VISION_FRESH!
         huart1.rx_healthy = true;
         Step(5U, false);
         Feed_Config(RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION);
         Feed_Vision(1U);
         for (uint32_t t = 10U; t < 40U; ++t) { Step(t, false); }
         Step(40U, true);
-        // 1 = pre-drain check (no frames in ring), 2 = atomic mission+actuator commit check!
+        static unsigned nonzero_after_uart_fault = 0U;
+        nonzero_after_uart_fault = 0U;
+        on_can_tx = [](FDCAN_HandleTypeDef *) {
+            if (!huart1.rx_healthy && (M2006[0].torque != 0.0f || M2006[1].torque != 0.0f)) {
+                ++nonzero_after_uart_fault;
+            }
+        };
+        // 1 = pre-drain check (no frames in ring), 2 = atomic mission+actuator+CAN commit check!
         huart1.inject_fault_at_epoch_read = 2U;
         Step(70U, true);
         assert(!huart1.rx_healthy);
+        assert(nonzero_after_uart_fault == 0U);
         assert(Rescue_Mission.Get_State() == MISSION_PRE_MATCH);
         assert(!Rescue_Mission.Is_Config_Locked());
         assert(!Chassis_Drive.Is_Active());
         assert((Telemetry_Snapshot.status_flags & TEL_FLAG_VISION_FRESH) == 0U);
         assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_UART_RX) != 0U);
         Stopped();
-        std::puts("PASS: atomic UART RX validation rejects frame commit, match lock, chassis start, and VISION_FRESH on same-tick fault");
+
+        // Case 3 (Finding 1, R9): UART error IRQ deferred until unmask of the atomic commit section!
+        // Because BOTH CAN submissions and telemetry publication happen INSIDE the critical section,
+        // ZERO nonzero CAN commands may ever be enqueued after the UART error ISR executes, telemetry
+        // for the committed tick stays internally consistent, and the very next tick immediately stops!
+        huart1.rx_healthy = true;
+        Step(80U, false);
+        Step(110U, false);
+        Feed_Vision(2U);
+        Step(120U, false);
+        Step(130U, true);
+        each_unmask = [] {
+            if (M2006[0].torque != 0.0f || M2006[1].torque != 0.0f) {
+                huart1.rx_healthy = false;
+                ++huart1.rx_epoch;
+                each_unmask = nullptr;
+            }
+        };
+        Step(160U, true);
+        assert(!huart1.rx_healthy);
+        assert(nonzero_after_uart_fault == 0U);
+        assert(Rescue_Mission.Is_Config_Locked());
+        assert((Telemetry_Snapshot.status_flags & TEL_FLAG_VISION_FRESH) != 0U);
+        on_can_tx = nullptr;
+        // Very next tick observes the deferred UART fault immediately, clears VISION_FRESH, and stops chassis!
+        Step(161U, false);
+        assert((Telemetry_Snapshot.status_flags & TEL_FLAG_VISION_FRESH) == 0U);
+        assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_UART_RX) != 0U);
+        assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_STOPPING || Chassis_Drive.Get_Mode() == CHASSIS_MODE_IDLE);
+        uint32_t t_stop = 161U;
+        for (int k = 0; k < 100 && Chassis_Drive.Is_Active(); ++k) {
+            Step(++t_stop, false);
+        }
+        Stopped();
+        std::puts("PASS: atomic UART RX validation covers frame commit, match lock, CAN TX submissions, and deferred unmask ISR");
+        return 0;
+    }
+
+    const bool resync_drain = argc > 1 && std::strcmp(argv[1], "resync_drain") == 0;
+    if (resync_drain) {
+        // Finding 4 (R9): Bad-CRC outer candidate embedding valid SET_CONFIG + VISION_STATE must
+        // commit BOTH frames in the exact same Drive_Control tick with ZERO trailing UART bytes!
+        uint8_t inner[64] = {};
+        const size_t first = Rescue_Encode_Set_Config(
+            1U, {RESCUE_TEAM_RED, 2U, RESCUE_MODE_COMPETITION, 1U}, inner, sizeof(inner));
+        Struct_Vision_State vis{};
+        vis.frame_seq = 7U;
+        vis.camera_view = CAMERA_VIEW_FAR;
+        vis.target_type = TARGET_GREEN_MATERIAL;
+        vis.flags = VIS_FLAG_TARGET_VALID;
+        vis.target_dist_mm = 500U;
+        vis.confidence = 95U;
+        const size_t second = Rescue_Encode_Vision_State(2U, vis, inner + first, sizeof(inner) - first);
+        assert(first == 12U && second == 28U);
+        uint8_t wire[RESCUE_PROTO_MAX_FRAME] = {};
+        const size_t total = Rescue_Build_Frame(0x99U, 0U, inner, sizeof(inner), wire, sizeof(wire));
+        assert(total == RESCUE_PROTO_MAX_FRAME);
+        wire[total - 1U] ^= 0x01U;
+        Vision_Uart_RxCallback(wire, static_cast<uint16_t>(total));
+        Step(0U, false);
+        assert(Rescue_Mission.Get_Team() == RESCUE_TEAM_RED);
+        assert(Rescue_Mission.Get_Start_Zone() == 2U);
+        assert((Telemetry_Snapshot.status_flags & TEL_FLAG_VISION_FRESH) != 0U);
+        std::puts("PASS: Vision_Drain_Rx drains all buffered resynchronized frames without extra UART bytes");
         return 0;
     }
 
     const bool can_tx_complete = argc > 1 && std::strcmp(argv[1], "can_tx_complete") == 0;
-    if (can_tx_complete) {
+    const bool can_standstill_hw = argc > 1 && std::strcmp(argv[1], "can_standstill_hw") == 0;
+    if (can_tx_complete || can_standstill_hw) {
         // Finding 2 (R8): Feedback received AFTER zero-torque CAN enqueue but BEFORE zero-torque TX completion
         // MUST NOT release the reverse standstill gate! Only feedback arriving AFTER BOTH zero-torque frames
         // complete transmission may release the gate!
@@ -637,7 +754,65 @@ int main(int argc, char **argv) {
         hfdcan1.hold_tx = hfdcan2.hold_tx = true;
         drive_no_can(++tm);
         assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_IDLE);
-        assert(hfdcan1.pending && hfdcan2.pending);
+        assert(hfdcan1.txbrp != 0U && hfdcan2.txbrp != 0U);
+
+        if (can_standstill_hw) {
+            // Finding 2 (R9):
+            // 1) Cancellation (TXBRP cleared via TXBCF with TXBTO == 0) MUST NEVER count as TX completion!
+            hfdcan1.cancel_tx(hfdcan1.latest_tx_buf);
+            hfdcan2.cancel_tx(hfdcan2.latest_tx_buf);
+            assert(hfdcan1.txbrp == 0U && hfdcan2.txbrp == 0U);
+            assert(!CAN_Is_Tx_Buffer_Occurred(&hfdcan1, hfdcan1.latest_tx_buf));
+            assert(!CAN_Is_Tx_Buffer_Occurred(&hfdcan2, hfdcan2.latest_tx_buf));
+            // Pre-stop feedback arrives after cancellation while replacement zero-torque TX stays pending!
+            for (unsigned i = 0; i < 2U; ++i) {
+                ++M2006_Feedback_Seq[i];
+                M2006_Last_Feedback_Ms[i] = tm + 1U;
+                M2006[i].omega = 0.0f;
+            }
+            drive_no_can(++tm);
+            assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_IDLE);
+            assert(Rescue_Mission.Is_Standstill_Gate_Pending_Boundary());
+            // New stop TX is now armed and pending in hardware.
+            assert(hfdcan1.txbrp != 0U && hfdcan2.txbrp != 0U);
+
+            // 2) Pre-completion feedback arrives in hardware RX FIFO0 BEFORE TX completes, with its
+            //    RX ISR deferred until PRIMASK restore -> FIFO fence MUST exclude it so no wire
+            //    feedback after TX completion NEVER releases into CHASSIS_MODE_TURN!
+            hfdcan1.rx_fifo0_level = 1U;
+            hfdcan2.rx_fifo0_level = 1U;
+            hfdcan1.complete_tx();
+            hfdcan2.complete_tx();
+            hfdcan1.hold_tx = hfdcan2.hold_tx = false;
+            irq_after_unmask = [] {
+                // Deferred FDCAN RX FIFO0 ISR runs upon PRIMASK restore and drains the pre-completion frames.
+                hfdcan1.rx_fifo0_level = 0U;
+                hfdcan2.rx_fifo0_level = 0U;
+                for (unsigned i = 0; i < 2U; ++i) {
+                    M2006_Feedback_Seq[i] = M2006_Feedback_Seq[i] + 1U;
+                    M2006_Last_Feedback_Ms[i] = now_ms;
+                    M2006[i].omega = 0.0f;
+                }
+            };
+            drive_no_can(++tm);
+            assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_IDLE);
+            assert(hfdcan1.rx_fifo0_level == 0U && hfdcan2.rx_fifo0_level == 0U);
+
+            // Next tick with ZERO post-completion wire feedback -> MUST STILL stay CHASSIS_MODE_IDLE!
+            drive_no_can(++tm);
+            assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_IDLE);
+
+            // Genuine post-completion standstill feedback from BOTH motors -> cleanly enters CHASSIS_MODE_TURN!
+            for (unsigned i = 0; i < 2U; ++i) {
+                M2006_Feedback_Seq[i] = M2006_Feedback_Seq[i] + 1U;
+                M2006_Last_Feedback_Ms[i] = tm + 1U;
+                M2006[i].omega = 0.0f;
+            }
+            drive_no_can(++tm);
+            assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_TURN);
+            std::puts("PASS: CAN standstill gate requires positive TXBTO and excludes buffered pre-completion RX FIFO0 frames");
+            return 0;
+        }
 
         // In-flight zero-speed feedback finishes on BOTH buses BEFORE either zero-torque TX completes!
         for (unsigned i = 0; i < 2U; ++i) {
@@ -647,7 +822,8 @@ int main(int argc, char **argv) {
         }
         // Now BOTH zero-torque commands complete transmission (no feedback arrives AFTER completion!).
         hfdcan1.hold_tx = hfdcan2.hold_tx = false;
-        hfdcan1.pending = hfdcan2.pending = false;
+        hfdcan1.complete_tx();
+        hfdcan2.complete_tx();
 
         // Tick after TX completion with NO post-TX-completion feedback -> MUST stay IDLE (NOT start turn!).
         drive_no_can(++tm);
@@ -952,9 +1128,11 @@ int main(int argc, char **argv) {
     Stopped();
     Step(230, false); Step(260, false); Step(270, true); Step(300, true);
     assert(Straight_Drive.Is_Running());
-    hfdcan2.pending = true;
+    hfdcan2.txbrp = hfdcan2.latest_tx_buf;
+    hfdcan2.txbto &= ~hfdcan2.latest_tx_buf;
     Step(301, true);
-    assert(!hfdcan2.pending);
+    assert(hfdcan2.txbrp == 0U);
+    assert((hfdcan2.txbcf & hfdcan2.latest_tx_buf) != 0U);
     Stopped();
     Step(310, false); Step(340, false); Step(350, true); Step(380, true);
     assert(Straight_Drive.Is_Running());
@@ -994,5 +1172,5 @@ cmd = ["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-Wno-unused-variable
 if os.name == "nt":
     cmd.append("-static")
 subprocess.run(cmd, check=True)
-for mode in ([], ["held"], ["comp"], ["can_fault"], ["frozen"], ["cold_boot"], ["servo_fail"], ["reverse_abort"], ["uart_unhealthy"], ["standstill_can"], ["irq_races"], ["uart_atomic"], ["can_tx_complete"]):
+for mode in ([], ["held"], ["comp"], ["can_fault"], ["frozen"], ["cold_boot"], ["servo_fail"], ["reverse_abort"], ["uart_unhealthy"], ["standstill_can"], ["irq_races"], ["uart_atomic"], ["resync_drain"], ["can_tx_complete"], ["can_standstill_hw"]):
     subprocess.run([str(exe), *mode], check=True)

@@ -148,6 +148,26 @@ uint8_t CAN_Transmit_Data(FDCAN_HandleTypeDef *hfdcan, uint16_t ID, uint8_t *Dat
     return (HAL_FDCAN_AddMessageToTxFifoQ(hfdcan, &tx_header, Data));
 }
 
+bool CAN_Is_Tx_Buffer_Occurred(const FDCAN_HandleTypeDef *hfdcan, uint32_t tx_buffer_mask)
+{
+    if (hfdcan == nullptr || hfdcan->Instance == nullptr || tx_buffer_mask == 0U)
+    {
+        return false;
+    }
+    return ((hfdcan->Instance->TXBTO & tx_buffer_mask) != 0U) &&
+           ((hfdcan->Instance->TXBRP & tx_buffer_mask) == 0U) &&
+           ((hfdcan->Instance->TXBCF & tx_buffer_mask) == 0U);
+}
+
+bool CAN_Is_Rx_Fifo0_Empty(const FDCAN_HandleTypeDef *hfdcan)
+{
+    if (hfdcan == nullptr || hfdcan->Instance == nullptr)
+    {
+        return false;
+    }
+    return HAL_FDCAN_GetRxFifoFillLevel(hfdcan, FDCAN_RX_FIFO0) == 0U;
+}
+
 /**
  * @brief CAN的TIM定时器中断发送回调函数
  *
