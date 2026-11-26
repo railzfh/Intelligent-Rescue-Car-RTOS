@@ -103,13 +103,15 @@ def run_maixcam(config_path: Path | None = None) -> None:
     prev_camera_near = False
     prev_camera_settled = False
     prev_gate_open_settled = False
+    prev_gate_closed_settled = False
     fenced_pre_match_gen = 0
     pre_match_drain_remaining = 0
     cam_settle_drain_remaining = drain_depth
     gate_settle_drain_remaining = 0
 
     def _observe_telemetry(tel: Telemetry) -> None:
-        nonlocal prev_camera_near, prev_camera_settled, prev_gate_open_settled
+        nonlocal prev_camera_near, prev_camera_settled
+        nonlocal prev_gate_open_settled, prev_gate_closed_settled
         nonlocal fenced_pre_match_gen, pre_match_drain_remaining
         nonlocal cam_settle_drain_remaining, gate_settle_drain_remaining
 
@@ -118,6 +120,7 @@ def run_maixcam(config_path: Path | None = None) -> None:
         g_closed = bool(tel.status_flags & TEL_FLAG_GATE_CLOSED)
         g_settled = bool(tel.status_flags & TEL_FLAG_GATE_SETTLED)
         g_open_settled = (not g_closed) and g_settled
+        g_closed_settled = g_closed and g_settled
         pm_gen = (tel.status_flags & TEL_FLAG_PRE_MATCH_GEN_MASK) >> TEL_FLAG_PRE_MATCH_GEN_SHIFT
 
         if cam_near != prev_camera_near or not cam_settled:
@@ -128,11 +131,12 @@ def run_maixcam(config_path: Path | None = None) -> None:
             cam_settle_drain_remaining = drain_depth
         prev_camera_settled = cam_settled
 
-        if not g_open_settled:
+        if not g_settled:
             gate_settle_drain_remaining = 0
-        elif not prev_gate_open_settled:
+        elif (g_open_settled and not prev_gate_open_settled) or (g_closed_settled and not prev_gate_closed_settled):
             gate_settle_drain_remaining = drain_depth
         prev_gate_open_settled = g_open_settled
+        prev_gate_closed_settled = g_closed_settled
 
         pm_ready = (not cam_near) and cam_settled and g_open_settled and (1 <= pm_gen <= 3)
         if not pm_ready:

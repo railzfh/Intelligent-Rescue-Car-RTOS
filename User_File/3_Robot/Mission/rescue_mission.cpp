@@ -106,6 +106,10 @@ bool Class_Rescue_Mission::On_Vision_State(const Struct_Vision_State &vis, uint3
         {
             Pending_Near_Non_Valid_Corral_Event = true;
         }
+        if (State == MISSION_CLOSE_GATE_VERIFY && (vis.flags & VIS_FLAG_GATE_CLOSED_SETTLED_ACK) == 0U)
+        {
+            Pending_Near_Non_Valid_Corral_Event = true;
+        }
         if ((vis.flags & VIS_FLAG_DROP_PATH_CLEAR) == 0U)
         {
             Pending_Drop_Path_Blocked_Event = true;
@@ -1300,8 +1304,10 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                 Enter_State(MISSION_BACK_OUT_SEPARATE, in.now_ms);
                 break;
             }
-            // Only count confirmation frames after the gate has mechanically settled.
-            if (!in.gate_settled)
+            // Only count confirmation frames (or declare post-close cargo loss) after the gate has
+            // mechanically settled AND MaixCAM acknowledges a post-drain frame captured after closure.
+            const bool closed_settled_ack = (Latest_Vision.flags & VIS_FLAG_GATE_CLOSED_SETTLED_ACK) != 0U;
+            if (!in.gate_settled || !closed_settled_ack)
             {
                 Reset_Confirm_Streak();
                 break;

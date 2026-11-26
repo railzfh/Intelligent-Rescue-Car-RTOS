@@ -288,7 +288,7 @@ static void Test_Cyan_Interrupts_Unsettled_Gate_Closure()
     for (int k = 0; k < 2; ++k)
     {
         bin.now_ms = (bt += 40U);
-        assert(blind_m.On_Vision_State(Make_Near_Vision(bseq++, 1U, 0U, 0U, 0U, 0U, safe), bt));
+        assert(blind_m.On_Vision_State(Make_Near_Vision(bseq++, 1U, 0U, 0U, 0U, 0U, safe | VIS_FLAG_GATE_CLOSED_SETTLED_ACK), bt));
         blind_m.Update(bin);
     }
     assert(blind_m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
@@ -303,7 +303,7 @@ static void Test_Cyan_Interrupts_Unsettled_Gate_Closure()
     assert(blind_m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
     // Single NEAR frame after TRANSITION MUST NOT advance to FIND_HOME (needs full 3-frame streak again)!
     bin.now_ms = (bt += 40U);
-    assert(blind_m.On_Vision_State(Make_Near_Vision(bseq++, 1U, 0U, 0U, 0U, 0U, safe), bt));
+    assert(blind_m.On_Vision_State(Make_Near_Vision(bseq++, 1U, 0U, 0U, 0U, 0U, safe | VIS_FLAG_GATE_CLOSED_SETTLED_ACK), bt));
     blind_m.Update(bin);
     assert(blind_m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
 
@@ -387,7 +387,7 @@ static void Test_Full_First_Green_Delivery_And_Proven_Rear_Corridor()
     for (int k = 0; k < 3; ++k)
     {
         in.now_ms = (t += 50U);
-        assert(mission.On_Vision_State(Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U, safe), t));
+        assert(mission.On_Vision_State(Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U, safe | VIS_FLAG_GATE_CLOSED_SETTLED_ACK), t));
         out = mission.Update(in);
     }
     assert(mission.Get_State() == MISSION_FIND_HOME);
@@ -633,7 +633,10 @@ static void Test_Drop_Rechecks_Hazards_And_Alignment_While_Opening_And_Pushing()
         for (int k = 0; k < 3; ++k)
         {
             in.now_ms = (t += 50U);
-            assert(m.On_Vision_State(Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U, VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR), t));
+            assert(m.On_Vision_State(
+                Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U,
+                                 VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR | VIS_FLAG_GATE_CLOSED_SETTLED_ACK),
+                t));
             m.Update(in);
         }
         in.now_ms = (t += 50U);
@@ -902,7 +905,8 @@ static void Test_Active_Reverse_Abrupt_Clearance_Loss_Cancels_Immediately_And_Wa
         for (int k = 0; k < 6; ++k)
         {
             din.now_ms = (dt += 50U);
-            assert(dm.On_Vision_State(Make_Near_Vision(dseq++, 1U, 0U, 0U, 0U, 0U, safe), dt));
+            const uint16_t flags_k = (k >= 3) ? (safe | VIS_FLAG_GATE_CLOSED_SETTLED_ACK) : safe;
+            assert(dm.On_Vision_State(Make_Near_Vision(dseq++, 1U, 0U, 0U, 0U, 0U, flags_k), dt));
             dm.Update(din);
         }
         din.now_ms = (dt += 50U);
@@ -1054,7 +1058,7 @@ static void Test_Same_Cargo_Reverify_After_Escape_Cannot_Bypass_Recovery_Budget(
     for (int k = 0; k < 3; ++k)
     {
         in.now_ms = (t += 50U);
-        assert(mission.On_Vision_State(Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U, safe), t));
+        assert(mission.On_Vision_State(Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U, safe | VIS_FLAG_GATE_CLOSED_SETTLED_ACK), t));
         mission.Update(in);
     }
     assert(mission.Get_State() == MISSION_FIND_HOME);
@@ -1087,7 +1091,7 @@ static void Test_Same_Cargo_Reverify_After_Escape_Cannot_Bypass_Recovery_Budget(
         for (int k = 0; k < 3; ++k)
         {
             in.now_ms = (t += 50U);
-            assert(mission.On_Vision_State(Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U, safe), t));
+            assert(mission.On_Vision_State(Make_Near_Vision(seq++, 1U, 0U, 0U, 0U, 0U, safe | VIS_FLAG_GATE_CLOSED_SETTLED_ACK), t));
             mission.Update(in);
         }
         assert(mission.Get_State() == MISSION_FIND_HOME);
@@ -1347,7 +1351,8 @@ static void Test_Drop_Verify_Requires_Consecutive_Near_Frames()
     for (int k = 0; k < 6; ++k)
     {
         din.now_ms = (dt += 50U);
-        assert(dm.On_Vision_State(Make_Near_Vision(dseq++, 1U, 0U, 0U, 0U, 0U, safe), dt));
+        const uint16_t flags_k = (k >= 3) ? (safe | VIS_FLAG_GATE_CLOSED_SETTLED_ACK) : safe;
+        assert(dm.On_Vision_State(Make_Near_Vision(dseq++, 1U, 0U, 0U, 0U, 0U, flags_k), dt));
         dm.Update(din);
     }
     din.now_ms = (dt += 50U);
@@ -1484,7 +1489,10 @@ static void Test_Round12_Push_Same_Drain_Standstill_Bench_Leave_And_Interrupted_
             to_inspect();
             for (unsigned i = 0; i < 6U; ++i)
             {
-                near(1U, VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR);
+                const uint16_t f = (i >= 3U)
+                                       ? (VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR | VIS_FLAG_GATE_CLOSED_SETTLED_ACK)
+                                       : (VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR);
+                near(1U, f);
                 tick();
             }
             assert(m.Get_State() == MISSION_FIND_HOME);
@@ -1810,6 +1818,80 @@ static void Test_Round12_Push_Same_Drain_Standstill_Bench_Leave_And_Interrupted_
         h.tick();
         assert(h.m.Get_Delivered_Green() == 0U);
         assert(!h.m.Is_First_Green_Unlocked());
+    }
+
+    // 7. Round 18 P1: MISSION_CLOSE_GATE_VERIFY with pitch already settled in NEAR MUST NOT confirm
+    //    cargo from buffered pre-close NEAR frames (lacking VIS_FLAG_GATE_CLOSED_SETTLED_ACK), while
+    //    still aborting immediately on hazards without ACK and backing out on post-close empty corral.
+    {
+        Harness h;
+        h.to_inspect();
+        for (unsigned i = 0; i < 3U; ++i)
+        {
+            h.near(1U, safe);
+            h.tick();
+        }
+        assert(h.m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
+        h.in.gate_settled = true;
+        h.in.camera_settled = true;
+        // 4 ordinary NEAR frames (pre-close buffered frames without closed-settled ACK) MUST NOT advance to FIND_HOME!
+        for (unsigned i = 0; i < 4U; ++i)
+        {
+            h.near(1U, safe);
+            const auto out = h.tick();
+            assert(out.gate_closed);
+            assert(h.m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
+        }
+        // First post-close image showing empty corral WITH closed-settled ACK immediately backs out!
+        h.near(0U, safe | VIS_FLAG_GATE_CLOSED_SETTLED_ACK);
+        const auto lost_out = h.tick();
+        assert(!lost_out.gate_closed);
+        assert(h.m.Get_State() == MISSION_BACK_OUT_SEPARATE);
+    }
+    {
+        // Hazard arriving during post-close drain (closed_settled_ack == 0) MUST still immediately abort!
+        Harness h;
+        h.to_inspect();
+        for (unsigned i = 0; i < 3U; ++i)
+        {
+            h.near(1U, safe);
+            h.tick();
+        }
+        assert(h.m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
+        h.in.gate_settled = true;
+        assert(h.m.On_Vision_State(Make_Near_Vision(h.seq++, 1U, 0U, 0U, 1U, 0U, 0U), h.t));
+        const auto haz_out = h.tick();
+        assert(!haz_out.gate_closed);
+        assert(h.m.Get_State() == MISSION_BACK_OUT_SEPARATE);
+    }
+    {
+        // Same-drain [ack=0, ack=1] after 2 valid post-close frames MUST reset streak (cannot hit 3)!
+        Harness h;
+        h.to_inspect();
+        for (unsigned i = 0; i < 3U; ++i)
+        {
+            h.near(1U, safe);
+            h.tick();
+        }
+        assert(h.m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
+        h.in.gate_settled = true;
+        for (unsigned i = 0; i < 2U; ++i)
+        {
+            h.near(1U, safe | VIS_FLAG_GATE_CLOSED_SETTLED_ACK);
+            h.tick();
+        }
+        assert(h.m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
+        h.near(1U, safe); // ack=0 in same drain
+        h.near(1U, safe | VIS_FLAG_GATE_CLOSED_SETTLED_ACK);
+        h.tick();
+        assert(h.m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
+        // Needs 2 more consecutive post-close ack frames to confirm (total 3 consecutive)!
+        h.near(1U, safe | VIS_FLAG_GATE_CLOSED_SETTLED_ACK);
+        h.tick();
+        assert(h.m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
+        h.near(1U, safe | VIS_FLAG_GATE_CLOSED_SETTLED_ACK);
+        h.tick();
+        assert(h.m.Get_State() == MISSION_FIND_HOME);
     }
 }
 

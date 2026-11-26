@@ -32,6 +32,7 @@ from maixcam.protocol import (
     VIS_FLAG_DROP_BASELINE_READY,
     VIS_FLAG_DROP_CONFIRMED,
     VIS_FLAG_DROP_PATH_CLEAR,
+    VIS_FLAG_GATE_CLOSED_SETTLED_ACK,
     VIS_FLAG_GATE_OPEN_SETTLED_ACK,
     VIS_FLAG_HOME_HALF_MATCH,
     VIS_FLAG_HOME_VALID,
@@ -2265,6 +2266,185 @@ class MaixcamVisionAndUITest(unittest.TestCase):
         self.assertEqual(len(burst_states), 10)
         burst_gens = [(s.flags & VIS_FLAG_PRE_MATCH_GEN_MASK) >> VIS_FLAG_PRE_MATCH_GEN_SHIFT for s in burst_states]
         self.assertEqual(burst_gens, [0, 0, 0, 0, 1, 0, 0, 0, 0, 1])
+
+    def test_round18_gate_closed_drain_and_floor_overlap_cargo_exclusion(self) -> None:
+        """R18 P1 & P2: post-close camera drain + ACK while keeping NEAR hazard monitoring live, and floor-only cargo rejection."""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from maixcam import main as maix_main
+        from maixcam.protocol import (
+            TEL_FLAG_CAMERA_NEAR,
+            TEL_FLAG_CAMERA_SETTLED,
+            TEL_FLAG_GATE_CLOSED,
+            TEL_FLAG_GATE_SETTLED,
+        )
+
+        # 1. R18 P1: Camera pitch stays settled in NEAR while gate closes open -> closing -> closed_settled.
+        #    The 4 buffered pre-close frames MUST emit CAMERA_VIEW_NEAR with LIVE hazard detection and
+        #    VIS_FLAG_GATE_CLOSED_SETTLED_ACK == 0; ONLY the 5th post-close frame emits ACK == 1!
+        tel_near_open = encode_telemetry(
+            1, Telemetry(status_flags=TEL_FLAG_CAMERA_NEAR | TEL_FLAG_CAMERA_SETTLED | TEL_FLAG_GATE_SETTLED)
+        )
+        tel_near_closing = encode_telemetry(
+            2, Telemetry(status_flags=TEL_FLAG_CAMERA_NEAR | TEL_FLAG_CAMERA_SETTLED | TEL_FLAG_GATE_CLOSED)
+        )
+        tel_near_closed = encode_telemetry(
+            3,
+            Telemetry(
+                status_flags=TEL_FLAG_CAMERA_NEAR
+                | TEL_FLAG_CAMERA_SETTLED
+                | TEL_FLAG_GATE_CLOSED
+                | TEL_FLAG_GATE_SETTLED
+            ),
+        )
+        # 5 frames to settle NEAR open (4 drain + 1 settled), 1 frame while gate closing,
+        # 4 buffered pre-close frames after closed-settled telemetry (one carrying a cyan hazard!),
+        # 1 fresh post-close empty frame, then a same-burst [closing, closed_settled] re-arming 4 more drains + 1 fresh!
+        tags = (
+            [f"open_drain_{i}" for i in range(4)]
+            + ["open_live"]
+            + ["closing_live"]
+            + ["pre_close_0", "pre_close_cyan", "pre_close_2", "pre_close_3"]
+            + ["post_close_empty"]
+            + ["burst_pre_0", "burst_pre_1", "burst_pre_2", "burst_pre_3"]
+            + ["burst_post_fresh"]
+        )
+        rx_seq = (
+            [tel_near_open, b"", b"", b"", b""]
+            + [tel_near_closing]
+            + [tel_near_closed, b"", b"", b""]
+            + [b""]
+            + [tel_near_closing + tel_near_closed, b"", b"", b""]
+            + [b""]
+        )
+        self.assertEqual(len(tags), 16)
+        self.assertEqual(len(rx_seq), 16)
+
+        frames = [SimpleNamespace(resize=lambda *_: None, tag=t) for t in tags]
+        written: list[bytes] = []
+        cam_obj = SimpleNamespace(read=iter(frames).__next__, clear_buff=lambda: None)
+        fake_maix = SimpleNamespace(
+            app=SimpleNamespace(need_exit=iter([False] * len(tags) + [True]).__next__),
+            camera=SimpleNamespace(Camera=lambda *_a, **_k: cam_obj),
+            display=SimpleNamespace(Display=lambda: SimpleNamespace(width=lambda: 552, height=lambda: 368, show=lambda _: None)),
+            pinmap=SimpleNamespace(set_pin_function=lambda *_: None),
+            touchscreen=SimpleNamespace(TouchScreen=lambda: SimpleNamespace(read=lambda: (0, 0, False))),
+            uart=SimpleNamespace(UART=lambda *_: SimpleNamespace(read=iter(rx_seq).__next__, write=written.append)),
+        )
+
+        def _blobs_by_tag(frame, *_a, **_k):
+            tag = frame.tag
+            if tag == "pre_close_cyan":
+                return [
+                    Blob("green", 140, 150, 16, 16, 256, 1.0),
+                    Blob("cyan", 120, 150, 10, 10, 100, 1.0),
+                ]
+            if tag == "post_close_empty":
+                return []
+            return [Blob("green", 140, 150, 16, 16, 256, 1.0)]
+
+        with (
+            patch.dict(sys.modules, {"maix": fake_maix}),
+            patch.object(maix_main, "time", SimpleNamespace(monotonic=iter([0.0] + [1.0 + 0.06 * i for i in range(len(tags))]).__next__)),
+            patch.object(maix_main, "extract_blobs_from_maix_image", side_effect=_blobs_by_tag),
+            patch.object(maix_main, "_extract_motion_grid", return_value=[0] * (16 * 12)),
+            patch.object(maix_main, "render_touch_overlay"),
+        ):
+            maix_main.run_maixcam()
+
+        p_close = RescueProtocolParser()
+        close_states = [
+            vs
+            for raw_tx in written
+            for fr in p_close.feed(raw_tx)
+            if (vs := decode_vision_state(fr)) is not None
+        ]
+        self.assertEqual(len(close_states), len(tags))
+        # Indices 6..9 are the 4 buffered pre-close frames after closed-settled telemetry arrived:
+        for idx in range(6, 10):
+            self.assertEqual(close_states[idx].camera_view, CAMERA_VIEW_NEAR, msg=tags[idx])
+            self.assertFalse(bool(close_states[idx].flags & VIS_FLAG_GATE_CLOSED_SETTLED_ACK), msg=tags[idx])
+        # Hazard monitoring MUST remain live during the drain (index 7 has cyan hazard)!
+        self.assertEqual(close_states[7].corral_cyan_cnt, 1)
+        self.assertFalse(bool(close_states[7].flags & VIS_FLAG_CORRAL_SAFE))
+        # Index 10 is the first genuine post-close image (empty corral) -> ACK == 1, green == 0!
+        self.assertEqual(close_states[10].camera_view, CAMERA_VIEW_NEAR)
+        self.assertTrue(bool(close_states[10].flags & VIS_FLAG_GATE_CLOSED_SETTLED_ACK))
+        self.assertEqual(close_states[10].corral_green_cnt, 0)
+        # Indices 11..14 after same-burst [closing, closed_settled] re-arm MUST withhold ACK, index 15 sets ACK == 1!
+        for idx in range(11, 15):
+            self.assertEqual(close_states[idx].camera_view, CAMERA_VIEW_NEAR, msg=tags[idx])
+            self.assertFalse(bool(close_states[idx].flags & VIS_FLAG_GATE_CLOSED_SETTLED_ACK), msg=tags[idx])
+        self.assertTrue(bool(close_states[15].flags & VIS_FLAG_GATE_CLOSED_SETTLED_ACK))
+
+        # 2. R18 P2: Floor-only patch under a floor-overlapping green calibration MUST NEVER authorize pickup
+        #    across Tier 1 (exact), Tier 2 (binary), AND Tier 3 (find_blobs-only)!
+        cfg_overlap = RescueVisionConfig()
+        cfg_overlap.lab_thresholds["green"] = [30, 82, -60, 14, 12, 55]  # overlaps arena_floor_lab at (75, -14, 14)
+        cfg_overlap.validate()
+        floor_base = (85, 0, 0)
+        floor_green_overlap = (75, -14, 14)  # matches BOTH arena_floor_lab AND green!
+        real_green = (55, -35, 30)           # non-floor green
+        unknown_lab = (55, 5, 85)            # non-floor unknown (outside green [30..82,-60..14,12..55] and all bands)
+
+        def _to_tier2(im: _FakeMaixImage) -> _FakeMaixBinaryImage:
+            b = _FakeMaixBinaryImage(im.width, im.height, floor_base)
+            b._lab_rows = [list(row) for row in im._grid]
+            return b
+
+        for tier_name, make_src in (
+            ("Tier1", lambda im: im),
+            ("Tier2", _to_tier2),
+            ("Tier3", lambda im: SimpleNamespace(find_blobs=im.find_blobs)),
+        ):
+            # 2a. Pure 600-px floor-only patch inside corral -> green=0, unknown=0, CORRAL_SAFE=True, SWEEP_CLEAR=True!
+            img_fl = _FakeMaixImage(320, 240, floor_base)
+            img_fl.fill_rect(120, 150, 30, 20, floor_green_overlap)  # 600 px pure floor
+            fl_blobs = extract_blobs_from_maix_image(make_src(img_fl), cfg_overlap, scan_unknown_near=True)
+            fl_st = RescueVisionProcessor(cfg_overlap).process(
+                fl_blobs, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False
+            )
+            self.assertEqual(fl_st.corral_green_cnt, 0, msg=tier_name)
+            self.assertEqual(fl_st.corral_unknown_cnt, 0, msg=tier_name)
+            self.assertTrue(bool(fl_st.flags & VIS_FLAG_CORRAL_SAFE), msg=tier_name)
+            self.assertTrue(bool(fl_st.flags & VIS_FLAG_SWEEP_CLEAR), msg=tier_name)
+
+            # 2b. C-shaped floor-only green patch enclosing a 100-px unknown block -> green=0, unknown=1, CORRAL_SAFE=False!
+            img_c = _FakeMaixImage(320, 240, floor_base)
+            img_c.fill_rect(110, 140, 40, 8, floor_green_overlap)
+            img_c.fill_rect(110, 148, 8, 24, floor_green_overlap)
+            img_c.fill_rect(110, 172, 40, 8, floor_green_overlap)
+            img_c.fill_rect(126, 154, 10, 10, unknown_lab)  # 100 px unknown in hollow
+            c_blobs = extract_blobs_from_maix_image(make_src(img_c), cfg_overlap, scan_unknown_near=True)
+            c_st = RescueVisionProcessor(cfg_overlap).process(
+                c_blobs, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False
+            )
+            self.assertEqual(c_st.corral_green_cnt, 0, msg=tier_name)
+            self.assertEqual(c_st.corral_unknown_cnt, 1, msg=tier_name)
+            self.assertFalse(bool(c_st.flags & VIS_FLAG_CORRAL_SAFE), msg=tier_name)
+
+            # 2c. 600-px floor patch touching a sub-threshold 50-px real green speck -> floor stripped, green=0!
+            img_sp = _FakeMaixImage(320, 240, floor_base)
+            img_sp.fill_rect(120, 150, 30, 20, floor_green_overlap)
+            img_sp.fill_rect(150, 150, 5, 10, real_green)  # 50 px real green (< min_block_pixels=90)
+            sp_blobs = extract_blobs_from_maix_image(make_src(img_sp), cfg_overlap, scan_unknown_near=True)
+            sp_st = RescueVisionProcessor(cfg_overlap).process(
+                sp_blobs, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False
+            )
+            self.assertEqual(sp_st.corral_green_cnt, 0, msg=tier_name)
+
+            # 2d. 600-px floor patch touching a valid 120-px real green block -> floor stripped, green=1 (120 px)!
+            img_ok = _FakeMaixImage(320, 240, floor_base)
+            img_ok.fill_rect(120, 150, 30, 20, floor_green_overlap)
+            img_ok.fill_rect(150, 150, 12, 10, real_green)  # 120 px real green (>= 90)
+            ok_blobs = extract_blobs_from_maix_image(make_src(img_ok), cfg_overlap, scan_unknown_near=True)
+            ok_st = RescueVisionProcessor(cfg_overlap).process(
+                ok_blobs, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False
+            )
+            self.assertEqual(ok_st.corral_green_cnt, 1, msg=tier_name)
+            self.assertEqual(ok_st.corral_unknown_cnt, 0, msg=tier_name)
+            self.assertTrue(bool(ok_st.flags & VIS_FLAG_CORRAL_SAFE), msg=tier_name)
+            self.assertTrue(any(b.label == "green" and b.pixels == 120 for b in ok_blobs), msg=tier_name)
 
 
 if __name__ == "__main__":
