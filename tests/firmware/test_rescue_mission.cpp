@@ -295,6 +295,34 @@ static void Test_Cyan_Interrupts_Unsettled_Gate_Closure()
     assert(blind_m.On_Vision_State(Make_Near_Vision(bseq++, 1U, 0U, 0U, 0U, 0U, safe), bt));
     blind_m.Update(bin);
     assert(blind_m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
+
+    // Finding 1 (R11): Same-drain FAR -> NEAR before Update() while gate is still closing (!gate_settled)
+    // MUST NOT hide the wrong-view frame! Must abort closure immediately back to INSPECT_CORRAL!
+    bin.gate_settled = false;
+    bin.now_ms = (bt += 20U);
+    assert(blind_m.On_Vision_State(Make_Far_Vision(bseq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), bt));
+    assert(blind_m.On_Vision_State(Make_Near_Vision(bseq++, 1U, 0U, 0U, 0U, 0U, safe), bt));
+    bout = blind_m.Update(bin);
+    assert(!bout.gate_closed);
+    assert(!blind_m.Is_Gate_Closed_Cmd());
+    assert(blind_m.Get_State() == MISSION_INSPECT_CORRAL);
+
+    // Re-enter CLOSE_GATE_VERIFY; same-drain NEAR(cyan) -> NEAR(clean) while !gate_settled MUST abort to BACK_OUT_SEPARATE!
+    bin.gate_settled = true;
+    for (int k = 0; k < 3; ++k)
+    {
+        bin.now_ms = (bt += 40U);
+        assert(blind_m.On_Vision_State(Make_Near_Vision(bseq++, 1U, 0U, 0U, 0U, 0U, safe), bt));
+        blind_m.Update(bin);
+    }
+    assert(blind_m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
+    bin.gate_settled = false;
+    bin.now_ms = (bt += 20U);
+    assert(blind_m.On_Vision_State(Make_Near_Vision(bseq++, 0U, 0U, 0U, 1U, 0U, 0U), bt));
+    assert(blind_m.On_Vision_State(Make_Near_Vision(bseq++, 1U, 0U, 0U, 0U, 0U, safe), bt));
+    bout = blind_m.Update(bin);
+    assert(!bout.gate_closed);
+    assert(blind_m.Get_State() == MISSION_BACK_OUT_SEPARATE);
 }
 
 static void Test_Full_First_Green_Delivery_And_Proven_Rear_Corridor()
@@ -1268,6 +1296,137 @@ static void Test_Braking_Phase_Vision_Outage_And_Uart_Rx_Unhealthy()
     }
 }
 
+static void Test_Drop_Verify_Requires_Consecutive_Near_Frames()
+{
+    // Finding 4 (R11): MISSION_DROP_BACKOUT_VERIFY Sub_Phase 2 MUST reset Confirm_Count on any
+    // non-NEAR frame (TRANSITION/FAR), including same-drain TRANSITION -> CONFIRM or
+    // NEAR(unconfirmed) -> NEAR(confirmed), so non-consecutive confirmations NEVER unlock
+    // First_Green_Unlocked or credit Delivered_Green!
+    Class_Rescue_Mission dm;
+    assert(dm.On_Set_Config({RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION, 1U}));
+    const uint16_t safe = VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR;
+    const uint16_t safe_aligned =
+        VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR | VIS_FLAG_HOME_HALF_MATCH |
+        VIS_FLAG_DROP_PATH_CLEAR | VIS_FLAG_DROP_BASELINE_READY;
+    uint32_t dt = 1000U;
+    uint16_t dseq = 1U;
+    assert(dm.On_Vision_State(Make_Far_Vision(dseq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), dt));
+    Struct_Mission_Inputs din{};
+    din.now_ms = dt;
+    din.hardware_ready = true;
+    din.can_launch = true;
+    din.button_pressed = true;
+    din.wheels_still = true;
+    din.gate_settled = true;
+    din.camera_settled = true;
+    dm.Update(din);
+    din.button_pressed = false;
+    din.chassis_motion_done = true;
+    din.now_ms = (dt += 50U);
+    assert(dm.On_Vision_State(Make_Far_Vision(dseq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 0, 190U), dt));
+    dm.Update(din);
+    din.chassis_motion_done = false;
+    for (int i = 0; i < 2; ++i)
+    {
+        din.now_ms = (dt += 50U);
+        assert(dm.On_Vision_State(Make_Far_Vision(dseq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 0, 190U), dt));
+        dm.Update(din);
+    }
+    for (int k = 0; k < 6; ++k)
+    {
+        din.now_ms = (dt += 50U);
+        assert(dm.On_Vision_State(Make_Near_Vision(dseq++, 1U, 0U, 0U, 0U, 0U, safe), dt));
+        dm.Update(din);
+    }
+    din.now_ms = (dt += 50U);
+    assert(dm.On_Vision_State(Make_Far_Vision(dseq++, TARGET_NONE, VIS_FLAG_HOME_VALID, 0, 500U), dt));
+    dm.Update(din);
+    din.now_ms = (dt += 50U);
+    assert(dm.On_Vision_State(Make_Far_Vision(dseq++, TARGET_NONE, VIS_FLAG_HOME_VALID | VIS_FLAG_HOME_HALF_MATCH, 0, 200U), dt));
+    dm.Update(din);
+    for (int k = 0; k < 3; ++k)
+    {
+        din.now_ms = (dt += 50U);
+        assert(dm.On_Vision_State(Make_Near_Vision(dseq++, 1U, 0U, 0U, 0U, 0U, safe_aligned), dt));
+        dm.Update(din);
+    }
+    din.now_ms = (dt += 50U);
+    dm.Update(din);
+    din.now_ms = (dt += 50U);
+    assert(dm.On_Vision_State(
+        Make_Near_Vision(dseq++, 1U, 0U, 0U, 0U, 0U, safe_aligned | VIS_FLAG_GATE_OPEN_SETTLED_ACK), dt));
+    dm.Update(din);
+    // Complete push with no proven reverse -> enters MISSION_DROP_BACKOUT_VERIFY Sub_Phase 2 directly!
+    din.chassis_motion_done = true;
+    din.chassis_active = false;
+    din.wheels_still = true;
+    din.now_ms = (dt += 50U);
+    assert(dm.On_Vision_State(Make_Near_Vision(dseq++, 0U, 0U, 0U, 0U, 0U, safe_aligned), dt));
+    dm.Update(din);
+    din.chassis_motion_done = false;
+    assert(dm.Get_State() == MISSION_DROP_BACKOUT_VERIFY);
+
+    auto make_trans = [&](uint16_t s) {
+        Struct_Vision_State v{};
+        v.frame_seq = s;
+        v.camera_view = CAMERA_VIEW_TRANSITION;
+        v.confidence = 90U;
+        return v;
+    };
+
+    // Case 1: CONFIRM -> TRANSITION -> CONFIRM -> TRANSITION -> CONFIRM MUST NOT confirm!
+    for (int step = 0; step < 3; ++step)
+    {
+        din.now_ms = (dt += 40U);
+        assert(dm.On_Vision_State(Make_Near_Vision(dseq++, 0U, 0U, 0U, 0U, 0U, safe | VIS_FLAG_DROP_CONFIRMED), dt));
+        dm.Update(din);
+        assert(dm.Get_State() == MISSION_DROP_BACKOUT_VERIFY);
+        assert(!dm.Is_First_Green_Unlocked());
+        assert(dm.Get_Delivered_Green() == 0U);
+        if (step < 2)
+        {
+            din.now_ms = (dt += 40U);
+            assert(dm.On_Vision_State(make_trans(dseq++), dt));
+            dm.Update(din);
+            assert(dm.Get_State() == MISSION_DROP_BACKOUT_VERIFY);
+        }
+    }
+
+    // Case 2: Currently Confirm_Count == 1; same-drain TRANSITION -> CONFIRM resets to 0, so a following CONFIRM
+    // only reaches 1 (NOT 3!) and MUST NOT confirm!
+    din.now_ms = (dt += 40U);
+    assert(dm.On_Vision_State(make_trans(dseq++), dt));
+    assert(dm.On_Vision_State(Make_Near_Vision(dseq++, 0U, 0U, 0U, 0U, 0U, safe | VIS_FLAG_DROP_CONFIRMED), dt));
+    dm.Update(din);
+    assert(dm.Get_State() == MISSION_DROP_BACKOUT_VERIFY);
+    din.now_ms = (dt += 40U);
+    assert(dm.On_Vision_State(Make_Near_Vision(dseq++, 0U, 0U, 0U, 0U, 0U, safe | VIS_FLAG_DROP_CONFIRMED), dt));
+    dm.Update(din);
+    assert(dm.Get_State() == MISSION_DROP_BACKOUT_VERIFY);
+    assert(!dm.Is_First_Green_Unlocked());
+
+    // Case 3: Currently Confirm_Count == 1; same-drain NEAR(unconfirmed) -> NEAR(confirmed) resets before counting
+    // so Confirm_Count stays 1; one more CONFIRM reaches 2 (NOT 3!).
+    din.now_ms = (dt += 40U);
+    assert(dm.On_Vision_State(Make_Near_Vision(dseq++, 0U, 0U, 0U, 0U, 0U, safe), dt));
+    assert(dm.On_Vision_State(Make_Near_Vision(dseq++, 0U, 0U, 0U, 0U, 0U, safe | VIS_FLAG_DROP_CONFIRMED), dt));
+    dm.Update(din);
+    assert(dm.Get_State() == MISSION_DROP_BACKOUT_VERIFY);
+    din.now_ms = (dt += 40U);
+    assert(dm.On_Vision_State(Make_Near_Vision(dseq++, 0U, 0U, 0U, 0U, 0U, safe | VIS_FLAG_DROP_CONFIRMED), dt));
+    dm.Update(din);
+    assert(dm.Get_State() == MISSION_DROP_BACKOUT_VERIFY);
+    assert(!dm.Is_First_Green_Unlocked());
+
+    // Case 4: Third consecutive settled NEAR(VIS_FLAG_DROP_CONFIRMED) frame cleanly confirms & unlocks!
+    din.now_ms = (dt += 40U);
+    assert(dm.On_Vision_State(Make_Near_Vision(dseq++, 0U, 0U, 0U, 0U, 0U, safe | VIS_FLAG_DROP_CONFIRMED), dt));
+    dm.Update(din);
+    assert(dm.Get_State() == MISSION_SEARCH_TARGET);
+    assert(dm.Is_First_Green_Unlocked());
+    assert(dm.Get_Delivered_Green() == 1U);
+}
+
 int main()
 {
     Test_Freshness_Nonconsecutive_Replay_Wrap_And_Restart();
@@ -1280,5 +1439,6 @@ int main()
     Test_Active_Reverse_Abrupt_Clearance_Loss_Cancels_Immediately_And_Waits_Standstill();
     Test_Same_Cargo_Reverify_After_Escape_Cannot_Bypass_Recovery_Budget();
     Test_Braking_Phase_Vision_Outage_And_Uart_Rx_Unhealthy();
-    std::puts("PASS: rescue mission replay/wrap, stale/opponent interlock, gate/push hazard abort, margin reverse + standstill, braking outage gate, bounded recovery");
+    Test_Drop_Verify_Requires_Consecutive_Near_Frames();
+    std::puts("PASS: rescue mission replay/wrap, stale/opponent interlock, gate/push hazard abort, margin reverse + standstill, braking outage gate, drop consecutive confirm, bounded recovery");
 }

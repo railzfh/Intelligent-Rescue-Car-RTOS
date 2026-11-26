@@ -161,6 +161,78 @@ class _FakeMaixImage:
         return out
 
 
+class _FakeMaix8ConnImage(_FakeMaixImage):
+    """Tier-1 pixel-accessor image whose find_blobs() uses 8-connected components."""
+
+    def find_blobs(
+        self,
+        thresholds: list[tuple[int, int, int, int, int, int]],
+        roi: tuple[int, int, int, int] | None = None,
+        x_stride: int = 1,
+        y_stride: int = 1,
+        pixels_threshold: int = 1,
+        area_threshold: int = 1,
+        invert: bool = False,
+        merge: bool = False,
+    ) -> list[_FakeMaixBlob]:
+        _ = (x_stride, y_stride)
+        rx, ry, rw, rh = roi if roi is not None else (0, 0, self.width, self.height)
+        x1, y1 = max(0, rx), max(0, ry)
+        x2, y2 = min(self.width, rx + rw), min(self.height, ry + rh)
+        t = thresholds[0]
+
+        def matches(px: tuple[int, int, int]) -> bool:
+            inside = (t[0] <= px[0] <= t[1]) and (t[2] <= px[1] <= t[3]) and (t[4] <= px[2] <= t[5])
+            return (not inside) if invert else inside
+
+        visited = [[False] * (x2 - x1) for _ in range(y2 - y1)]
+        comps: list[tuple[int, int, int, int, int]] = []
+        nbrs8 = ((-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1))
+        for yy in range(y1, y2):
+            for xx in range(x1, x2):
+                if visited[yy - y1][xx - x1] or not matches(self._grid[yy][xx]):
+                    continue
+                stack = [(xx, yy)]
+                visited[yy - y1][xx - x1] = True
+                min_x = max_x = xx
+                min_y = max_y = yy
+                cnt = 0
+                while stack:
+                    cx, cy = stack.pop()
+                    cnt += 1
+                    if cx < min_x:
+                        min_x = cx
+                    if cx > max_x:
+                        max_x = cx
+                    if cy < min_y:
+                        min_y = cy
+                    if cy > max_y:
+                        max_y = cy
+                    for dx, dy in nbrs8:
+                        nx, ny = cx + dx, cy + dy
+                        if x1 <= nx < x2 and y1 <= ny < y2 and not visited[ny - y1][nx - x1]:
+                            if matches(self._grid[ny][nx]):
+                                visited[ny - y1][nx - x1] = True
+                                stack.append((nx, ny))
+                bw = max_x - min_x + 1
+                bh = max_y - min_y + 1
+                comps.append((min_x, min_y, bw, bh, cnt))
+
+        if merge and comps:
+            mx1 = min(c[0] for c in comps)
+            my1 = min(c[1] for c in comps)
+            mx2 = max(c[0] + c[2] for c in comps)
+            my2 = max(c[1] + c[3] for c in comps)
+            total_px = sum(c[4] for c in comps)
+            comps = [(mx1, my1, mx2 - mx1, my2 - my1, total_px)]
+
+        out: list[_FakeMaixBlob] = []
+        for bx, by, bw, bh, cnt in comps:
+            if cnt >= pixels_threshold and (bw * bh) >= area_threshold:
+                out.append(_FakeMaixBlob(bx, by, bw, bh, cnt))
+        return out
+
+
 class _FakeMaixBinaryImage:
     """Real-MaixPy-faithful Tier-2 Image mock: exposes ONLY find_blobs(), crop(), binary() (no pixel accessor!)."""
 
@@ -1590,6 +1662,108 @@ class MaixcamVisionAndUITest(unittest.TestCase):
             blobs_sw_hit = extract_blobs_from_maix_image(img_sw, self.cfg, scan_unknown_near=True)
             st_sw_hit = RescueVisionProcessor(self.cfg).process(blobs_sw_hit, **kw)
             self.assertFalse(st_sw_hit.flags & VIS_FLAG_SWEEP_CLEAR, cls.__name__)
+
+    def test_round11_cross_label_disambiguation_and_tier1_8conn_occupancy(self) -> None:
+        floor_lab = (85, 0, 0)
+        green_only_lab = (55, -35, 30)
+        orange_only_lab = (65, 45, 60)
+        shared_go_lab = (60, 10, 45)  # matches overlapping custom green & orange bands!
+        cyan_only_lab = (68, -25, -20)
+        shared_cg_lab = (60, -25, 10)  # matches overlapping custom cyan & green bands!
+        kw = dict(camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False)
+
+        ov_go_cfg = RescueVisionConfig()
+        ov_go_cfg.lab_thresholds["green"] = [30, 82, -60, 20, 12, 55]
+        ov_go_cfg.lab_thresholds["orange"] = [48, 88, 0, 58, 36, 78]
+
+        # 1. Finding 2 (R11): Overlapping custom object LAB bands MUST disambiguate BEFORE emitting
+        #    verified or rejected objects into blobs across ALL tiers!
+        for cls in (_FakeMaixImage, _FakeMaixBinaryImage, _FakeMaixNativeStrideImage, _FakeMaix8ConnImage):
+            # 1a. One 120-px (12x10) foreground patch matching both green & orange -> EXACTLY ONE unknown
+            #     (NEVER 1 green + 1 orange!).
+            img_120 = cls(320, 240, floor_lab)
+            img_120.fill_rect(120, 150, 12, 10, shared_go_lab)
+            blobs_120 = extract_blobs_from_maix_image(img_120, ov_go_cfg, scan_unknown_near=True)
+            self.assertEqual([b.label for b in blobs_120 if b.label in ("green", "orange", "unknown")], ["unknown"], cls.__name__)
+            st_120 = RescueVisionProcessor(ov_go_cfg).process(blobs_120, **kw)
+            self.assertEqual(st_120.corral_green_cnt, 0, cls.__name__)
+            self.assertEqual(st_120.corral_orange_cnt, 0, cls.__name__)
+            self.assertEqual(st_120.corral_unknown_cnt, 1, cls.__name__)
+            self.assertFalse(st_120.flags & VIS_FLAG_CORRAL_SAFE, cls.__name__)
+
+            # 1b. Partially overlapping 150-px foreground patch (50 green-only + 50 shared + 50 orange-only):
+            #     green sees 100 px, orange sees 100 px sharing 50 px -> STILL EXACTLY ONE unknown!
+            img_part = cls(320, 240, floor_lab)
+            img_part.fill_rect(120, 150, 5, 10, green_only_lab)
+            img_part.fill_rect(125, 150, 5, 10, shared_go_lab)
+            img_part.fill_rect(130, 150, 5, 10, orange_only_lab)
+            blobs_part = extract_blobs_from_maix_image(img_part, ov_go_cfg, scan_unknown_near=True)
+            self.assertEqual([b.label for b in blobs_part if b.label in ("green", "orange", "unknown")], ["unknown"], cls.__name__)
+            st_part = RescueVisionProcessor(ov_go_cfg).process(blobs_part, **kw)
+            self.assertEqual(st_part.corral_green_cnt, 0, cls.__name__)
+            self.assertEqual(st_part.corral_orange_cnt, 0, cls.__name__)
+            self.assertEqual(st_part.corral_unknown_cnt, 1, cls.__name__)
+            self.assertFalse(st_part.flags & VIS_FLAG_CORRAL_SAFE, cls.__name__)
+
+            # 1c. One 9600-px (120x80 > max_block_pixels=9500) oversized patch matching overlapping green & orange
+            #     (both inside corral AND straddling corral boundary!) -> EXACTLY ONE rejected unknown (NEVER 2!).
+            for ox, oy in ((100, 136), (80, 120)):
+                img_big = cls(320, 240, floor_lab)
+                img_big.fill_rect(ox, oy, 120, 80, shared_go_lab)
+                blobs_big = extract_blobs_from_maix_image(img_big, ov_go_cfg, scan_unknown_near=True)
+                self.assertEqual(len([b for b in blobs_big if b.label in ("green", "orange", "unknown")]), 1, cls.__name__)
+                st_big = RescueVisionProcessor(ov_go_cfg).process(blobs_big, **kw)
+                self.assertEqual(st_big.corral_unknown_cnt, 1, cls.__name__)
+                self.assertFalse(st_big.flags & VIS_FLAG_CORRAL_SAFE, cls.__name__)
+
+            # 1d. Disjoint pure green (144 px) + pure orange (144 px) under overlapping bands -> NO false conflict!
+            img_disj = cls(320, 240, floor_lab)
+            img_disj.fill_rect(110, 150, 12, 12, green_only_lab)
+            img_disj.fill_rect(150, 150, 12, 12, orange_only_lab)
+            blobs_disj = extract_blobs_from_maix_image(img_disj, ov_go_cfg, scan_unknown_near=True)
+            st_disj = RescueVisionProcessor(ov_go_cfg).process(blobs_disj, **kw)
+            self.assertEqual(st_disj.corral_green_cnt, 1, cls.__name__)
+            self.assertEqual(st_disj.corral_orange_cnt, 1, cls.__name__)
+            self.assertEqual(st_disj.corral_unknown_cnt, 0, cls.__name__)
+
+            # 1e. Overlapping cyan & green bands on one 120-px patch -> hazard priority: 1 cyan, 0 green, 0 unknown!
+            ov_cg_cfg = RescueVisionConfig()
+            ov_cg_cfg.lab_thresholds["cyan"] = [48, 90, -48, -16, -42, 20]
+            ov_cg_cfg.lab_thresholds["green"] = [30, 82, -60, -18, 0, 55]
+            img_cg = cls(320, 240, floor_lab)
+            img_cg.fill_rect(120, 150, 12, 10, shared_cg_lab)
+            blobs_cg = extract_blobs_from_maix_image(img_cg, ov_cg_cfg, scan_unknown_near=True)
+            st_cg = RescueVisionProcessor(ov_cg_cfg).process(blobs_cg, **kw)
+            self.assertEqual(st_cg.corral_cyan_cnt, 1, cls.__name__)
+            self.assertEqual(st_cg.corral_green_cnt, 0, cls.__name__)
+            self.assertEqual(st_cg.corral_unknown_cnt, 0, cls.__name__)
+            self.assertFalse(st_cg.flags & VIS_FLAG_CORRAL_SAFE, cls.__name__)
+
+        # 2. Finding 3 (R11): Tier-1 pixel-clipped sweep occupancy with an 8-connected host image adapter
+        #    (_FakeMaix8ConnImage exposes get_lab_pixel -> Tier 1!). An 84-px 8-connected cyan component
+        #    strictly outside near_sweep_roi ([232, 118, 64, 106]) whose AABB overlaps near_sweep_roi
+        #    MUST preserve SWEEP_CLEAR=True while clearing DROP_PATH_CLEAR=False!
+        img_8c = _FakeMaix8ConnImage(320, 240, floor_lab)
+        # Two 4-disconnected blocks joined diagonally at (231,117)-(232,116):
+        # left vertical block: (228, 117, 4, 10) -> 40 px (x=228..231 < 232, y=117..126)
+        # top horizontal block: (232, 115, 22, 2) -> 44 px (x=232..253, y=115..116 < 118)
+        # 8-connected total = 84 px, AABB = (228, 115, 26, 12) overlaps sweep [232..296, 118..224] with 0 actual pixels!
+        img_8c.fill_rect(228, 117, 4, 10, cyan_only_lab)
+        img_8c.fill_rect(232, 115, 22, 2, cyan_only_lab)
+        blobs_8c = extract_blobs_from_maix_image(img_8c, self.cfg, scan_unknown_near=True)
+        cyan_8c = [b for b in blobs_8c if b.label == "cyan"]
+        self.assertEqual(len(cyan_8c), 1)
+        self.assertEqual(cyan_8c[0].pixels, 84)
+        self.assertIs(cyan_8c[0].in_sweep, False)
+        st_8c = RescueVisionProcessor(self.cfg).process(blobs_8c, **kw)
+        self.assertTrue(st_8c.flags & VIS_FLAG_SWEEP_CLEAR)
+        self.assertFalse(st_8c.flags & VIS_FLAG_DROP_PATH_CLEAR)
+
+        # Positive control: extend 1 diagonal pixel INTO near_sweep_roi at (232, 118) -> SWEEP_CLEAR=False!
+        img_8c.fill_rect(232, 118, 1, 1, cyan_only_lab)
+        blobs_8c_hit = extract_blobs_from_maix_image(img_8c, self.cfg, scan_unknown_near=True)
+        st_8c_hit = RescueVisionProcessor(self.cfg).process(blobs_8c_hit, **kw)
+        self.assertFalse(st_8c_hit.flags & VIS_FLAG_SWEEP_CLEAR)
 
     def test_home_half_match_checks_full_corral_width_and_opponent_zone(self) -> None:
         # Home x=100..320 (cx=210, left material half=[100, 192]).

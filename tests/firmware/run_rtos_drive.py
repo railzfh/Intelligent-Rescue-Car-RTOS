@@ -758,7 +758,31 @@ int main(int argc, char **argv) {
         }
         assert(Gate_Servo.Get_Current_Us() == Gate_Open_Us && Gate_Servo.Is_Settled());
         assert(Rescue_Mission.Get_State() == MISSION_INSPECT_CORRAL);
-        std::puts("PASS: UART RX fault and wrong-view frames mid-gate-close immediately abort blind closure and retract gate to open");
+
+        // Finding 1 (R11): Re-enter MISSION_CLOSE_GATE_VERIFY, then deliver FAR followed by NEAR
+        // in the SAME UART drain while gate is still closing (!Is_Settled) -> MUST abort closure
+        // immediately on that tick and retract gate back to Gate_Open_Us (never advance 1002 -> 1004 us)!
+        for (int k = 0; k < 1000 && Rescue_Mission.Get_State() == MISSION_INSPECT_CORRAL; ++k) {
+            ++tm;
+            if ((tm % 25U) == 0U) { feed_gate(CAMERA_VIEW_NEAR, VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR, 1U); }
+            Step(tm, false);
+        }
+        assert(Rescue_Mission.Get_State() == MISSION_CLOSE_GATE_VERIFY);
+        const uint16_t before_same_drain_us = Gate_Servo.Get_Current_Us();
+        assert(before_same_drain_us < Gate_Closed_Us && !Gate_Servo.Is_Settled());
+        feed_gate(CAMERA_VIEW_FAR, VIS_FLAG_TARGET_VALID, 0U);
+        feed_gate(CAMERA_VIEW_NEAR, VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR, 1U);
+        Step(++tm, false);
+        assert(!Rescue_Mission.Is_Gate_Closed_Cmd());
+        assert(Rescue_Mission.Get_State() == MISSION_INSPECT_CORRAL);
+        assert(Gate_Servo.Get_Current_Us() <= before_same_drain_us);
+        for (unsigned elapsed = 0U; elapsed < 200U && !Gate_Servo.Is_Settled(); ++elapsed) {
+            if ((elapsed % 25U) == 0U) { feed_gate(CAMERA_VIEW_NEAR, VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR, 0U); }
+            Step(++tm, false);
+            assert(Gate_Servo.Get_Current_Us() <= before_same_drain_us);
+        }
+        assert(Gate_Servo.Get_Current_Us() == Gate_Open_Us && Gate_Servo.Is_Settled());
+        std::puts("PASS: UART RX fault, wrong-view frames, and same-drain FAR->NEAR mid-gate-close abort blind closure and retract gate to open");
         return 0;
     }
 

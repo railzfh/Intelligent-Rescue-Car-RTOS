@@ -199,6 +199,9 @@ private:
     uint32_t Vision_Outage_Start_Ms = 0U;
     bool Interrupted_By_Stale_Vision = false;
     bool Vision_Invalidated_By_Rx_Fault = false;
+    bool Pending_Non_Near_View_Event = false;
+    bool Pending_Near_Hazard_Event = false;
+    bool Pending_Drop_Unconfirmed_Event = false;
 
     bool Has_Confirm_Frame = false;
     uint16_t Last_Confirm_Frame_Seq = 0U;
