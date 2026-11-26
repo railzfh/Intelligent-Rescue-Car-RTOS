@@ -42,13 +42,26 @@ def _extract_motion_grid(img, width: int, height: int) -> list[int]:
     return list(small.to_bytes())
 
 
-def _fence_camera_queue(cam) -> bool:
-    """Flush queued pre-transition camera frames; return True if buffer flush is supported."""
-    clear_fn = getattr(cam, "clear_buff", None)
-    if not callable(clear_fn):
-        return False
-    clear_fn()
-    return True
+_CAMERA_BUFF_NUM = 3  # MaixCDK MMF default camera buffer queue depth
+
+
+def _camera_drain_frames(cam, configured_buff_num: int = _CAMERA_BUFF_NUM) -> int:
+    """Return number of reads to discard (queued buffers + 1 in-flight exposure).
+
+    Sipeed's MaixCAM MMF Camera.clear_buff() is a logged no-op, so settle transitions
+    must drain queued and in-flight frames via real cam.read() calls and withhold settle
+    acknowledgments until a demonstrably fresh capture is obtained.
+    """
+    raw_depth = getattr(cam, "buff_num", None)
+    if callable(raw_depth):
+        try:
+            raw_depth = raw_depth()
+        except Exception:
+            raw_depth = None
+    depth = configured_buff_num
+    if isinstance(raw_depth, int) and not isinstance(raw_depth, bool) and raw_depth > 0:
+        depth = max(depth, raw_depth)
+    return depth + 1
 
 
 def run_maixcam(config_path: Path | None = None) -> None:
@@ -62,7 +75,11 @@ def run_maixcam(config_path: Path | None = None) -> None:
     pinmap.set_pin_function(cfg.uart_rx_pin, "UART1_RX")
     serial = uart.UART(cfg.uart_device, cfg.uart_baud)
 
-    cam = camera.Camera(cfg.frame_width, cfg.frame_height)
+    try:
+        cam = camera.Camera(cfg.frame_width, cfg.frame_height, buff_num=_CAMERA_BUFF_NUM)
+    except TypeError:
+        cam = camera.Camera(cfg.frame_width, cfg.frame_height)
+    drain_depth = _camera_drain_frames(cam)
     disp = display.Display()
     ts = touchscreen.TouchScreen()
 
@@ -85,21 +102,59 @@ def run_maixcam(config_path: Path | None = None) -> None:
     last_vis_s = 0.0
     prev_camera_near = False
     prev_camera_settled = False
-    prev_gate_settled = False
+    prev_gate_open_settled = False
     fenced_pre_match_gen = 0
-    pre_match_gen_fresh = False
+    pre_match_drain_remaining = 0
+    cam_settle_drain_remaining = drain_depth
+    gate_settle_drain_remaining = 0
+
+    def _observe_telemetry(tel: Telemetry) -> None:
+        nonlocal prev_camera_near, prev_camera_settled, prev_gate_open_settled
+        nonlocal fenced_pre_match_gen, pre_match_drain_remaining
+        nonlocal cam_settle_drain_remaining, gate_settle_drain_remaining
+
+        cam_near = bool(tel.status_flags & TEL_FLAG_CAMERA_NEAR)
+        cam_settled = bool(tel.status_flags & TEL_FLAG_CAMERA_SETTLED)
+        g_closed = bool(tel.status_flags & TEL_FLAG_GATE_CLOSED)
+        g_settled = bool(tel.status_flags & TEL_FLAG_GATE_SETTLED)
+        g_open_settled = (not g_closed) and g_settled
+        pm_gen = (tel.status_flags & TEL_FLAG_PRE_MATCH_GEN_MASK) >> TEL_FLAG_PRE_MATCH_GEN_SHIFT
+
+        if cam_near != prev_camera_near or not cam_settled:
+            motion_estimator.reset()
+            cam_settle_drain_remaining = drain_depth
+            prev_camera_near = cam_near
+        elif cam_settled and not prev_camera_settled:
+            cam_settle_drain_remaining = drain_depth
+        prev_camera_settled = cam_settled
+
+        if not g_open_settled:
+            gate_settle_drain_remaining = 0
+        elif not prev_gate_open_settled:
+            gate_settle_drain_remaining = drain_depth
+        prev_gate_open_settled = g_open_settled
+
+        pm_ready = (not cam_near) and cam_settled and g_open_settled and (1 <= pm_gen <= 3)
+        if not pm_ready:
+            fenced_pre_match_gen = 0
+            pre_match_drain_remaining = 0
+        elif pm_gen != fenced_pre_match_gen:
+            fenced_pre_match_gen = pm_gen
+            pre_match_drain_remaining = drain_depth
 
     while not app.need_exit():
         now_s = time.monotonic()
         uptime_ms = int((now_s - start_s) * 1000.0)
 
-        # 1. Read incoming telemetry frames from DM-MC02.
+        # 1. Read incoming telemetry frames from DM-MC02, observing every frame in burst order
+        #    so a transient settle/pitch/gate transition within one serial.read() always re-arms drain.
         raw = serial.read()
         if raw:
             for frame in parser.feed(raw):
                 tel = decode_telemetry(frame)
                 if tel is not None:
                     telemetry = tel
+                    _observe_telemetry(tel)
 
         camera_near = bool(telemetry.status_flags & TEL_FLAG_CAMERA_NEAR)
         camera_settled = bool(telemetry.status_flags & TEL_FLAG_CAMERA_SETTLED)
@@ -107,48 +162,59 @@ def run_maixcam(config_path: Path | None = None) -> None:
         carrying_casualty = bool(telemetry.status_flags & TEL_FLAG_CARRYING_CASUALTY)
         gate_closed = bool(telemetry.status_flags & TEL_FLAG_GATE_CLOSED)
         gate_settled = bool(telemetry.status_flags & TEL_FLAG_GATE_SETTLED)
+        gate_open_settled = (not gate_closed) and gate_settled
         drop_pushing = bool(telemetry.status_flags & TEL_FLAG_DROP_PUSHING)
         pre_match_settle_gen = (telemetry.status_flags & TEL_FLAG_PRE_MATCH_GEN_MASK) >> TEL_FLAG_PRE_MATCH_GEN_SHIFT
         wheels_moving = abs(telemetry.vx_mm_s) > 35 or abs(telemetry.omega_mrad_s) > 250
-
-        need_cam_fence = (
-            camera_near != prev_camera_near
-            or (camera_settled and not prev_camera_settled)
-            or (gate_settled and not prev_gate_settled)
-        )
-        if camera_near != prev_camera_near or not camera_settled:
-            motion_estimator.reset()
-            prev_camera_near = camera_near
-        prev_camera_settled = camera_settled
-        prev_gate_settled = gate_settled
-
         pre_match_ready_state = (
             (not camera_near)
             and camera_settled
-            and (not gate_closed)
-            and gate_settled
+            and gate_open_settled
             and (1 <= pre_match_settle_gen <= 3)
         )
-        if not pre_match_ready_state:
-            fenced_pre_match_gen = 0
-            pre_match_gen_fresh = False
-        elif pre_match_settle_gen != fenced_pre_match_gen:
-            fenced_pre_match_gen = pre_match_settle_gen
-            pre_match_gen_fresh = _fence_camera_queue(cam)
-            need_cam_fence = False
-        if need_cam_fence:
-            _fence_camera_queue(cam)
 
-        # 2. Capture frame, run LAB blob pipeline (with near unknown-foreground scan) & spatial motion estimator.
+        # 2. Capture frame; while draining buffered/in-flight pre-settle frames, withhold settled
+        #    camera/gate/pre-match acknowledgments so a pre-settle frame can NEVER authorize launch or push.
         img = cam.read()
-        blobs = extract_blobs_from_maix_image(img, cfg, scan_unknown_near=(camera_near and camera_settled))
-        grid = _extract_motion_grid(img, cfg.motion_grid_w, cfg.motion_grid_h)
-        motion_stalled, _ = motion_estimator.update(grid, now_s, wheels_moving=wheels_moving)
+        if img is None:
+            continue
+
+        draining_cam = cam_settle_drain_remaining > 0
+        if draining_cam:
+            cam_settle_drain_remaining -= 1
+
+        draining_gate = gate_settle_drain_remaining > 0
+        if draining_gate:
+            gate_settle_drain_remaining -= 1
+
+        draining_pre_match = pre_match_drain_remaining > 0
+        if draining_pre_match:
+            pre_match_drain_remaining -= 1
+
+        effective_camera_settled = camera_settled and (not draining_cam) and (not draining_pre_match)
+        effective_gate_settled = gate_settled and (not draining_gate) and (not draining_pre_match)
+        if (
+            pre_match_ready_state
+            and effective_camera_settled
+            and effective_gate_settled
+            and fenced_pre_match_gen == pre_match_settle_gen
+        ):
+            effective_pre_match_gen = pre_match_settle_gen
+        else:
+            effective_pre_match_gen = 0
+
+        blobs = extract_blobs_from_maix_image(img, cfg, scan_unknown_near=(camera_near and effective_camera_settled))
+        if effective_camera_settled:
+            grid = _extract_motion_grid(img, cfg.motion_grid_w, cfg.motion_grid_h)
+            motion_stalled, _ = motion_estimator.update(grid, now_s, wheels_moving=wheels_moving)
+        else:
+            motion_estimator.reset()
+            motion_stalled = False
 
         vision_state = processor.process(
             blobs=blobs,
             camera_near_cmd=camera_near,
-            camera_settled=camera_settled,
+            camera_settled=effective_camera_settled,
             team=telemetry.team if telemetry.team else ui.config.team,
             first_green_unlocked=first_green_unlocked,
             carrying_casualty=carrying_casualty,
@@ -157,9 +223,9 @@ def run_maixcam(config_path: Path | None = None) -> None:
             rear_clear=False,
             mission_state=telemetry.mission_state,
             gate_closed=gate_closed,
-            gate_settled=gate_settled,
+            gate_settled=effective_gate_settled,
             drop_pushing=drop_pushing,
-            pre_match_settle_gen=pre_match_settle_gen if pre_match_gen_fresh else 0,
+            pre_match_settle_gen=effective_pre_match_gen,
         )
 
         # 3. Poll touchscreen (locked automatically once MC02 confirms launch).

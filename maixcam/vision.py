@@ -1497,7 +1497,7 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
     # to accept a standalone legal block.
     accounted_obj_pts: set[Tuple[int, int]] = set()
     accounted_obj_boxes: List[Tuple[int, int, int, int]] = []
-    accounted_clusters: List[Tuple[set[Tuple[int, int]], Tuple[int, int, int, int]]] = []
+    accounted_clusters: List[Tuple[set[Tuple[int, int]], Tuple[int, int, int, int], bool]] = []
     accounted_rejected_blobs: List[Blob] = []
 
     def _emit_singleton_obj(b: Blob, meets_min: bool, is_ver: bool) -> None:
@@ -1647,7 +1647,12 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
             emitted_rejected_object_rects.add((ux1, uy1, uw, uh))
             accounted_obj_pts.update(union_pts)
             accounted_obj_boxes.append((ux1, uy1, ux2, uy2))
-            accounted_clusters.append((union_pts, (ux1, uy1, ux2, uy2)))
+            cluster_floor_disjoint = all(
+                (t_m := cfg.lab_thresholds.get(raw_obj_cands[m][0].label)) is not None
+                and not _lab_ranges_overlap(t_m, cfg.arena_floor_lab)
+                for m in members
+            )
+            accounted_clusters.append((union_pts, (ux1, uy1, ux2, uy2), cluster_floor_disjoint))
 
     # In NEAR view, detect unexplained non-floor foreground across ALL fixed near ROIs PLUS the dynamic
     # home zone, ramp band, and projected push-corridor geometry, masking ONLY verified connected
@@ -2509,6 +2514,7 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                     merge=False,
                 )
                 other_fgs: List[Tuple[int, int, int, int, int]] = []
+                solid_self_comps: List[Tuple[int, int, int, int]] = []
                 matched_self = False
                 total_box_fg_px = 0
                 for c_item in box_fg_comps:
@@ -2518,56 +2524,60 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                     total_box_fg_px += cpx
                     if not merge_fg and not matched_self and (cx, cy, cw, ch, cpx) == (fx, fy, fg_w, fg_h, px):
                         matched_self = True
+                        if cpx >= cw * ch:
+                            solid_self_comps.append((cx, cy, cx + cw, cy + ch))
                     elif not merge_fg:
                         other_fgs.append((cx, cy, cw, ch, cpx))
+                    elif cpx >= cw * ch:
+                        solid_self_comps.append((cx, cy, cx + cw, cy + ch))
                 membership_uncertain = (not merge_fg and not matched_self) or (merge_fg and total_box_fg_px != px)
 
                 def _proven_sub_on_fg(candidate: Blob, thresh: Optional[Sequence[int]]) -> Optional[Blob]:
                     if membership_uncertain:
                         return None
+                    fits_self = (
+                        candidate.x >= fx
+                        and candidate.y >= fy
+                        and candidate.x2 <= fx + fg_w
+                        and candidate.y2 <= fy + fg_h
+                        and candidate.pixels <= px
+                    )
+                    if not fits_self:
+                        return None
+                    # If candidate lies wholly inside a 100% solid non-floor component of fg (zero floor or
+                    # other-component pixels exist inside that box), every pixel of candidate belongs to fg.
+                    if any(
+                        sx1 <= candidate.x and sy1 <= candidate.y and candidate.x2 <= sx2 and candidate.y2 <= sy2
+                        for sx1, sy1, sx2, sy2 in solid_self_comps
+                    ):
+                        return candidate
+                    # Connected-component subgraph membership proof (R14 P2-5, R15 P2-4, R16 P2-4, R17 P2-2):
+                    # Check floor disjointness BEFORE any early return! If `thresh` is missing or overlaps
+                    # `arena_floor_lab`, a Tier-3 find_blobs-only adapter cannot prove candidate pixels are
+                    # non-floor foreground rather than floor pixels inside a ring -> fail closed.
+                    if thresh is None or _lab_ranges_overlap(thresh, cfg.arena_floor_lab):
+                        return None
                     if not other_fgs:
                         return candidate
-                    # Connected-component subgraph membership proof (R14 P2-5, R15 P2-4, R16 P2-4):
-                    # Each candidate from _extract_roi_blobs_for_label (merge=False) is a single connected
-                    # component of `thresh`. When `thresh` is disjoint from `arena_floor_lab`, every pixel
-                    # of `candidate` is non-floor, so `candidate` MUST lie wholly inside ONE connected
-                    # component of `box_fg_comps` (`fg` or one of `other_fgs`) — never split across them!
-                    # A component C can contain `candidate` ONLY if AABB(C) encloses AABB(candidate) AND
-                    # C.pixels >= candidate.pixels.
-                    if thresh is not None and not _lab_ranges_overlap(thresh, cfg.arena_floor_lab):
-                        fits_self = (
-                            candidate.x >= fx
-                            and candidate.y >= fy
-                            and candidate.x2 <= fx + fg_w
-                            and candidate.y2 <= fy + fg_h
-                            and candidate.pixels <= px
-                        )
-                        if not fits_self:
-                            return None
-                        enclosing_others = [
-                            (ox, oy, ow, oh, opx)
-                            for ox, oy, ow, oh, opx in other_fgs
-                            if ox <= candidate.x
-                            and oy <= candidate.y
-                            and ox + ow >= candidate.x2
-                            and oy + oh >= candidate.y2
-                            and opx >= candidate.pixels
-                        ]
-                        if not enclosing_others:
-                            # `fg` is the UNIQUE connected foreground component that can contain `candidate`!
-                            return candidate
-                        # Ambiguous: another disconnected foreground component also encloses `candidate`'s AABB
-                        # and pixel count; fail closed so a disconnected known block can never mask `fg`.
-                        return None
-
-                    # Fallback when `thresh` is unavailable or overlaps `arena_floor_lab`:
-                    # require strict AABB disjointness from all disconnected `other_fgs` (fail closed).
-                    if any(
-                        _rects_intersect(candidate.x, candidate.y, candidate.w, candidate.h, ox, oy, ow, oh)
-                        for ox, oy, ow, oh, _ in other_fgs
-                    ):
-                        return None
-                    return candidate
+                    # Every pixel of single connected component `candidate` is non-floor, so `candidate`
+                    # must lie wholly inside ONE connected component of `box_fg_comps` (`fg` or one of
+                    # `other_fgs`). A component C can contain `candidate` only if AABB(C) encloses
+                    # AABB(candidate) AND C.pixels >= candidate.pixels.
+                    enclosing_others = [
+                        (ox, oy, ow, oh, opx)
+                        for ox, oy, ow, oh, opx in other_fgs
+                        if ox <= candidate.x
+                        and oy <= candidate.y
+                        and ox + ow >= candidate.x2
+                        and oy + oh >= candidate.y2
+                        and opx >= candidate.pixels
+                    ]
+                    if not enclosing_others:
+                        # `fg` is the UNIQUE connected foreground component that can contain `candidate`!
+                        return candidate
+                    # Ambiguous: another disconnected foreground component also encloses `candidate`'s AABB
+                    # and pixel count; fail closed so a disconnected known block can never mask `fg`.
+                    return None
 
                 roi_surfaces: List[Blob] = []
                 for surface_label in _SURFACE_LABELS:
@@ -2604,16 +2614,41 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
 
                 roi_accounted: List[Blob] = []
                 fx2, fy2 = fx + fg_w, fy + fg_h
-                for cl_pts, (ax1, ay1, ax2, ay2) in accounted_clusters:
+                for cl_pts, (ax1, ay1, ax2, ay2), cl_floor_disjoint in accounted_clusters:
                     if membership_uncertain or not _rects_intersect(fx, fy, fg_w, fg_h, ax1, ay1, ax2 - ax1, ay2 - ay1):
                         continue
-                    in_fg = [
+                    cand_in_fg = [
                         (x, y)
                         for x, y in cl_pts
                         if fx <= x < fx2
                         and fy <= y < fy2
                         and not any(ox <= x < ox + ow and oy <= y < oy + oh for ox, oy, ow, oh, _ in other_fgs)
                     ]
+                    if not cand_in_fg:
+                        continue
+                    if cl_floor_disjoint:
+                        in_fg = cand_in_fg
+                    else:
+                        in_fg = [
+                            (x, y)
+                            for x, y in cand_in_fg
+                            if any(sx1 <= x < sx2 and sy1 <= y < sy2 for sx1, sy1, sx2, sy2 in solid_self_comps)
+                        ]
+                        rem_pts = [
+                            (x, y)
+                            for x, y in cand_in_fg
+                            if not any(sx1 <= x < sx2 and sy1 <= y < sy2 for sx1, sy1, sx2, sy2 in solid_self_comps)
+                        ]
+                        if rem_pts:
+                            rx1 = min(p[0] for p in rem_pts)
+                            ry1 = min(p[1] for p in rem_pts)
+                            rx2 = max(p[0] for p in rem_pts) + 1
+                            ry2 = max(p[1] for p in rem_pts) + 1
+                            fl_grid = [[False] * (rx2 - rx1) for _ in range(ry2 - ry1)]
+                            _rle_fill_mask(
+                                img, [tuple(cfg.arena_floor_lab)], (rx1, ry1, rx2, ry2), fl_grid, rx1, ry1, True
+                            )
+                            in_fg.extend((x, y) for x, y in rem_pts if not fl_grid[y - ry1][x - rx1])
                     if in_fg:
                         px1 = min(p[0] for p in in_fg)
                         py1 = min(p[1] for p in in_fg)
@@ -2629,18 +2664,15 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                     ix1, iy1, ix2, iy2 = inter
                     iw, ih = max(1, ix2 - ix1), max(1, iy2 - iy1)
                     rb_thresh = cfg.lab_thresholds.get(rb.label)
-                    if rb.pixels >= rb.w * rb.h and not other_fgs:
-                        if not membership_uncertain:
-                            roi_accounted.append(Blob("_accounted", ix1, iy1, iw, ih, iw * ih, 1.0))
+                    if rb.pixels >= rb.w * rb.h:
+                        proven = _proven_sub_on_fg(Blob("_accounted", ix1, iy1, iw, ih, iw * ih, 1.0), rb_thresh)
+                        if proven is not None:
+                            roi_accounted.append(proven)
                     elif rb_thresh is not None:
                         for sub in _extract_roi_blobs_for_label(img, "_accounted", rb_thresh, (ix1, iy1, iw, ih)):
                             proven = _proven_sub_on_fg(sub, rb_thresh)
                             if proven is not None:
                                 roi_accounted.append(proven)
-                    elif rb.pixels >= rb.w * rb.h:
-                        proven = _proven_sub_on_fg(Blob("_accounted", ix1, iy1, iw, ih, iw * ih, 1.0), None)
-                        if proven is not None:
-                            roi_accounted.append(proven)
 
                 explained_px, union_area = _unique_explained_pixels(
                     fg, roi_objects + roi_surfaces + roi_accounted, cfg=cfg

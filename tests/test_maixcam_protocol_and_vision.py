@@ -2088,8 +2088,30 @@ class MaixcamVisionAndUITest(unittest.TestCase):
         )
         self.assertTrue(any(b.label == "unknown" for b in fallback_wart))
 
-        # 3. R15 P1-2 & R16 P1-2: MaixCAM echoes pre_match_settle_gen ONLY when FAR settled and gate is open & settled,
-        #    AND run_maixcam() fences camera buffer via clear_buff() on a new settle gen (failing closed without clear_buff)!
+        # 2d. R17 P2-2: floor-overlapping calibration inside an unknown ring MUST NOT be credited as foreground in Tier 3!
+        cfg_floor_overlap = RescueVisionConfig()
+        cfg_floor_overlap.lab_thresholds["purple_ramp"] = [20, 75, 12, 60, -70, -12]
+        cfg_floor_overlap.validate()
+        img_ring = _FakeMaixImage(320, 240, (85, 0, 0))
+        img_ring.fill_rect(100, 140, 42, 42, (55, 5, 30))      # 164-px unknown ring border
+        img_ring.fill_rect(101, 141, 40, 40, (75, 14, -14))    # 1,600-px floor-matching patch overlapping purple_ramp
+        for src in (img_ring, SimpleNamespace(find_blobs=img_ring.find_blobs)):
+            ring_blobs = extract_blobs_from_maix_image(src, cfg_floor_overlap, scan_unknown_near=True)
+            ring_state = RescueVisionProcessor(cfg_floor_overlap).process(
+                ring_blobs,
+                camera_near_cmd=True,
+                camera_settled=True,
+                team=TEAM_RED,
+                first_green_unlocked=False,
+                carrying_casualty=False,
+                max_materials_per_trip=1,
+            )
+            self.assertEqual(ring_state.corral_unknown_cnt, 1)
+            self.assertFalse(bool(ring_state.flags & VIS_FLAG_CORRAL_SAFE))
+            self.assertTrue(any(b.label == "unknown" and b.pixels == 164 for b in ring_blobs))
+
+        # 3. R15 P1-2, R16 P1-2 & R17 P1-1: MaixCAM echoes pre_match_settle_gen ONLY when FAR settled and gate is open & settled,
+        #    AND run_maixcam() drains queued + in-flight frames (buff_num + 1 reads) without relying on no-op clear_buff()!
         proc = RescueVisionProcessor(cfg)
         st_closed = proc.process(
             [], camera_near_cmd=False, camera_settled=True, team=TEAM_RED,
@@ -2107,10 +2129,16 @@ class MaixcamVisionAndUITest(unittest.TestCase):
         )
         self.assertEqual((st_open_settled.flags & VIS_FLAG_PRE_MATCH_GEN_MASK) >> VIS_FLAG_PRE_MATCH_GEN_SHIFT, 2)
 
-        # End-to-end run_maixcam() camera queue fence check (both WITH and WITHOUT clear_buff):
+        # End-to-end run_maixcam() drain check:
+        #   - callable no-op clear_buff() (matching MaixCAM MMF maix_camera_mmf.cpp) with default buff_num=3 -> drains 4 reads
+        #   - larger backend buff_num=5 with no-op clear_buff() -> drains 6 reads
+        #   - no clear_buff() attribute at all -> drains 4 reads
+        #   - multi-frame UART burst toggling settled True -> False -> True in one serial.read() -> re-arms full drain
         from unittest.mock import patch
         from maixcam import main as maix_main
         from maixcam.protocol import (
+            CAMERA_VIEW_FAR,
+            CAMERA_VIEW_TRANSITION,
             TEL_FLAG_CAMERA_SETTLED,
             TEL_FLAG_GATE_SETTLED,
             TEL_FLAG_PRE_MATCH_GEN_SHIFT,
@@ -2126,39 +2154,60 @@ class MaixcamVisionAndUITest(unittest.TestCase):
                 | (1 << TEL_FLAG_PRE_MATCH_GEN_SHIFT),
             ),
         )
-        for has_clear in (True, False):
-            events: list[str] = []
-            stale = SimpleNamespace(resize=lambda *_: None)
-            fresh = SimpleNamespace(resize=lambda *_: None)
-            q = [stale]
+        payload_unsettled = encode_telemetry(2, Telemetry(status_flags=0))
+        payload_gen1_again = encode_telemetry(
+            3,
+            Telemetry(
+                status_flags=TEL_FLAG_CAMERA_SETTLED
+                | TEL_FLAG_GATE_SETTLED
+                | (1 << TEL_FLAG_PRE_MATCH_GEN_SHIFT),
+            ),
+        )
+
+        for mode, extra_buff_num, expected_drain in (
+            ("noop_clear_default", None, 4),
+            ("noop_clear_buff5", 5, 6),
+            ("no_clear_attr", None, 4),
+        ):
+            stale_frames = [SimpleNamespace(resize=lambda *_: None, tag=f"stale_{i}") for i in range(expected_drain)]
+            fresh = SimpleNamespace(resize=lambda *_: None, tag="fresh")
+            queue = list(stale_frames)
             written: list[bytes] = []
 
-            def _read_frame(queue=q, ev=events, st=stale, fr=fresh):
-                f = queue.pop(0) if queue else fr
-                ev.append("stale" if f is st else "fresh")
-                return f
+            def _read_frame(q=queue, fr=fresh):
+                return q.pop(0) if q else fr
 
-            cam_obj = (
-                SimpleNamespace(read=_read_frame, clear_buff=q.clear)
-                if has_clear
-                else SimpleNamespace(read=_read_frame)
-            )
+            cam_kwargs = {"read": _read_frame}
+            if mode != "no_clear_attr":
+                cam_kwargs["clear_buff"] = lambda: None  # real MaixCAM MMF logs warning and returns without flushing
+            if extra_buff_num is not None:
+                cam_kwargs["buff_num"] = extra_buff_num
+            cam_obj = SimpleNamespace(**cam_kwargs)
+
+            n_iters = expected_drain + 1
+            exit_seq = iter([False] * n_iters + [True]).__next__
+            mono_seq = iter([0.0] + [1.0 + 0.06 * i for i in range(n_iters)]).__next__
             fake_maix = SimpleNamespace(
-                app=SimpleNamespace(need_exit=iter((False, True)).__next__),
-                camera=SimpleNamespace(Camera=lambda *_: cam_obj),
+                app=SimpleNamespace(need_exit=exit_seq),
+                camera=SimpleNamespace(Camera=lambda *_a, **_k: cam_obj),
                 display=SimpleNamespace(Display=lambda: SimpleNamespace(width=lambda: 552, height=lambda: 368, show=lambda _: None)),
                 pinmap=SimpleNamespace(set_pin_function=lambda *_: None),
                 touchscreen=SimpleNamespace(TouchScreen=lambda: SimpleNamespace(read=lambda: (0, 0, False))),
                 uart=SimpleNamespace(UART=lambda *_: SimpleNamespace(read=lambda: payload_gen1, write=written.append)),
             )
+
+            def _fake_blobs(frame, *_a, **_k):
+                return [Blob("green", 145, 150, 30, 25, 750, 1.0)] if getattr(frame, "tag", "") != "fresh" else []
+
             with (
                 patch.dict(sys.modules, {"maix": fake_maix}),
-                patch.object(maix_main, "time", SimpleNamespace(monotonic=iter((0.0, 1.0)).__next__)),
-                patch.object(maix_main, "extract_blobs_from_maix_image", return_value=[]),
+                patch.object(maix_main, "time", SimpleNamespace(monotonic=mono_seq)),
+                patch.object(maix_main, "extract_blobs_from_maix_image", side_effect=_fake_blobs),
                 patch.object(maix_main, "_extract_motion_grid", return_value=[0] * (16 * 12)),
                 patch.object(maix_main, "render_touch_overlay"),
             ):
                 maix_main.run_maixcam()
+
             p_check = RescueProtocolParser()
             states = [
                 vs
@@ -2166,14 +2215,56 @@ class MaixcamVisionAndUITest(unittest.TestCase):
                 for fr in p_check.feed(raw_tx)
                 if (vs := decode_vision_state(fr)) is not None
             ]
-            self.assertEqual(len(states), 1)
-            echo_gen = (states[0].flags & VIS_FLAG_PRE_MATCH_GEN_MASK) >> VIS_FLAG_PRE_MATCH_GEN_SHIFT
-            if has_clear:
-                self.assertEqual(events, ["fresh"])
-                self.assertEqual(echo_gen, 1)
-            else:
-                self.assertEqual(events, ["stale"])
-                self.assertEqual(echo_gen, 0)
+            self.assertEqual(len(states), n_iters, msg=mode)
+            for idx in range(expected_drain):
+                echo_gen = (states[idx].flags & VIS_FLAG_PRE_MATCH_GEN_MASK) >> VIS_FLAG_PRE_MATCH_GEN_SHIFT
+                self.assertEqual(echo_gen, 0, msg=f"{mode} drain iter {idx}")
+                self.assertEqual(states[idx].camera_view, CAMERA_VIEW_TRANSITION, msg=f"{mode} drain iter {idx}")
+                self.assertEqual(states[idx].target_type, 0, msg=f"{mode} drain iter {idx}")
+            final_gen = (states[-1].flags & VIS_FLAG_PRE_MATCH_GEN_MASK) >> VIS_FLAG_PRE_MATCH_GEN_SHIFT
+            self.assertEqual(final_gen, 1, msg=mode)
+            self.assertEqual(states[-1].camera_view, CAMERA_VIEW_FAR, msg=mode)
+            self.assertEqual(states[-1].target_type, 0, msg=mode)
+
+        # Multi-frame burst re-arm: once drained (iter 4), a single serial.read() containing
+        # [unsettled, settled(gen=1)] MUST re-arm a full 4-frame drain before echoing gen=1 again!
+        burst_frames = (
+            [SimpleNamespace(resize=lambda *_: None, tag=f"pre0_{i}") for i in range(4)]
+            + [SimpleNamespace(resize=lambda *_: None, tag="fresh0")]
+            + [SimpleNamespace(resize=lambda *_: None, tag=f"pre1_{i}") for i in range(4)]
+            + [SimpleNamespace(resize=lambda *_: None, tag="fresh1")]
+        )
+        burst_rx = iter(
+            [payload_gen1, b"", b"", b"", b"", payload_unsettled + payload_gen1_again, b"", b"", b"", b""]
+        ).__next__
+        burst_written: list[bytes] = []
+        burst_cam = SimpleNamespace(read=iter(burst_frames).__next__, clear_buff=lambda: None)
+        burst_maix = SimpleNamespace(
+            app=SimpleNamespace(need_exit=iter([False] * 10 + [True]).__next__),
+            camera=SimpleNamespace(Camera=lambda *_a, **_k: burst_cam),
+            display=SimpleNamespace(Display=lambda: SimpleNamespace(width=lambda: 552, height=lambda: 368, show=lambda _: None)),
+            pinmap=SimpleNamespace(set_pin_function=lambda *_: None),
+            touchscreen=SimpleNamespace(TouchScreen=lambda: SimpleNamespace(read=lambda: (0, 0, False))),
+            uart=SimpleNamespace(UART=lambda *_: SimpleNamespace(read=burst_rx, write=burst_written.append)),
+        )
+        with (
+            patch.dict(sys.modules, {"maix": burst_maix}),
+            patch.object(maix_main, "time", SimpleNamespace(monotonic=iter([0.0] + [1.0 + 0.06 * i for i in range(10)]).__next__)),
+            patch.object(maix_main, "extract_blobs_from_maix_image", return_value=[]),
+            patch.object(maix_main, "_extract_motion_grid", return_value=[0] * (16 * 12)),
+            patch.object(maix_main, "render_touch_overlay"),
+        ):
+            maix_main.run_maixcam()
+        p_burst = RescueProtocolParser()
+        burst_states = [
+            vs
+            for raw_tx in burst_written
+            for fr in p_burst.feed(raw_tx)
+            if (vs := decode_vision_state(fr)) is not None
+        ]
+        self.assertEqual(len(burst_states), 10)
+        burst_gens = [(s.flags & VIS_FLAG_PRE_MATCH_GEN_MASK) >> VIS_FLAG_PRE_MATCH_GEN_SHIFT for s in burst_states]
+        self.assertEqual(burst_gens, [0, 0, 0, 0, 1, 0, 0, 0, 0, 1])
 
 
 if __name__ == "__main__":
