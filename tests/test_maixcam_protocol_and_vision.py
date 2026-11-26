@@ -2516,6 +2516,52 @@ class MaixcamVisionAndUITest(unittest.TestCase):
             self.assertEqual(pair_st.corral_unknown_cnt, 0, msg=tier_name)
             self.assertTrue(bool(pair_st.flags & VIS_FLAG_CORRAL_SAFE), msg=tier_name)
 
+    def test_round21_concave_parent_cannot_explain_disconnected_same_label_patch(self) -> None:
+        from types import SimpleNamespace
+
+        floor = (85, 0, 0)
+        green = (55, -35, 30)
+
+        def binary_source(img):
+            binary = _FakeMaixBinaryImage(img.width, img.height, floor)
+            binary._lab_rows = [row[:] for row in img._grid]
+            return binary
+
+        for overlap in (False, True):
+            for parent_rejected, hollow in ((False, floor), (False, (12, 0, 0)), (True, floor)):
+                cfg = RescueVisionConfig()
+                if overlap:
+                    cfg.lab_thresholds["green"] = [30, 82, -60, 14, 12, 55]
+                if parent_rejected:
+                    cfg.max_block_pixels = 200
+                img = _FakeMaixImage(320, 240, floor)
+                img.fill_rect(120, 140, 26, 26, hollow)
+                img.fill_rect(120, 140, 26, 4, green)
+                img.fill_rect(120, 144, 4, 18, green)
+                img.fill_rect(120, 162, 26, 4, green)
+
+                for patch_present in (False, True):
+                    if patch_present:
+                        # Below the legal block minimum, but large enough to be an unknown hazard.
+                        img.fill_rect(130, 149, 8, 8, green)
+                    for tier, source in (
+                        (1, img),
+                        (2, binary_source(img)),
+                        (3, SimpleNamespace(find_blobs=img.find_blobs)),
+                    ):
+                        with self.subTest(tier=tier, overlap=overlap, rejected=parent_rejected,
+                                          hollow=hollow, patch=patch_present):
+                            blobs = extract_blobs_from_maix_image(source, cfg, scan_unknown_near=True)
+                            state = RescueVisionProcessor(cfg).process(
+                                blobs, camera_near_cmd=True, camera_settled=True, team=TEAM_RED,
+                                first_green_unlocked=True, max_materials_per_trip=2,
+                            )
+                            self.assertEqual(state.corral_green_cnt, int(not parent_rejected))
+                            self.assertEqual(state.corral_unknown_cnt, int(parent_rejected) + int(patch_present))
+                            self.assertEqual(bool(state.flags & VIS_FLAG_CORRAL_SAFE),
+                                             not (parent_rejected or patch_present))
+                            self.assertTrue(state.flags & VIS_FLAG_SWEEP_CLEAR)
+
 
 if __name__ == "__main__":
     unittest.main()

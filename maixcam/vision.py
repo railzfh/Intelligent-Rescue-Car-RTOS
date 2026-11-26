@@ -1003,17 +1003,6 @@ def _find_blobs_unit_stride(img, thresholds, **kwargs):
         return img.find_blobs(thresholds, **kwargs)
 
 
-def _extract_roi_blobs_for_label(img, label: str, thresh: Sequence[int], roi: Tuple[int, int, int, int]) -> List[Blob]:
-    found = _find_blobs_unit_stride(img, [tuple(thresh)], roi=roi, pixels_threshold=1, area_threshold=1, merge=False)
-    out: List[Blob] = []
-    for item in found:
-        w = max(1, int(item.w()))
-        h = max(1, int(item.h()))
-        px = int(item.pixels())
-        out.append(Blob(label=label, x=int(item.x()), y=int(item.y()), w=w, h=h, pixels=px, density=px / float(w * h)))
-    return out
-
-
 def _filter_opponent_excluding_floor(
     img,
     item,
@@ -2729,6 +2718,7 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
         # Always subtract verified/accounted component occupancy BEFORE deduplicating residuals so
         # an unexplained foreground patch sharing an AABB with a concave conflict is never skipped.
         emitted_tier3_residuals: set[Tuple[int, int, int, int]] = set()
+        verified_parents = verified_full_surfaces + verified_full_objects
         for roi, merge_fg in scan_rois:
             fg_blobs = _find_blobs_unit_stride(
                 img,
@@ -2830,22 +2820,51 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
 
                 fx2, fy2 = fx + fg_w, fy + fg_h
 
-                def _proven_cached_parent_on_fg(parent: Blob, emit_label: str) -> List[Blob]:
-                    pre_pts = precomputed_pts_by_key.get(
-                        (parent.label, parent.x, parent.y, parent.w, parent.h, parent.pixels)
-                    )
-                    if not pre_pts:
+                def _clip_parent_on_fg(parent: Blob, emit_label: str) -> List[Blob]:
+                    inter = _rect_intersection(fx, fy, fg_w, fg_h, parent.x, parent.y, parent.w, parent.h)
+                    if inter is None:
                         return []
-                    clipped = [(x, y) for x, y in pre_pts if fx <= x < fx2 and fy <= y < fy2]
-                    if not clipped:
-                        return []
-                    if len(clipped) == len(pre_pts):
-                        # Whole pre-verified non-floor connected component lies inside fg_roi.
-                        cand = Blob(emit_label, parent.x, parent.y, parent.w, parent.h, parent.pixels, parent.density)
-                        proven = _proven_sub_on_fg(cand, None, proven_non_floor=True)
+                    geom = (parent.x, parent.y, parent.w, parent.h, parent.pixels)
+                    key = (parent.label, *geom)
+                    thresh = cfg.lab_thresholds[parent.label]
+                    non_floor = key in proven_non_floor_keys
+                    ix1, iy1, ix2, iy2 = inter
+                    if parent.pixels == parent.w * parent.h:
+                        w, h = ix2 - ix1, iy2 - iy1
+                        cand = Blob(emit_label, ix1, iy1, w, h, w * h, 1.0)
+                    elif inter == (parent.x, parent.y, parent.x2, parent.y2):
+                        cand = Blob(emit_label, *geom, parent.density)
+                    else:
+                        cand = None
+                    if cand is not None:
+                        proven = _proven_sub_on_fg(cand, thresh, proven_non_floor=non_floor)
                         return [proven] if proven is not None else []
-                    # Split clipped proven non-floor pixels into connected sub-components before subgraph check.
-                    remaining_set = set(clipped)
+
+                    pre_pts = precomputed_pts_by_key.get(key)
+                    if pre_pts is not None:
+                        remaining_set = {(x, y) for x, y in pre_pts if ix1 <= x < ix2 and iy1 <= y < iy2}
+                    else:
+                        # Reconstruct the full parent before clipping. A scan of the intersection
+                        # alone cannot distinguish clipped parent pixels from enclosed siblings.
+                        box = (parent.x, parent.y, parent.x2, parent.y2)
+                        expected_geoms = {
+                            (b.x, b.y, b.w, b.h, b.pixels)
+                            for b in all_raw_by_label[parent.label]
+                            if parent.x <= b.x and parent.y <= b.y and b.x2 <= parent.x2 and b.y2 <= parent.y2
+                        }
+                        grid, geoms, _ = _resolve_exact_label_components(parent.label, thresh, box, expected_geoms)
+                        parent_ids = [cid for cid, g in enumerate(geoms) if g == geom]
+                        if len(parent_ids) != 1:
+                            # No unique parent proof: leave these pixels unexplained.
+                            return []
+                        parent_id = parent_ids[0]
+                        remaining_set = {
+                            (x, y) for y in range(iy1, iy2) for x in range(ix1, ix2)
+                            if grid[y - parent.y][x - parent.x] == parent_id
+                        }
+
+                    # Clipping can disconnect parts of the parent. Check foreground membership
+                    # for each connected fragment separately.
                     out_subs: List[Blob] = []
                     while remaining_set:
                         seed = remaining_set.pop()
@@ -2870,81 +2889,15 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                                     st.append(nb_pt)
                         sw, sh = mx_x - mn_x + 1, mx_y - mn_y + 1
                         cand = Blob(emit_label, mn_x, mn_y, sw, sh, cnt, cnt / float(sw * sh))
-                        proven = _proven_sub_on_fg(cand, None, proven_non_floor=True)
+                        proven = _proven_sub_on_fg(cand, thresh, proven_non_floor=non_floor)
                         if proven is not None:
                             out_subs.append(proven)
                     return out_subs
 
-                roi_surfaces: List[Blob] = []
-                for surface_label in _SURFACE_LABELS:
-                    thresh = cfg.lab_thresholds.get(surface_label)
-                    if thresh is None:
-                        continue
-                    parent_surfaces = verified_by_label[surface_label]
-                    if not parent_surfaces:
-                        continue
-                    uncached_surfaces: List[Blob] = []
-                    for p in parent_surfaces:
-                        p_key = (surface_label, p.x, p.y, p.w, p.h, p.pixels)
-                        if p_key in precomputed_pts_by_key:
-                            if _rects_intersect(fx, fy, fg_w, fg_h, p.x, p.y, p.w, p.h):
-                                roi_surfaces.extend(_proven_cached_parent_on_fg(p, surface_label))
-                        elif p_key in proven_non_floor_keys:
-                            inter_p = _rect_intersection(fx, fy, fg_w, fg_h, p.x, p.y, p.w, p.h)
-                            if inter_p is not None:
-                                ix1, iy1, ix2, iy2 = inter_p
-                                for sub in _extract_roi_blobs_for_label(
-                                    img, surface_label, thresh, (ix1, iy1, max(1, ix2 - ix1), max(1, iy2 - iy1))
-                                ):
-                                    proven = _proven_sub_on_fg(sub, thresh, proven_non_floor=True)
-                                    if proven is not None:
-                                        roi_surfaces.append(proven)
-                        else:
-                            uncached_surfaces.append(p)
-                    if uncached_surfaces:
-                        for sub in _extract_roi_blobs_for_label(img, surface_label, thresh, fg_roi):
-                            if any(
-                                _rects_intersect(sub.x, sub.y, sub.w, sub.h, p.x, p.y, p.w, p.h)
-                                for p in uncached_surfaces
-                            ):
-                                proven = _proven_sub_on_fg(sub, thresh)
-                                if proven is not None:
-                                    roi_surfaces.append(proven)
-
-                roi_objects: List[Blob] = []
-                for obj_label in _OBJECT_LABELS:
-                    thresh = cfg.lab_thresholds.get(obj_label)
-                    if thresh is None:
-                        continue
-                    parent_objs = verified_by_label[obj_label]
-                    if not parent_objs:
-                        continue
-                    uncached_objs: List[Blob] = []
-                    for p in parent_objs:
-                        p_key = (obj_label, p.x, p.y, p.w, p.h, p.pixels)
-                        if p_key in precomputed_pts_by_key:
-                            if _rects_intersect(fx, fy, fg_w, fg_h, p.x, p.y, p.w, p.h):
-                                roi_objects.extend(_proven_cached_parent_on_fg(p, obj_label))
-                        elif p_key in proven_non_floor_keys:
-                            inter_p = _rect_intersection(fx, fy, fg_w, fg_h, p.x, p.y, p.w, p.h)
-                            if inter_p is not None:
-                                ix1, iy1, ix2, iy2 = inter_p
-                                for sub in _extract_roi_blobs_for_label(
-                                    img, obj_label, thresh, (ix1, iy1, max(1, ix2 - ix1), max(1, iy2 - iy1))
-                                ):
-                                    proven = _proven_sub_on_fg(sub, thresh, proven_non_floor=True)
-                                    if proven is not None:
-                                        roi_objects.append(proven)
-                        else:
-                            uncached_objs.append(p)
-                    if uncached_objs:
-                        for sub in _extract_roi_blobs_for_label(img, obj_label, thresh, fg_roi):
-                            if any(
-                                _rects_intersect(sub.x, sub.y, sub.w, sub.h, p.x, p.y, p.w, p.h) for p in uncached_objs
-                            ):
-                                proven = _proven_sub_on_fg(sub, thresh)
-                                if proven is not None:
-                                    roi_objects.append(proven)
+                roi_verified = [
+                    sub for parent in verified_parents
+                    for sub in _clip_parent_on_fg(parent, parent.label)
+                ]
 
                 roi_accounted: List[Blob] = []
                 for cl_pts, (ax1, ay1, ax2, ay2), cl_floor_disjoint in accounted_clusters:
@@ -2991,32 +2944,9 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                         pcnt = len(in_fg)
                         roi_accounted.append(Blob("_accounted", px1, py1, pw, ph, pcnt, pcnt / float(pw * ph)))
                 for rb in accounted_rejected_blobs:
-                    inter = _rect_intersection(fx, fy, fg_w, fg_h, rb.x, rb.y, rb.w, rb.h)
-                    if inter is None:
-                        continue
-                    rb_key = (rb.label, rb.x, rb.y, rb.w, rb.h, rb.pixels)
-                    if rb_key in precomputed_pts_by_key:
-                        roi_accounted.extend(_proven_cached_parent_on_fg(rb, "_accounted"))
-                        continue
-                    ix1, iy1, ix2, iy2 = inter
-                    iw, ih = max(1, ix2 - ix1), max(1, iy2 - iy1)
-                    rb_thresh = cfg.lab_thresholds.get(rb.label)
-                    rb_nf = rb_key in proven_non_floor_keys
-                    if rb.pixels >= rb.w * rb.h:
-                        proven = _proven_sub_on_fg(
-                            Blob("_accounted", ix1, iy1, iw, ih, iw * ih, 1.0), rb_thresh, proven_non_floor=rb_nf
-                        )
-                        if proven is not None:
-                            roi_accounted.append(proven)
-                    elif rb_thresh is not None:
-                        for sub in _extract_roi_blobs_for_label(img, "_accounted", rb_thresh, (ix1, iy1, iw, ih)):
-                            proven = _proven_sub_on_fg(sub, rb_thresh, proven_non_floor=rb_nf)
-                            if proven is not None:
-                                roi_accounted.append(proven)
+                    roi_accounted.extend(_clip_parent_on_fg(rb, "_accounted"))
 
-                explained_px, union_area = _unique_explained_pixels(
-                    fg, roi_objects + roi_surfaces + roi_accounted, cfg=cfg
-                )
+                explained_px, union_area = _unique_explained_pixels(fg, roi_verified + roi_accounted, cfg=cfg)
                 unexplained_px = max(0, fg.pixels - explained_px)
                 pixel_coverage = explained_px / float(max(1, fg.pixels))
                 area_coverage = union_area / float(max(1, fg.w * fg.h))
