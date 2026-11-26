@@ -1438,6 +1438,7 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
     verified_surface_geoms = set()
     emitted_rejected_object_rects = set()
     precomputed_pts_by_key: Dict[Tuple[str, int, int, int, int, int], List[Tuple[int, int]]] = {}
+    proven_non_floor_keys: set[Tuple[str, int, int, int, int, int]] = set()
     # (blob, meets_label_min_area, is_verified_object)
     raw_obj_cands: List[Tuple[Blob, bool, bool]] = []
 
@@ -1518,6 +1519,8 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                     mixed.append(b)
 
         if not mixed:
+            for p in pure_non_floor:
+                proven_non_floor_keys.add((label, p.x, p.y, p.w, p.h, p.pixels))
             return pure_non_floor
 
         # Fold any pure blob overlapping a mixed blob's AABB into mixed so exact (thresh \ floor)
@@ -1616,6 +1619,10 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                         precomputed_pts_by_key[(label, nb.x, nb.y, nb.w, nb.h, nb.pixels)] = pts
                         extracted.append(nb)
 
+        for p in remaining_pure:
+            proven_non_floor_keys.add((label, p.x, p.y, p.w, p.h, p.pixels))
+        for nb in extracted:
+            proven_non_floor_keys.add((label, nb.x, nb.y, nb.w, nb.h, nb.pixels))
         return remaining_pure + extracted
 
     for label in ordered_labels:
@@ -2878,9 +2885,20 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                         continue
                     uncached_surfaces: List[Blob] = []
                     for p in parent_surfaces:
-                        if (surface_label, p.x, p.y, p.w, p.h, p.pixels) in precomputed_pts_by_key:
+                        p_key = (surface_label, p.x, p.y, p.w, p.h, p.pixels)
+                        if p_key in precomputed_pts_by_key:
                             if _rects_intersect(fx, fy, fg_w, fg_h, p.x, p.y, p.w, p.h):
                                 roi_surfaces.extend(_proven_cached_parent_on_fg(p, surface_label))
+                        elif p_key in proven_non_floor_keys:
+                            inter_p = _rect_intersection(fx, fy, fg_w, fg_h, p.x, p.y, p.w, p.h)
+                            if inter_p is not None:
+                                ix1, iy1, ix2, iy2 = inter_p
+                                for sub in _extract_roi_blobs_for_label(
+                                    img, surface_label, thresh, (ix1, iy1, max(1, ix2 - ix1), max(1, iy2 - iy1))
+                                ):
+                                    proven = _proven_sub_on_fg(sub, thresh, proven_non_floor=True)
+                                    if proven is not None:
+                                        roi_surfaces.append(proven)
                         else:
                             uncached_surfaces.append(p)
                     if uncached_surfaces:
@@ -2903,9 +2921,20 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                         continue
                     uncached_objs: List[Blob] = []
                     for p in parent_objs:
-                        if (obj_label, p.x, p.y, p.w, p.h, p.pixels) in precomputed_pts_by_key:
+                        p_key = (obj_label, p.x, p.y, p.w, p.h, p.pixels)
+                        if p_key in precomputed_pts_by_key:
                             if _rects_intersect(fx, fy, fg_w, fg_h, p.x, p.y, p.w, p.h):
                                 roi_objects.extend(_proven_cached_parent_on_fg(p, obj_label))
+                        elif p_key in proven_non_floor_keys:
+                            inter_p = _rect_intersection(fx, fy, fg_w, fg_h, p.x, p.y, p.w, p.h)
+                            if inter_p is not None:
+                                ix1, iy1, ix2, iy2 = inter_p
+                                for sub in _extract_roi_blobs_for_label(
+                                    img, obj_label, thresh, (ix1, iy1, max(1, ix2 - ix1), max(1, iy2 - iy1))
+                                ):
+                                    proven = _proven_sub_on_fg(sub, thresh, proven_non_floor=True)
+                                    if proven is not None:
+                                        roi_objects.append(proven)
                         else:
                             uncached_objs.append(p)
                     if uncached_objs:
@@ -2965,19 +2994,23 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                     inter = _rect_intersection(fx, fy, fg_w, fg_h, rb.x, rb.y, rb.w, rb.h)
                     if inter is None:
                         continue
-                    if (rb.label, rb.x, rb.y, rb.w, rb.h, rb.pixels) in precomputed_pts_by_key:
+                    rb_key = (rb.label, rb.x, rb.y, rb.w, rb.h, rb.pixels)
+                    if rb_key in precomputed_pts_by_key:
                         roi_accounted.extend(_proven_cached_parent_on_fg(rb, "_accounted"))
                         continue
                     ix1, iy1, ix2, iy2 = inter
                     iw, ih = max(1, ix2 - ix1), max(1, iy2 - iy1)
                     rb_thresh = cfg.lab_thresholds.get(rb.label)
+                    rb_nf = rb_key in proven_non_floor_keys
                     if rb.pixels >= rb.w * rb.h:
-                        proven = _proven_sub_on_fg(Blob("_accounted", ix1, iy1, iw, ih, iw * ih, 1.0), rb_thresh)
+                        proven = _proven_sub_on_fg(
+                            Blob("_accounted", ix1, iy1, iw, ih, iw * ih, 1.0), rb_thresh, proven_non_floor=rb_nf
+                        )
                         if proven is not None:
                             roi_accounted.append(proven)
                     elif rb_thresh is not None:
                         for sub in _extract_roi_blobs_for_label(img, "_accounted", rb_thresh, (ix1, iy1, iw, ih)):
-                            proven = _proven_sub_on_fg(sub, rb_thresh)
+                            proven = _proven_sub_on_fg(sub, rb_thresh, proven_non_floor=rb_nf)
                             if proven is not None:
                                 roi_accounted.append(proven)
 

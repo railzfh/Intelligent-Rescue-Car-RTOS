@@ -110,7 +110,9 @@ bool Class_Rescue_Mission::On_Vision_State(const Struct_Vision_State &vis, uint3
         {
             const uint8_t vis_close_gen = static_cast<uint8_t>(
                 (vis.flags & VIS_FLAG_SETTLE_GEN_MASK) >> VIS_FLAG_SETTLE_GEN_SHIFT);
-            if (Gate_Close_Settle_Gen == 0U || vis_close_gen != Gate_Close_Settle_Gen)
+            if (Gate_Close_Settle_Gen == 0U ||
+                vis_close_gen != Gate_Close_Settle_Gen ||
+                (vis.flags & VIS_FLAG_GATE_OPEN_SETTLED_ACK) != 0U)
             {
                 Pending_Near_Non_Valid_Corral_Event = true;
             }
@@ -1316,11 +1318,12 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             }
             if (!Gate_Close_Settled_Latched)
             {
-                // First tick observing gate closed & settled in THIS close cycle: advance the 2-bit non-zero
-                // close generation (1..3) so a reused ACK from an earlier close cycle can NEVER confirm cargo.
+                // First tick observing gate closed & settled in THIS close cycle: advance the shared
+                // 2-bit non-zero gate generation (1..3) so neither an earlier close cycle nor an
+                // open-gate cycle can ever share or reuse this ACK.
                 Gate_Close_Settled_Latched = true;
-                Gate_Close_Last_Gen = static_cast<uint8_t>((Gate_Close_Last_Gen % 3U) + 1U);
-                Gate_Close_Settle_Gen = Gate_Close_Last_Gen;
+                Gate_Settle_Last_Gen = static_cast<uint8_t>((Gate_Settle_Last_Gen % 3U) + 1U);
+                Gate_Close_Settle_Gen = Gate_Settle_Last_Gen;
                 Gate_Settled_Frame_Seq = Latest_Vision.frame_seq;
                 Reset_Confirm_Streak();
                 break;
@@ -1331,10 +1334,11 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             }
             Confirm_Boundary_Accept_Id = Vision_Accept_Counter;
             // Only count confirmation frames (or declare post-close cargo loss) after MaixCAM echoes
-            // THIS close cycle's non-zero generation (proving post-close drain completed).
+            // THIS close cycle's non-zero generation WITHOUT the open-gate ACK bit set.
             const uint8_t vis_close_gen = static_cast<uint8_t>(
                 (Latest_Vision.flags & VIS_FLAG_SETTLE_GEN_MASK) >> VIS_FLAG_SETTLE_GEN_SHIFT);
-            if (Gate_Close_Settle_Gen == 0U || vis_close_gen != Gate_Close_Settle_Gen)
+            const bool open_ack_set = (Latest_Vision.flags & VIS_FLAG_GATE_OPEN_SETTLED_ACK) != 0U;
+            if (Gate_Close_Settle_Gen == 0U || vis_close_gen != Gate_Close_Settle_Gen || open_ack_set)
             {
                 Reset_Confirm_Streak();
                 break;
@@ -1605,8 +1609,8 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                 else if (!Gate_Open_Settled_Latched)
                 {
                     Gate_Open_Settled_Latched = true;
-                    Gate_Open_Last_Gen = static_cast<uint8_t>((Gate_Open_Last_Gen % 3U) + 1U);
-                    Gate_Open_Settle_Gen = Gate_Open_Last_Gen;
+                    Gate_Settle_Last_Gen = static_cast<uint8_t>((Gate_Settle_Last_Gen % 3U) + 1U);
+                    Gate_Open_Settle_Gen = Gate_Settle_Last_Gen;
                     Gate_Settled_Frame_Seq = Latest_Vision.frame_seq;
                 }
                 else

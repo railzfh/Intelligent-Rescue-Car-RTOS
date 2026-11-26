@@ -2501,6 +2501,21 @@ class MaixcamVisionAndUITest(unittest.TestCase):
             self.assertEqual(lw_st.corral_unknown_cnt, 1, msg=tier_name)
             self.assertFalse(bool(lw_st.flags & VIS_FLAG_CORRAL_SAFE), msg=tier_name)
 
+            # 2g. Solid 12x10 green block (pure_non_floor under floor-overlapping calibration) touching a
+            #     solid 12x10 black block (forming a non-solid stepped foreground) MUST NOT be double-counted
+            #     as unknown in Tier 3!
+            img_pair = _FakeMaixImage(320, 240, floor_base)
+            img_pair.fill_rect(120, 150, 12, 10, real_green)    # 120 px solid non-floor green
+            img_pair.fill_rect(132, 155, 12, 10, (12, 0, 0))    # 120 px solid black touching right side -> non-solid fg!
+            pair_blobs = extract_blobs_from_maix_image(make_src(img_pair), cfg_overlap, scan_unknown_near=True)
+            pair_st = RescueVisionProcessor(cfg_overlap).process(
+                pair_blobs, camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=True, max_materials_per_trip=2
+            )
+            self.assertEqual(pair_st.corral_green_cnt, 1, msg=tier_name)
+            self.assertEqual(pair_st.corral_black_cnt, 1, msg=tier_name)
+            self.assertEqual(pair_st.corral_unknown_cnt, 0, msg=tier_name)
+            self.assertTrue(bool(pair_st.flags & VIS_FLAG_CORRAL_SAFE), msg=tier_name)
+
 
 if __name__ == "__main__":
     unittest.main()

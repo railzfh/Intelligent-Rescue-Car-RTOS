@@ -245,12 +245,12 @@ private:
     bool Standstill_Abrupt_Stop = false;
 
     // Post-settle gate check latches & global standstill interlock tracking reverse through braking.
+    // Shared monotonic Gate_Settle_Last_Gen (1..3) guarantees adjacent open/close cycles never collide.
     bool Gate_Close_Settled_Latched = false;
     uint8_t Gate_Close_Settle_Gen = 0U;
-    uint8_t Gate_Close_Last_Gen = 0U;
     bool Gate_Open_Settled_Latched = false;
     uint8_t Gate_Open_Settle_Gen = 0U;
-    uint8_t Gate_Open_Last_Gen = 0U;
+    uint8_t Gate_Settle_Last_Gen = 0U;
     uint16_t Gate_Settled_Frame_Seq = 0U;
     bool Reverse_Motion_In_Flight = false;
     bool Require_Standstill_Gate = false;

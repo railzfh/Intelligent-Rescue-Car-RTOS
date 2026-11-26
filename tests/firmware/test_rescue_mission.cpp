@@ -1898,10 +1898,12 @@ static void Test_Round12_Push_Same_Drain_Standstill_Bench_Leave_And_Interrupted_
         h.tick(); // latch close cycle 1 -> gen=1
         const uint8_t gen1 = h.m.Get_Gate_Close_Settle_Gen();
         assert(gen1 == 1U);
-        // 4 ordinary NEAR frames (pre-close buffered frames with gen=0) MUST NOT advance to FIND_HOME!
+        // 4 ordinary NEAR frames (pre-close buffered frames with gen=0) AND frames carrying the
+        // open-gate ACK bit alongside gen1 MUST NOT advance to FIND_HOME!
         for (unsigned i = 0; i < 4U; ++i)
         {
-            h.near(1U, safe);
+            const uint16_t bad_flags = (i < 2U) ? safe : (safe | VIS_FLAG_GATE_OPEN_SETTLED_ACK | Settle_Gen_Flag(gen1));
+            h.near(1U, bad_flags);
             const auto out = h.tick();
             assert(out.gate_closed);
             assert(h.m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
