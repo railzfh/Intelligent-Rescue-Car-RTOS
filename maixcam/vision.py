@@ -1426,7 +1426,10 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
             def _actual_unverified_subblobs_in_rect(
                 comp: Blob, rect_x: int, rect_y: int, rect_w: int, rect_h: int
             ) -> List[Blob]:
-                """Clip an unverified component to a rectangle using ACTUAL component pixels (never AABB area!)."""
+                """Clip an unverified component to a rectangle using ACTUAL component pixels, preserving
+                original component identity so disconnected verified same-label components inside comp's
+                bounding box (e.g. a verified purple ramp inside an unverified purple L's AABB) are never
+                misclassified as unknown."""
                 if rect_w <= 0 or rect_h <= 0:
                     return []
                 c_thresh = cfg.lab_thresholds.get(comp.label)
@@ -1440,11 +1443,57 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                     area_threshold=1,
                     merge=False,
                 )
+                if not sub_raw:
+                    return []
+                v_same = [
+                    v
+                    for v in verified_by_label.get(comp.label, [])
+                    if _rects_intersect(rect_x, rect_y, rect_w, rect_h, v.x, v.y, v.w, v.h)
+                ]
+                v_same_geoms = {(v.x, v.y, v.w, v.h, v.pixels) for v in v_same}
                 out_subs: List[Blob] = []
                 for item in sub_raw:
                     sx, sy = int(item.x()), int(item.y())
                     sw, sh = max(1, int(item.w())), max(1, int(item.h()))
                     spx = int(item.pixels())
+                    # Fast path 1: exact match to a verified component of the same label -> exclude!
+                    if (sx, sy, sw, sh, spx) in v_same_geoms:
+                        continue
+                    # Fast path 2: intersects any verified component of the same label -> verify component
+                    # identity in union(sub, intersecting verified components). Because sub is a connected
+                    # subset of EITHER one unverified component OR one verified component, sub belongs to
+                    # an unverified component iff some unverified component in roi_test contains sub's bbox
+                    # with pixels >= spx!
+                    hit_v = [v for v in v_same if _rects_intersect(sx, sy, sw, sh, v.x, v.y, v.w, v.h)]
+                    if hit_v:
+                        ux1 = min(sx, *(v.x for v in hit_v))
+                        uy1 = min(sy, *(v.y for v in hit_v))
+                        ux2 = max(sx + sw, *(v.x2 for v in hit_v))
+                        uy2 = max(sy + sh, *(v.y2 for v in hit_v))
+                        test_raw = _find_blobs_unit_stride(
+                            img,
+                            [tuple(c_thresh)],
+                            roi=(ux1, uy1, ux2 - ux1, uy2 - uy1),
+                            pixels_threshold=1,
+                            area_threshold=1,
+                            merge=False,
+                        )
+                        in_unverified = False
+                        for tc in test_raw:
+                            tx, ty = int(tc.x()), int(tc.y())
+                            tw, th = max(1, int(tc.w())), max(1, int(tc.h()))
+                            tpx = int(tc.pixels())
+                            if (tx, ty, tw, th, tpx) in v_same_geoms:
+                                continue
+                            if _is_verified_blob_for_label(
+                                Blob(comp.label, tx, ty, tw, th, tpx, tpx / float(tw * th)), cfg
+                            ):
+                                continue
+                            if tx <= sx and ty <= sy and (tx + tw) >= (sx + sw) and (ty + th) >= (sy + sh) and tpx >= spx:
+                                in_unverified = True
+                                break
+                        if not in_unverified:
+                            continue
                     out_subs.append(Blob("unknown", sx, sy, sw, sh, spx, min(1.0, spx / float(sw * sh))))
                 return out_subs
 

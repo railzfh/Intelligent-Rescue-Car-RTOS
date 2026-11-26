@@ -1440,6 +1440,38 @@ class MaixcamVisionAndUITest(unittest.TestCase):
         self.assertFalse(st_backout_done.flags & VIS_FLAG_DROP_BASELINE_READY)
         self.assertFalse(st_backout_done.flags & VIS_FLAG_GATE_OPEN_SETTLED_ACK)
 
+        # 4. Finding 3 (R8): Same-label component-identity preservation during Tier-2 clipping!
+        #    An unverified purple L has ZERO pixels inside corral_roi, while a disconnected VERIFIED
+        #    450-px purple_ramp (91, 130, 30, 15) sits inside the L's bounding box AND inside corral_roi.
+        #    ALL tiers MUST keep (91, 130, 30, 15, 450) strictly as purple_ramp (NOT unknown!) and
+        #    report corral_unknown_cnt == 0, VIS_FLAG_CORRAL_SAFE == 1!
+        for cls in (_FakeMaixImage, _FakeMaixBinaryImage, _FakeMaixNativeStrideImage):
+            img_same = make_scene(cls)
+            img_same.fill_rect(75, 119, 50, 2, ramp_lab)   # unverified purple L (164 px, outside corral)
+            img_same.fill_rect(75, 121, 2, 32, ramp_lab)
+            img_same.fill_rect(91, 130, 30, 15, ramp_lab)  # disconnected VERIFIED 450-px purple_ramp inside L's AABB!
+            blobs_same = extract_blobs_from_maix_image(img_same, self.cfg, scan_unknown_near=True)
+            ramp_box = (91, 130, 30, 15, 450)
+            labels_at_box = [b.label for b in blobs_same if (b.x, b.y, b.w, b.h, b.pixels) == ramp_box]
+            self.assertEqual(labels_at_box, ["purple_ramp"], cls.__name__)
+            st_same = RescueVisionProcessor(self.cfg).process(
+                blobs_same, mission_state=MISSION_DROP_OPEN_AND_PUSH, gate_closed=True, **kw
+            )
+            self.assertEqual(st_same.corral_unknown_cnt, 0, cls.__name__)
+            self.assertTrue(st_same.flags & VIS_FLAG_CORRAL_SAFE, cls.__name__)
+
+            # Also test partially clipped verified purple_ramp extending right past the L's bbox (x=91..141)!
+            img_partial_v = make_scene(cls)
+            img_partial_v.fill_rect(75, 119, 50, 2, ramp_lab)
+            img_partial_v.fill_rect(75, 121, 2, 32, ramp_lab)
+            img_partial_v.fill_rect(91, 130, 50, 15, ramp_lab)  # 750-px verified ramp clipped by L's x2=125!
+            blobs_pv = extract_blobs_from_maix_image(img_partial_v, self.cfg, scan_unknown_near=True)
+            st_pv = RescueVisionProcessor(self.cfg).process(
+                blobs_pv, mission_state=MISSION_DROP_OPEN_AND_PUSH, gate_closed=True, **kw
+            )
+            self.assertEqual(st_pv.corral_unknown_cnt, 0, cls.__name__)
+            self.assertTrue(st_pv.flags & VIS_FLAG_CORRAL_SAFE, cls.__name__)
+
     def test_home_half_match_checks_full_corral_width_and_opponent_zone(self) -> None:
         # Home x=100..320 (cx=210, left material half=[100, 192]).
         # Center=160, corral_align_half_w_px=24 => footprint [136, 184] strictly inside [100, 192]!

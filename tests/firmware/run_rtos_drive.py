@@ -74,6 +74,7 @@ struct UART_HandleTypeDef {
     uint32_t rx_epoch = 0U;
     int service_rx_calls = 0;
     bool inject_fault_after_epoch_read = false;
+    unsigned inject_fault_at_epoch_read = 0U;
 };
 UART_HandleTypeDef huart1;
 bool UART_Service_Rx_Recovery(UART_HandleTypeDef *h) {
@@ -84,14 +85,15 @@ bool UART_Is_Rx_Healthy(UART_HandleTypeDef *h) { return h->rx_healthy && !h->rx_
 bool UART_Is_Rx_Fault_Latched(UART_HandleTypeDef *h) { return h->rx_fault_latched; }
 uint32_t UART_Get_Rx_Epoch(UART_HandleTypeDef *h) {
     const uint32_t sampled = h->rx_epoch;
-    if (h->inject_fault_after_epoch_read) {
+    if (h->inject_fault_after_epoch_read ||
+        (h->inject_fault_at_epoch_read != 0U && --h->inject_fault_at_epoch_read == 0U)) {
         h->inject_fault_after_epoch_read = false;
         h->rx_healthy = false;
         ++h->rx_epoch;
     }
     return sampled;
 }
-struct FDCAN_HandleTypeDef { bool pending = false, fail = false; int tx_calls = 0; };
+struct FDCAN_HandleTypeDef { bool pending = false, fail = false, hold_tx = false; int tx_calls = 0; };
 FDCAN_HandleTypeDef hfdcan1, hfdcan2;
 uint8_t CAN1_0x200_Tx_Data[8], CAN2_0x200_Tx_Data[8];
 constexpr int FDCAN_DLC_BYTES_8 = 8, HAL_OK = 0;
@@ -115,7 +117,11 @@ int HAL_GPIO_ReadPin(int, int) { return key ? 0 : 1; }
 uint32_t HAL_FDCAN_GetLatestTxFifoQRequestBuffer(FDCAN_HandleTypeDef *) { return 0; }
 bool HAL_FDCAN_IsTxBufferMessagePending(FDCAN_HandleTypeDef *c, uint32_t) { return c->pending; }
 void HAL_FDCAN_AbortTxRequest(FDCAN_HandleTypeDef *c, uint32_t) { c->pending = false; }
-int CAN_Transmit_Data(FDCAN_HandleTypeDef *c, int, uint8_t *, int) { ++c->tx_calls; return c->fail ? 1 : 0; }
+int CAN_Transmit_Data(FDCAN_HandleTypeDef *c, int, uint8_t *, int) {
+    ++c->tx_calls;
+    if (c->hold_tx) { c->pending = true; }
+    return c->fail ? 1 : 0;
+}
 struct { float volume = 0; void Set_Loudness(float v) { volume = v; } } BSP_Buzzer;
 '''
 checks = r'''
@@ -516,6 +522,154 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    const bool uart_atomic = argc > 1 && std::strcmp(argv[1], "uart_atomic") == 0;
+    if (uart_atomic) {
+        // Finding 1 (R8): Inject UART RX fault at EVERY epoch-read boundary (frame commit AND mission/output commit).
+        // Case 1: Fault at frame commit MUST NOT apply SET_CONFIG!
+        Feed_Config(RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION);
+        huart1.inject_fault_at_epoch_read = 2U; // 1 = pre-drain check, 2 = atomic frame-commit check
+        Step(0U, false);
+        assert(!huart1.rx_healthy);
+        assert(Rescue_Mission.Get_Team() == RESCUE_TEAM_UNSET);
+        assert((Telemetry_Snapshot.status_flags & TEL_FLAG_VISION_FRESH) == 0U);
+        Stopped();
+
+        // Case 2: Fault at atomic mission+actuator commit MUST NOT lock match, start chassis, or publish VISION_FRESH!
+        huart1.rx_healthy = true;
+        Step(5U, false);
+        Feed_Config(RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION);
+        Feed_Vision(1U);
+        for (uint32_t t = 10U; t < 40U; ++t) { Step(t, false); }
+        Step(40U, true);
+        // 1 = pre-drain check (no frames in ring), 2 = atomic mission+actuator commit check!
+        huart1.inject_fault_at_epoch_read = 2U;
+        Step(70U, true);
+        assert(!huart1.rx_healthy);
+        assert(Rescue_Mission.Get_State() == MISSION_PRE_MATCH);
+        assert(!Rescue_Mission.Is_Config_Locked());
+        assert(!Chassis_Drive.Is_Active());
+        assert((Telemetry_Snapshot.status_flags & TEL_FLAG_VISION_FRESH) == 0U);
+        assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_UART_RX) != 0U);
+        Stopped();
+        std::puts("PASS: atomic UART RX validation rejects frame commit, match lock, chassis start, and VISION_FRESH on same-tick fault");
+        return 0;
+    }
+
+    const bool can_tx_complete = argc > 1 && std::strcmp(argv[1], "can_tx_complete") == 0;
+    if (can_tx_complete) {
+        // Finding 2 (R8): Feedback received AFTER zero-torque CAN enqueue but BEFORE zero-torque TX completion
+        // MUST NOT release the reverse standstill gate! Only feedback arriving AFTER BOTH zero-torque frames
+        // complete transmission may release the gate!
+        auto feed_far_c = [&](uint16_t s, uint8_t target, uint16_t flags, uint16_t dist_mm) {
+            uint8_t buf[RESCUE_PROTO_MAX_FRAME];
+            static uint8_t pseq = 40U;
+            Struct_Vision_State vis{};
+            vis.frame_seq = s;
+            vis.camera_view = CAMERA_VIEW_FAR;
+            vis.target_type = target;
+            vis.flags = flags;
+            vis.target_dist_mm = dist_mm;
+            vis.confidence = 95U;
+            const size_t n = Rescue_Encode_Vision_State(pseq++, vis, buf, sizeof(buf));
+            Vision_Uart_RxCallback(buf, static_cast<uint16_t>(n));
+        };
+        auto feed_near_c = [&](uint16_t s, uint8_t g, uint8_t c, uint16_t flags) {
+            uint8_t buf[RESCUE_PROTO_MAX_FRAME];
+            static uint8_t pseq = 120U;
+            Struct_Vision_State vis{};
+            vis.frame_seq = s;
+            vis.camera_view = CAMERA_VIEW_NEAR;
+            vis.flags = flags;
+            vis.corral_green_cnt = g;
+            vis.corral_cyan_cnt = c;
+            vis.confidence = 95U;
+            const size_t n = Rescue_Encode_Vision_State(pseq++, vis, buf, sizeof(buf));
+            Vision_Uart_RxCallback(buf, static_cast<uint16_t>(n));
+        };
+        auto drive_no_can = [&](uint32_t t_now) {
+            now_ms = t_now;
+            Battery.Update(24.0f, t_now);
+            Attitude_Sample_Ms = t_now;
+            Drive_Control();
+        };
+
+        Feed_Config(RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION);
+        uint16_t fseq = 1U;
+        uint32_t tm = 0U;
+        for (; tm < 200U; ++tm) {
+            if ((tm % 30U) == 0U) { feed_far_c(fseq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 190U); }
+            Step(tm, false);
+        }
+        Step(tm += 10U, true);
+        Step(tm += 30U, true);
+        assert(Rescue_Mission.Get_State() == MISSION_LAUNCH_CROSS_BUMPS);
+        for (int k = 0; k < 8000 && Rescue_Mission.Get_State() == MISSION_LAUNCH_CROSS_BUMPS; ++k) {
+            ++tm;
+            if ((tm % 40U) == 0U) { feed_far_c(fseq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 190U); }
+            Step(tm, false);
+            for (int i = 0; i < 2; ++i) {
+                M2006[i].angle += M2006[i].omega * 0.001f;
+                M2006[i].omega += 40.0f * M2006[i].torque * 0.001f;
+            }
+        }
+        M2006[0].omega = M2006[1].omega = 0.0f;
+        for (int k = 0; k < 300 && Rescue_Mission.Get_State() != MISSION_INSPECT_CORRAL; ++k) {
+            ++tm;
+            if ((tm % 30U) == 0U) { feed_far_c(fseq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 190U); }
+            Step(tm, false);
+        }
+        for (int k = 0; k < 600 && !Pitch_Servo.Is_Settled(); ++k) {
+            ++tm;
+            if ((tm % 30U) == 0U) { feed_near_c(fseq++, 1U, 0U, VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR); }
+            Step(tm, false);
+        }
+        feed_near_c(fseq++, 0U, 1U, 0U);
+        Step(++tm, false);
+        assert(Rescue_Mission.Get_State() == MISSION_BACK_OUT_SEPARATE);
+        feed_far_c(fseq++, TARGET_NONE, VIS_FLAG_REAR_CLEAR, 500U);
+        Step(++tm, false);
+        assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_DISTANCE);
+
+        for (int k = 0; k < 20; ++k) { drive_no_can(++tm); }
+        feed_far_c(fseq++, TARGET_NONE, 0U, 500U);
+        Heading_Rad += 0.2f;
+        // Enqueue both zero-torque commands as pending (NOT yet transmitted on the wire!).
+        hfdcan1.hold_tx = hfdcan2.hold_tx = true;
+        drive_no_can(++tm);
+        assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_IDLE);
+        assert(hfdcan1.pending && hfdcan2.pending);
+
+        // In-flight zero-speed feedback finishes on BOTH buses BEFORE either zero-torque TX completes!
+        for (unsigned i = 0; i < 2U; ++i) {
+            ++M2006_Feedback_Seq[i];
+            M2006_Last_Feedback_Ms[i] = tm;
+            M2006[i].omega = 0.0f;
+        }
+        // Now BOTH zero-torque commands complete transmission (no feedback arrives AFTER completion!).
+        hfdcan1.hold_tx = hfdcan2.hold_tx = false;
+        hfdcan1.pending = hfdcan2.pending = false;
+
+        // Tick after TX completion with NO post-TX-completion feedback -> MUST stay IDLE (NOT start turn!).
+        drive_no_can(++tm);
+        assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_IDLE);
+
+        // Only motor 0 delivers a post-TX-completion standstill sample -> STILL MUST stay IDLE!
+        ++M2006_Feedback_Seq[0];
+        M2006_Last_Feedback_Ms[0] = tm + 1U;
+        M2006[0].omega = 0.0f;
+        drive_no_can(++tm);
+        assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_IDLE);
+
+        // Motor 1 also delivers a post-TX-completion standstill sample -> NOW releases cleanly to CHASSIS_MODE_TURN!
+        ++M2006_Feedback_Seq[1];
+        M2006_Last_Feedback_Ms[1] = tm + 1U;
+        M2006[1].omega = 0.0f;
+        drive_no_can(++tm);
+        assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_TURN);
+        std::puts("PASS: reverse standstill gate stays closed until BOTH zero-torque CAN frames complete TX and post-TX standstill arrives from EACH motor");
+        return 0;
+    }
+
     if (reverse_abort) {
         // Coupled Drive_Control + Rescue_Mission + Chassis_Drive probe:
         // Active reverse losing rear clearance MUST cancel immediately to CHASSIS_MODE_IDLE
@@ -840,5 +994,5 @@ cmd = ["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-Wno-unused-variable
 if os.name == "nt":
     cmd.append("-static")
 subprocess.run(cmd, check=True)
-for mode in ([], ["held"], ["comp"], ["can_fault"], ["frozen"], ["cold_boot"], ["servo_fail"], ["reverse_abort"], ["uart_unhealthy"], ["standstill_can"], ["irq_races"]):
+for mode in ([], ["held"], ["comp"], ["can_fault"], ["frozen"], ["cold_boot"], ["servo_fail"], ["reverse_abort"], ["uart_unhealthy"], ["standstill_can"], ["irq_races"], ["uart_atomic"], ["can_tx_complete"]):
     subprocess.run([str(exe), *mode], check=True)

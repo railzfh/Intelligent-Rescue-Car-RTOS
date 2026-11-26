@@ -118,6 +118,11 @@ static volatile uint16_t Vision_Rx_Tail = 0U;
 static volatile uint32_t Vision_Rx_Overflow_Count = 0U;
 static uint32_t Last_Uart_Rx_Epoch = 0U;
 static bool Vision_Rx_Was_Healthy = true;
+static bool Standstill_Zero_Tx_Armed[2] = {};
+static uint32_t Standstill_Zero_Tx_Buffer[2] = {};
+static bool Standstill_Zero_Tx_Done[2] = {};
+static std::array<uint32_t, 2> Standstill_Zero_Tx_Post_Seq = {};
+static std::array<uint32_t, 2> Standstill_Zero_Tx_Post_Ms = {};
 
 static bool Drive_Prev_Odom_Valid = false;
 static std::array<float, 2> Drive_Prev_Angle = {};
@@ -269,20 +274,14 @@ static void Drive_Notify_Buzzer(bool can_start, bool reject_cue, uint32_t now_ms
     }
 }
 
-static void Vision_Flush_Rx_Queue()
+static bool Vision_Sample_Rx_State(bool &healthy, bool &fault_latched, uint32_t &epoch)
 {
-    const uint32_t mask = __get_PRIMASK();
-    __disable_irq();
-    Vision_Rx_Tail = Vision_Rx_Head;
-    __set_PRIMASK(mask);
-    Vision_Parser.Reset();
-}
-
-static bool Vision_Uart_Rx_Still_Valid(uint32_t expected_epoch)
-{
-    return UART_Is_Rx_Healthy(&huart1) &&
-           !UART_Is_Rx_Fault_Latched(&huart1) &&
-           UART_Get_Rx_Epoch(&huart1) == expected_epoch;
+    // Read epoch before health/fault while caller masks IRQs so validation and commit are atomic
+    // against HAL_UART_ErrorCallback.
+    epoch = UART_Get_Rx_Epoch(&huart1);
+    healthy = UART_Is_Rx_Healthy(&huart1);
+    fault_latched = UART_Is_Rx_Fault_Latched(&huart1);
+    return healthy && !fault_latched;
 }
 
 static bool Vision_Drain_Rx(uint32_t now_ms, uint32_t expected_epoch)
@@ -293,61 +292,82 @@ static bool Vision_Drain_Rx(uint32_t now_ms, uint32_t expected_epoch)
     Struct_Rescue_Frame frame;
     while (tail != head)
     {
-        if (!Vision_Uart_Rx_Still_Valid(expected_epoch))
-        {
-            Vision_Flush_Rx_Queue();
-            Rescue_Mission.On_Uart_Rx_Fault();
-            return false;
-        }
         const uint8_t byte = Vision_Rx_Ring[tail];
         tail = static_cast<uint16_t>((tail + 1U) % Vision_Rx_Ring_Size);
         if (!Vision_Parser.Feed_Byte(byte, frame))
         {
             continue;
         }
-        // Revalidate UART RX health & recovery epoch IMMEDIATELY before committing any parsed frame!
-        if (!Vision_Uart_Rx_Still_Valid(expected_epoch))
-        {
-            Vision_Flush_Rx_Queue();
-            Rescue_Mission.On_Uart_Rx_Fault();
-            return false;
-        }
+        Struct_Vision_Heartbeat hb{};
+        Struct_Match_Config_Cmd cfg{};
+        Struct_Vision_State vis{};
+        Struct_Bench_Actuator_Cmd cmd{};
+        bool decoded = false;
         if (frame.msg_type == RESCUE_MSG_HEARTBEAT)
         {
-            Struct_Vision_Heartbeat hb;
-            if (Rescue_Decode_Heartbeat(frame, hb))
-            {
-                Rescue_Mission.On_Heartbeat(hb, now_ms);
-            }
+            decoded = Rescue_Decode_Heartbeat(frame, hb);
         }
         else if (frame.msg_type == RESCUE_MSG_SET_CONFIG)
         {
-            Struct_Match_Config_Cmd cfg;
-            if (Rescue_Decode_Set_Config(frame, cfg))
-            {
-                Rescue_Mission.On_Set_Config(cfg);
-            }
+            decoded = Rescue_Decode_Set_Config(frame, cfg);
         }
         else if (frame.msg_type == RESCUE_MSG_VISION_STATE)
         {
-            Struct_Vision_State vis;
-            if (Rescue_Decode_Vision_State(frame, vis))
-            {
-                Rescue_Mission.On_Vision_State(vis, now_ms);
-            }
+            decoded = Rescue_Decode_Vision_State(frame, vis);
         }
         else if (frame.msg_type == RESCUE_MSG_BENCH_ACTUATOR)
         {
-            Struct_Bench_Actuator_Cmd cmd;
-            if (Rescue_Decode_Bench_Actuator(frame, cmd))
+            decoded = Rescue_Decode_Bench_Actuator(frame, cmd);
+        }
+        if (!decoded)
+        {
+            continue;
+        }
+
+        // Atomic validation + frame commit with UART error ISR masked.
+        bool commit_ok = false;
+        const uint32_t mask = __get_PRIMASK();
+        __disable_irq();
+        bool rx_h = false;
+        bool rx_f = false;
+        uint32_t rx_ep = 0U;
+        if (Vision_Sample_Rx_State(rx_h, rx_f, rx_ep) && rx_ep == expected_epoch)
+        {
+            commit_ok = true;
+            if (frame.msg_type == RESCUE_MSG_HEARTBEAT)
+            {
+                Rescue_Mission.On_Heartbeat(hb, now_ms);
+            }
+            else if (frame.msg_type == RESCUE_MSG_SET_CONFIG)
+            {
+                Rescue_Mission.On_Set_Config(cfg);
+            }
+            else if (frame.msg_type == RESCUE_MSG_VISION_STATE)
+            {
+                Rescue_Mission.On_Vision_State(vis, now_ms);
+            }
+            else if (frame.msg_type == RESCUE_MSG_BENCH_ACTUATOR)
             {
                 Rescue_Mission.On_Bench_Actuator(cmd);
             }
         }
+        else
+        {
+            Last_Uart_Rx_Epoch = UART_Get_Rx_Epoch(&huart1);
+            Vision_Rx_Tail = Vision_Rx_Head;
+            Rescue_Mission.On_Uart_Rx_Fault();
+            Vision_Rx_Was_Healthy = false;
+        }
+        __set_PRIMASK(mask);
+        if (!commit_ok)
+        {
+            Vision_Parser.Reset();
+            return false;
+        }
     }
     __DMB();
     Vision_Rx_Tail = tail;
-    return Vision_Uart_Rx_Still_Valid(expected_epoch);
+    return true;
 }
 
 static Struct_WS2812_Color Compute_Status_LED(bool battery_ready, bool hardware_ready, uint32_t now_ms)
@@ -400,7 +420,10 @@ static void Drive_Control()
     std::array<uint32_t, 2> fb_seq = {};
     std::array<uint32_t, 2> fb_ms = {};
     bool feedback_fresh = true;
-    // CAN 中断可以抢占该任务，确保同一轮转角、速度和时间戳来自同一帧。
+    bool latch_standstill_now = false;
+    std::array<uint32_t, 2> latch_seq = {};
+    std::array<uint32_t, 2> latch_ms = {};
+    // CAN 中断可以抢占该任务，确保同一轮转角、速度、时间戳与待确认零扭矩发完边界来自同一快照。
     const uint32_t primask = __get_PRIMASK();
     __disable_irq();
     const uint32_t now_ms = HAL_GetTick();
@@ -412,6 +435,25 @@ static void Drive_Control()
         fb_ms[i] = M2006_Last_Feedback_Ms[i];
         feedback_fresh &= M2006_Feedback_Received[i] &&
                           (uint32_t)(now_ms - fb_ms[i]) < M2006_Feedback_Timeout_Ms;
+        if (Standstill_Zero_Tx_Armed[i] && !Standstill_Zero_Tx_Done[i])
+        {
+            FDCAN_HandleTypeDef &can = (i == 0U) ? hfdcan1 : hfdcan2;
+            if (!HAL_FDCAN_IsTxBufferMessagePending(&can, Standstill_Zero_Tx_Buffer[i]))
+            {
+                Standstill_Zero_Tx_Done[i] = true;
+                Standstill_Zero_Tx_Post_Seq[i] = fb_seq[i];
+                Standstill_Zero_Tx_Post_Ms[i] = fb_ms[i];
+            }
+        }
+    }
+    if (Standstill_Zero_Tx_Armed[0] && Standstill_Zero_Tx_Armed[1] &&
+        Standstill_Zero_Tx_Done[0] && Standstill_Zero_Tx_Done[1])
+    {
+        latch_standstill_now = true;
+        latch_seq = Standstill_Zero_Tx_Post_Seq;
+        latch_ms = Standstill_Zero_Tx_Post_Ms;
+        Standstill_Zero_Tx_Armed[0] = Standstill_Zero_Tx_Armed[1] = false;
+        Standstill_Zero_Tx_Done[0] = Standstill_Zero_Tx_Done[1] = false;
     }
     const bool attitude_fresh = Attitude_Valid && (uint32_t)(now_ms - Attitude_Sample_Ms) < 30U;
     const bool imu_quiet = Imu_Quiet;
@@ -422,52 +464,57 @@ static void Drive_Control()
     const float pack_voltage = Battery.Get_Pack_Voltage();
     __set_PRIMASK(primask);
 
+    if (latch_standstill_now)
+    {
+        Rescue_Mission.Latch_Standstill_Boundary(latch_seq.data(), latch_ms.data());
+    }
+    else if (!Rescue_Mission.Is_Standstill_Gate_Pending_Boundary())
+    {
+        Standstill_Zero_Tx_Armed[0] = Standstill_Zero_Tx_Armed[1] = false;
+        Standstill_Zero_Tx_Done[0] = Standstill_Zero_Tx_Done[1] = false;
+    }
+
     // 1 ms 控制任务仅做非阻塞 RX 健康与纪元检查，绝不阻塞调用 HAL DMA 中止/重初始化；
     // 任一 RX 异常或跨周期恢复均清空旧环缓冲、复位协议解析器并失效故障前缓存视觉帧，
-    // 且在提交解析帧前、状态机决策前与电机输出前二次复验，防止同周期中断竞态放行运动。
-    bool uart_rx_healthy = UART_Is_Rx_Healthy(&huart1);
-    bool uart_rx_fault = UART_Is_Rx_Fault_Latched(&huart1);
-    uint32_t uart_rx_epoch = UART_Get_Rx_Epoch(&huart1);
-    if (!uart_rx_healthy || uart_rx_fault || uart_rx_epoch != Last_Uart_Rx_Epoch)
+    // 且帧提交与状态机/执行器提交分别在关中断临界区内与 RX 故障中断保持原子性。
+    bool uart_rx_healthy = false;
+    bool uart_rx_fault = false;
+    uint32_t uart_rx_epoch = 0U;
+    bool need_drain = false;
+    bool need_parser_reset = false;
     {
-        Last_Uart_Rx_Epoch = uart_rx_epoch;
-        Vision_Flush_Rx_Queue();
-        Rescue_Mission.On_Uart_Rx_Fault();
-        Vision_Rx_Was_Healthy = uart_rx_healthy && !uart_rx_fault;
-    }
-    else
-    {
-        if (!Vision_Rx_Was_Healthy)
+        const uint32_t rx_mask = __get_PRIMASK();
+        __disable_irq();
+        Vision_Sample_Rx_State(uart_rx_healthy, uart_rx_fault, uart_rx_epoch);
+        if (!uart_rx_healthy || uart_rx_fault || uart_rx_epoch != Last_Uart_Rx_Epoch)
         {
-            Vision_Flush_Rx_Queue();
-            Vision_Rx_Was_Healthy = true;
-        }
-        if (!Vision_Drain_Rx(now_ms, uart_rx_epoch))
-        {
-            uart_rx_healthy = false;
-            uart_rx_fault = UART_Is_Rx_Fault_Latched(&huart1);
             Last_Uart_Rx_Epoch = UART_Get_Rx_Epoch(&huart1);
-            Vision_Rx_Was_Healthy = false;
-        }
-    }
-    // Revalidate RX health & generation immediately before mission decision!
-    {
-        const bool rx_ok_now = UART_Is_Rx_Healthy(&huart1);
-        const bool rx_fault_now = UART_Is_Rx_Fault_Latched(&huart1);
-        const uint32_t rx_epoch_now = UART_Get_Rx_Epoch(&huart1);
-        if (!rx_ok_now || rx_fault_now || rx_epoch_now != Last_Uart_Rx_Epoch)
-        {
-            Last_Uart_Rx_Epoch = rx_epoch_now;
-            Vision_Flush_Rx_Queue();
+            Vision_Rx_Tail = Vision_Rx_Head;
             Rescue_Mission.On_Uart_Rx_Fault();
+            Vision_Rx_Was_Healthy = uart_rx_healthy && !uart_rx_fault;
             uart_rx_healthy = false;
-            uart_rx_fault = uart_rx_fault || rx_fault_now;
-            Vision_Rx_Was_Healthy = rx_ok_now && !rx_fault_now;
+            need_parser_reset = true;
         }
         else
         {
-            uart_rx_epoch = rx_epoch_now;
+            if (!Vision_Rx_Was_Healthy)
+            {
+                Vision_Rx_Tail = Vision_Rx_Head;
+                Vision_Rx_Was_Healthy = true;
+                need_parser_reset = true;
+            }
+            need_drain = true;
         }
+        __set_PRIMASK(rx_mask);
+    }
+    if (need_parser_reset)
+    {
+        Vision_Parser.Reset();
+    }
+    if (need_drain && !Vision_Drain_Rx(now_ms, uart_rx_epoch))
+    {
+        uart_rx_healthy = false;
+        uart_rx_fault = UART_Is_Rx_Fault_Latched(&huart1);
     }
 
     // 舵机控制：等待首帧有效电池采样后再启动 PWM；真实电池故障或 PWM 启动失败则永久锁停。
@@ -507,11 +554,6 @@ static void Drive_Control()
     const bool wheels_still = feedback_fresh && std::fabs(speed[0]) < 0.1f && std::fabs(speed[1]) < 0.1f;
     const bool can1_ready = Drive_Tx_Ready(hfdcan1);
     const bool can2_ready = Drive_Tx_Ready(hfdcan2);
-    const bool is_bench_mode = (Rescue_Mission.Get_Run_Mode() == RESCUE_MODE_BENCH_STRAIGHT);
-    const bool ready =
-        battery_ready && feedback_fresh && attitude_fresh && can1_ready && can2_ready &&
-        (is_bench_mode || (servos_ready && !uart_rx_fault));
-    const bool can_start = ready && wheels_still && imu_quiet;
     const bool button_pressed = Drive_Button_Pressed(now_ms);
 
     float forward_delta_m = 0.0f;
@@ -533,117 +575,133 @@ static void Drive_Control()
         Drive_Prev_Odom_Valid = false;
     }
 
-    const Enum_Mission_State prev_state = Rescue_Mission.Get_State();
-    Struct_Mission_Inputs mission_in{};
-    mission_in.now_ms = now_ms;
-    mission_in.hardware_ready = ready;
-    mission_in.can_launch = can_start && (is_bench_mode || uart_rx_healthy);
-    mission_in.uart_rx_healthy = is_bench_mode || uart_rx_healthy;
-    mission_in.button_pressed = button_pressed;
-    mission_in.chassis_active = (prev_state == MISSION_BENCH_STRAIGHT)
-                                    ? Straight_Drive.Is_Running()
-                                    : Chassis_Drive.Is_Active();
-    mission_in.wheels_still = wheels_still;
-    mission_in.chassis_motion_done = Chassis_Drive.Is_Motion_Done();
-    mission_in.chassis_motion_aborted = Chassis_Drive.Is_Motion_Aborted();
-    mission_in.chassis_stalled = Chassis_Drive.Is_Stalled();
-    mission_in.gate_settled = Gate_Servo.Is_Settled();
-    mission_in.camera_settled = Pitch_Servo.Is_Settled();
-    mission_in.forward_delta_m = forward_delta_m;
-    mission_in.yaw_delta_rad = yaw_delta_rad;
-    mission_in.motor_feedback_seq[0] = fb_seq[0];
-    mission_in.motor_feedback_seq[1] = fb_seq[1];
-    mission_in.motor_feedback_ms[0] = fb_ms[0];
-    mission_in.motor_feedback_ms[1] = fb_ms[1];
-    mission_in.use_motor_feedback_seq = true;
-
-    const Struct_Mission_Output cmd = Rescue_Mission.Update(mission_in);
-
-    // Post-decision / pre-output RX revalidation: if a UART RX fault or recovery epoch bump
-    // arrived mid-tick during mission update in competition mode, immediately suppress motor output
-    // and invalidate vision/freshness publication for this tick.
-    bool uart_rx_faulted_mid_tick = false;
-    if (!is_bench_mode)
+    // Atomic critical section (<2 us on 480 MHz H7) pairing final RX generation validation with
+    // mission update and servo/chassis/M2006 torque commitment so no UART error ISR can slip between
+    // validation, match lock, and actuator command application.
+    bool is_bench_mode = false;
+    bool ready = false;
+    bool can_launch_commit = false;
+    bool reset_parser_after_commit = false;
+    Struct_Mission_Output cmd{};
+    std::array<float, 2> torque = {};
     {
-        const bool rx_ok_post = UART_Is_Rx_Healthy(&huart1);
-        const bool rx_fault_post = UART_Is_Rx_Fault_Latched(&huart1);
-        const uint32_t rx_epoch_post = UART_Get_Rx_Epoch(&huart1);
-        if (!rx_ok_post || rx_fault_post || rx_epoch_post != Last_Uart_Rx_Epoch)
+        const uint32_t commit_mask = __get_PRIMASK();
+        __disable_irq();
+        bool rx_ok_now = false;
+        bool rx_fault_now = false;
+        uint32_t rx_epoch_now = 0U;
+        Vision_Sample_Rx_State(rx_ok_now, rx_fault_now, rx_epoch_now);
+        if (!rx_ok_now || rx_fault_now || rx_epoch_now != Last_Uart_Rx_Epoch)
         {
-            Last_Uart_Rx_Epoch = rx_epoch_post;
-            Vision_Flush_Rx_Queue();
+            Last_Uart_Rx_Epoch = UART_Get_Rx_Epoch(&huart1);
+            Vision_Rx_Tail = Vision_Rx_Head;
             Rescue_Mission.On_Uart_Rx_Fault();
             uart_rx_healthy = false;
-            uart_rx_fault = uart_rx_fault || rx_fault_post;
-            Vision_Rx_Was_Healthy = rx_ok_post && !rx_fault_post;
-            uart_rx_faulted_mid_tick = true;
+            uart_rx_fault = uart_rx_fault || rx_fault_now;
+            Vision_Rx_Was_Healthy = rx_ok_now && !rx_fault_now;
+            reset_parser_after_commit = true;
         }
-    }
 
-    Drive_Notify_Buzzer(mission_in.can_launch && !uart_rx_faulted_mid_tick, cmd.launch_rejected_cue, now_ms);
+        is_bench_mode = (Rescue_Mission.Get_Run_Mode() == RESCUE_MODE_BENCH_STRAIGHT);
+        ready = battery_ready && feedback_fresh && attitude_fresh && can1_ready && can2_ready &&
+                (is_bench_mode || (servos_ready && !uart_rx_fault));
+        const bool can_start = ready && wheels_still && imu_quiet;
+        can_launch_commit = can_start && (is_bench_mode || uart_rx_healthy);
 
-    if (servos_ready)
-    {
-        Gate_Servo.Set_Target_Us(cmd.gate_closed ? Gate_Closed_Us : Gate_Open_Us);
-        Pitch_Servo.Set_Target_Us(cmd.camera_near ? Pitch_Near_Us : Pitch_Far_Us);
-        Gate_Servo.Update_1ms();
-        Pitch_Servo.Update_1ms();
-    }
+        const Enum_Mission_State prev_state = Rescue_Mission.Get_State();
+        Struct_Mission_Inputs mission_in{};
+        mission_in.now_ms = now_ms;
+        mission_in.hardware_ready = ready;
+        mission_in.can_launch = can_launch_commit;
+        mission_in.uart_rx_healthy = is_bench_mode || uart_rx_healthy;
+        mission_in.button_pressed = button_pressed;
+        mission_in.chassis_active = (prev_state == MISSION_BENCH_STRAIGHT)
+                                        ? Straight_Drive.Is_Running()
+                                        : Chassis_Drive.Is_Active();
+        mission_in.wheels_still = wheels_still;
+        mission_in.chassis_motion_done = Chassis_Drive.Is_Motion_Done();
+        mission_in.chassis_motion_aborted = Chassis_Drive.Is_Motion_Aborted();
+        mission_in.chassis_stalled = Chassis_Drive.Is_Stalled();
+        mission_in.gate_settled = Gate_Servo.Is_Settled();
+        mission_in.camera_settled = Pitch_Servo.Is_Settled();
+        mission_in.forward_delta_m = forward_delta_m;
+        mission_in.yaw_delta_rad = yaw_delta_rad;
+        mission_in.motor_feedback_seq[0] = fb_seq[0];
+        mission_in.motor_feedback_seq[1] = fb_seq[1];
+        mission_in.motor_feedback_ms[0] = fb_ms[0];
+        mission_in.motor_feedback_ms[1] = fb_ms[1];
+        mission_in.use_motor_feedback_seq = true;
 
-    std::array<float, 2> torque = {};
-    if (!ready || uart_rx_faulted_mid_tick)
-    {
-        Straight_Drive.Stop();
-        Chassis_Drive.Emergency_Stop();
-    }
-    else if (cmd.drive_action == DRIVE_ACTION_BENCH_STRAIGHT)
-    {
-        Chassis_Drive.Emergency_Stop();
-        if (prev_state == MISSION_PRE_MATCH && !Straight_Drive.Is_Running())
+        cmd = Rescue_Mission.Update(mission_in);
+
+        if (servos_ready)
         {
-            Straight_Drive.Start(angle, speed, heading, now_ms);
+            Gate_Servo.Set_Target_Us(cmd.gate_closed ? Gate_Closed_Us : Gate_Open_Us);
+            Pitch_Servo.Set_Target_Us(cmd.camera_near ? Pitch_Near_Us : Pitch_Far_Us);
+            Gate_Servo.Update_1ms();
+            Pitch_Servo.Update_1ms();
         }
-        else if (button_pressed && Straight_Drive.Is_Running())
+
+        if (!ready)
         {
-            Straight_Drive.Request_Stop(now_ms);
-        }
-        torque = Straight_Drive.Update(angle, speed, heading, yaw_rate, now_ms);
-    }
-    else
-    {
-        Straight_Drive.Stop();
-        switch (cmd.drive_action)
-        {
-        case DRIVE_ACTION_VELOCITY:
-            Chassis_Drive.Set_Velocity(cmd.linear_mps, cmd.angular_rad_s, speed, now_ms);
-            break;
-        case DRIVE_ACTION_START_DISTANCE:
-            Chassis_Drive.Start_Distance(cmd.distance_m, cmd.speed_mps, angle, speed, heading,
-                                         now_ms, cmd.motion_timeout_ms);
-            break;
-        case DRIVE_ACTION_START_TURN:
-            Chassis_Drive.Start_Turn(cmd.delta_yaw_rad, cmd.angular_rad_s, speed, heading,
-                                     now_ms, cmd.motion_timeout_ms);
-            break;
-        case DRIVE_ACTION_SOFT_STOP:
-            Chassis_Drive.Request_Stop(now_ms);
-            break;
-        case DRIVE_ACTION_EMERGENCY_STOP:
-        case DRIVE_ACTION_IDLE:
+            Straight_Drive.Stop();
             Chassis_Drive.Emergency_Stop();
-            break;
-        case DRIVE_ACTION_KEEP:
-        default:
-            break;
         }
-        torque = Chassis_Drive.Update(angle, speed, heading, yaw_rate, now_ms);
-    }
+        else if (cmd.drive_action == DRIVE_ACTION_BENCH_STRAIGHT)
+        {
+            Chassis_Drive.Emergency_Stop();
+            if (prev_state == MISSION_PRE_MATCH && !Straight_Drive.Is_Running())
+            {
+                Straight_Drive.Start(angle, speed, heading, now_ms);
+            }
+            else if (button_pressed && Straight_Drive.Is_Running())
+            {
+                Straight_Drive.Request_Stop(now_ms);
+            }
+            torque = Straight_Drive.Update(angle, speed, heading, yaw_rate, now_ms);
+        }
+        else
+        {
+            Straight_Drive.Stop();
+            switch (cmd.drive_action)
+            {
+            case DRIVE_ACTION_VELOCITY:
+                Chassis_Drive.Set_Velocity(cmd.linear_mps, cmd.angular_rad_s, speed, now_ms);
+                break;
+            case DRIVE_ACTION_START_DISTANCE:
+                Chassis_Drive.Start_Distance(cmd.distance_m, cmd.speed_mps, angle, speed, heading,
+                                             now_ms, cmd.motion_timeout_ms);
+                break;
+            case DRIVE_ACTION_START_TURN:
+                Chassis_Drive.Start_Turn(cmd.delta_yaw_rad, cmd.angular_rad_s, speed, heading,
+                                         now_ms, cmd.motion_timeout_ms);
+                break;
+            case DRIVE_ACTION_SOFT_STOP:
+                Chassis_Drive.Request_Stop(now_ms);
+                break;
+            case DRIVE_ACTION_EMERGENCY_STOP:
+            case DRIVE_ACTION_IDLE:
+                Chassis_Drive.Emergency_Stop();
+                break;
+            case DRIVE_ACTION_KEEP:
+            default:
+                break;
+            }
+            torque = Chassis_Drive.Update(angle, speed, heading, yaw_rate, now_ms);
+        }
 
-    for (uint8_t i = 0; i < 2; ++i)
-    {
-        M2006[i].Set_Target_Torque(M2006_Direction[i] * torque[i]);
-        M2006[i].TIM_Calculate_PeriodElapsedCallback();
+        for (uint8_t i = 0; i < 2; ++i)
+        {
+            M2006[i].Set_Target_Torque(M2006_Direction[i] * torque[i]);
+            M2006[i].TIM_Calculate_PeriodElapsedCallback();
+        }
+        __set_PRIMASK(commit_mask);
     }
+    if (reset_parser_after_commit)
+    {
+        Vision_Parser.Reset();
+    }
+    Drive_Notify_Buzzer(can_launch_commit, cmd.launch_rejected_cue, now_ms);
 
     const auto can1_status = can1_ready ? CAN_Transmit_Data(&hfdcan1, 0x200, CAN1_0x200_Tx_Data, FDCAN_DLC_BYTES_8) : HAL_OK;
     const auto can2_status = can2_ready ? CAN_Transmit_Data(&hfdcan2, 0x200, CAN2_0x200_Tx_Data, FDCAN_DLC_BYTES_8) : HAL_OK;
@@ -671,21 +729,56 @@ static void Drive_Control()
         }
     }
 
-    // Establish the standstill feedback boundary AFTER Emergency_Stop and zero-torque CAN TX have been
-    // applied, so CAN IRQs that fired earlier in this tick (while still reversing) can NEVER release it!
-    if (Rescue_Mission.Is_Standstill_Gate_Pending_Boundary())
+    // Keep the reverse standstill gate closed until BOTH specific zero-torque CAN commands complete
+    // transmission (!HAL_FDCAN_IsTxBufferMessagePending), and only THEN latch each motor's post-TX
+    // feedback boundary so in-flight feedback received before TX completion can NEVER release the gate!
+    if (can_tx_ok && can1_ready && can2_ready && Rescue_Mission.Is_Standstill_Gate_Pending_Boundary())
     {
+        if (!Standstill_Zero_Tx_Armed[0] && !Standstill_Zero_Tx_Armed[1])
+        {
+            Standstill_Zero_Tx_Buffer[0] = HAL_FDCAN_GetLatestTxFifoQRequestBuffer(&hfdcan1);
+            Standstill_Zero_Tx_Buffer[1] = HAL_FDCAN_GetLatestTxFifoQRequestBuffer(&hfdcan2);
+            Standstill_Zero_Tx_Armed[0] = true;
+            Standstill_Zero_Tx_Armed[1] = true;
+            Standstill_Zero_Tx_Done[0] = false;
+            Standstill_Zero_Tx_Done[1] = false;
+        }
         std::array<uint32_t, 2> post_stop_seq = {};
         std::array<uint32_t, 2> post_stop_ms = {};
+        bool both_tx_done = false;
         const uint32_t stop_mask = __get_PRIMASK();
         __disable_irq();
         for (uint8_t i = 0; i < 2; ++i)
         {
-            post_stop_seq[i] = M2006_Feedback_Seq[i];
-            post_stop_ms[i] = M2006_Last_Feedback_Ms[i];
+            if (Standstill_Zero_Tx_Armed[i] && !Standstill_Zero_Tx_Done[i])
+            {
+                FDCAN_HandleTypeDef &can = (i == 0U) ? hfdcan1 : hfdcan2;
+                if (!HAL_FDCAN_IsTxBufferMessagePending(&can, Standstill_Zero_Tx_Buffer[i]))
+                {
+                    Standstill_Zero_Tx_Done[i] = true;
+                    Standstill_Zero_Tx_Post_Seq[i] = M2006_Feedback_Seq[i];
+                    Standstill_Zero_Tx_Post_Ms[i] = M2006_Last_Feedback_Ms[i];
+                }
+            }
+        }
+        if (Standstill_Zero_Tx_Done[0] && Standstill_Zero_Tx_Done[1])
+        {
+            both_tx_done = true;
+            post_stop_seq = Standstill_Zero_Tx_Post_Seq;
+            post_stop_ms = Standstill_Zero_Tx_Post_Ms;
+            Standstill_Zero_Tx_Armed[0] = Standstill_Zero_Tx_Armed[1] = false;
+            Standstill_Zero_Tx_Done[0] = Standstill_Zero_Tx_Done[1] = false;
         }
         __set_PRIMASK(stop_mask);
-        Rescue_Mission.Latch_Standstill_Boundary(post_stop_seq.data(), post_stop_ms.data());
+        if (both_tx_done)
+        {
+            Rescue_Mission.Latch_Standstill_Boundary(post_stop_seq.data(), post_stop_ms.data());
+        }
+    }
+    else if (!Rescue_Mission.Is_Standstill_Gate_Pending_Boundary())
+    {
+        Standstill_Zero_Tx_Armed[0] = Standstill_Zero_Tx_Armed[1] = false;
+        Standstill_Zero_Tx_Done[0] = Standstill_Zero_Tx_Done[1] = false;
     }
 
     // 发布灯光颜色与遥测快照，供 statusTask 消费。
@@ -737,10 +830,16 @@ static void Drive_Control()
     tel.delivered_orange = Rescue_Mission.Get_Delivered_Orange();
     tel.max_materials_per_trip = Rescue_Mission.Get_Max_Materials_Per_Trip();
 
-    const Struct_WS2812_Color led =
-        Compute_Status_LED(battery_ready, ready && (is_bench_mode || uart_rx_healthy), now_ms);
     const uint32_t pub_mask = __get_PRIMASK();
     __disable_irq();
+    const bool pub_rx_ok = uart_rx_healthy && UART_Is_Rx_Healthy(&huart1) && !UART_Is_Rx_Fault_Latched(&huart1);
+    if (!pub_rx_ok)
+    {
+        tel.status_flags &= static_cast<uint16_t>(~TEL_FLAG_VISION_FRESH);
+        tel.fault_flags |= FAULT_FLAG_UART_RX;
+    }
+    const Struct_WS2812_Color led =
+        Compute_Status_LED(battery_ready, ready && (is_bench_mode || pub_rx_ok), now_ms);
     Status_LED_Color = led;
     Telemetry_Snapshot = tel;
     __set_PRIMASK(pub_mask);
