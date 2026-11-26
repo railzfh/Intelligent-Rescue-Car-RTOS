@@ -442,6 +442,8 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         Reverse_Motion_In_Flight = false;
     }
 
+    const bool vision_fresh = Is_Vision_Fresh(in.now_ms) && in.uart_rx_healthy;
+
     // Global standstill interlock after any cancelled/interrupted/completed reverse transition:
     // inhibit ALL motion across ALL states until fresh post-stop feedback from EACH motor confirms
     // standstill, or latch a fault.
@@ -455,6 +457,16 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         }
         else
         {
+            if (!vision_fresh && Gate_Closed_Cmd && !in.gate_settled)
+            {
+                Clear_Cargo();
+                Gate_Closed_Cmd = false;
+                if (State == MISSION_CLOSE_GATE_VERIFY)
+                {
+                    Camera_Near_Cmd = true;
+                    Enter_State(MISSION_INSPECT_CORRAL, in.now_ms);
+                }
+            }
             if ((uint32_t)(in.now_ms - Standstill_Gate_Start_Ms) >= 1500U)
             {
                 Fault_Stop(in.now_ms);
@@ -466,7 +478,6 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         }
     }
 
-    const bool vision_fresh = Is_Vision_Fresh(in.now_ms) && in.uart_rx_healthy;
     const bool rear_sensor_clear = vision_fresh && ((Latest_Vision.flags & VIS_FLAG_REAR_CLEAR) != 0U);
     const bool opponent_alert =
         vision_fresh && ((Latest_Vision.flags & (VIS_FLAG_OPPONENT_NEAR | VIS_FLAG_OPPONENT_ZONE_NEAR)) != 0U);
@@ -540,7 +551,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         }
 
         // Unified vision freshness interlock across ALL active competition states:
-        // never continue blind open-loop motion on stale vision frames.
+        // never continue blind open-loop chassis motion or blind gate closure on stale/faulted vision.
         if (!vision_fresh)
         {
             if (!Vision_Outage_Active)
@@ -549,6 +560,8 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                 Vision_Outage_Start_Ms = in.now_ms;
             }
             Interrupted_By_Stale_Vision = true;
+            Confirm_Count = 0U;
+            Has_Confirm_Frame = false;
             if ((uint32_t)(in.now_ms - Vision_Outage_Start_Ms) >= Config.vision_abort_ms)
             {
                 Fault_Stop(in.now_ms);
@@ -557,11 +570,24 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                 out.drive_action = DRIVE_ACTION_EMERGENCY_STOP;
                 return out;
             }
+            // Never keep sweeping the corral arm closed while vision is stale or UART is faulted!
+            if (Gate_Closed_Cmd && !in.gate_settled)
+            {
+                Clear_Cargo();
+                Gate_Closed_Cmd = false;
+                if (State == MISSION_CLOSE_GATE_VERIFY)
+                {
+                    Camera_Near_Cmd = true;
+                    Enter_State(MISSION_INSPECT_CORRAL, in.now_ms);
+                }
+            }
             const bool in_active_reverse = Is_Active_Reverse_State();
             if (in_active_reverse)
             {
                 Engage_Standstill_Gate(in.now_ms, in);
             }
+            out.gate_closed = Gate_Closed_Cmd;
+            out.camera_near = Camera_Near_Cmd;
             out.drive_action = in_active_reverse ? DRIVE_ACTION_EMERGENCY_STOP : DRIVE_ACTION_SOFT_STOP;
             return out;
         }

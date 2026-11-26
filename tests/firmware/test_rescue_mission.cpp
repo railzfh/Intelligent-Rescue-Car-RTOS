@@ -187,6 +187,60 @@ static void Test_Cyan_Interrupts_Unsettled_Gate_Closure()
     const auto out = mission.Update(in);
     assert(!out.gate_closed);
     assert(mission.Get_State() == MISSION_BACK_OUT_SEPARATE);
+
+    // Also verify vision/UART loss while gate is closing (!gate_settled) IMMEDIATELY aborts blind closure
+    // (commands gate open and returns to INSPECT_CORRAL to require fresh confirmation after recovery)!
+    Class_Rescue_Mission blind_m;
+    assert(blind_m.On_Set_Config({RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION, 1U}));
+    uint32_t bt = 1000U;
+    uint16_t bseq = 1U;
+    assert(blind_m.On_Vision_State(Make_Far_Vision(bseq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), bt));
+    Struct_Mission_Inputs bin{};
+    bin.now_ms = bt;
+    bin.hardware_ready = true;
+    bin.can_launch = true;
+    bin.button_pressed = true;
+    bin.gate_settled = true;
+    bin.camera_settled = true;
+    blind_m.Update(bin);
+    bin.button_pressed = false;
+    bin.chassis_motion_done = true;
+    bin.now_ms = (bt += 50U);
+    assert(blind_m.On_Vision_State(Make_Far_Vision(bseq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 0, 190U), bt));
+    blind_m.Update(bin);
+    bin.chassis_motion_done = false;
+    for (int i = 0; i < 2; ++i)
+    {
+        bin.now_ms = (bt += 50U);
+        assert(blind_m.On_Vision_State(Make_Far_Vision(bseq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 0, 190U), bt));
+        blind_m.Update(bin);
+    }
+    for (int k = 0; k < 3; ++k)
+    {
+        bin.now_ms = (bt += 50U);
+        assert(blind_m.On_Vision_State(Make_Near_Vision(bseq++, 1U, 0U, 0U, 0U, 0U, safe), bt));
+        blind_m.Update(bin);
+    }
+    assert(blind_m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
+    assert(blind_m.Is_Gate_Closed_Cmd());
+
+    // Gate is mid-close (!gate_settled) when UART RX faults -> MUST immediately command gate open!
+    bin.gate_settled = false;
+    bin.uart_rx_healthy = false;
+    bin.now_ms = (bt += 10U);
+    auto bout = blind_m.Update(bin);
+    assert(!bout.gate_closed);
+    assert(!blind_m.Is_Gate_Closed_Cmd());
+    assert(blind_m.Get_State() == MISSION_INSPECT_CORRAL);
+
+    // Recover UART + 1 fresh frame -> MUST stay open until 3 fresh frames confirm!
+    bin.uart_rx_healthy = true;
+    bin.gate_settled = true;
+    bin.now_ms = (bt += 40U);
+    assert(blind_m.On_Vision_State(Make_Near_Vision(bseq++, 1U, 0U, 0U, 0U, 0U, safe), bt));
+    bout = blind_m.Update(bin);
+    assert(!bout.gate_closed);
+    assert(blind_m.Get_State() == MISSION_INSPECT_CORRAL);
 }
 
 static void Test_Full_First_Green_Delivery_And_Proven_Rear_Corridor()

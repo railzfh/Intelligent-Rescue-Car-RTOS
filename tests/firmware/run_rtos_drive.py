@@ -671,6 +671,74 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    const bool gate_blind_abort = argc > 1 && std::strcmp(argv[1], "gate_blind_abort") == 0;
+    if (gate_blind_abort) {
+        // Vision/UART loss while Gate_Servo is actively closing (!Is_Settled) in MISSION_CLOSE_GATE_VERIFY
+        // MUST immediately abort blind gate closure, retract back to Gate_Open_Us, and NEVER close while blind!
+        Feed_Config(RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION);
+        uint16_t fseq = 0U;
+        auto feed_gate = [&](uint8_t view, uint16_t flags, uint8_t green) {
+            uint8_t wire[RESCUE_PROTO_MAX_FRAME]{};
+            Struct_Vision_State vis{};
+            vis.frame_seq = ++fseq;
+            vis.camera_view = view;
+            vis.target_type = TARGET_GREEN_MATERIAL;
+            vis.target_dist_mm = 190U;
+            vis.flags = flags;
+            vis.corral_green_cnt = green;
+            vis.confidence = 95U;
+            const auto n = Rescue_Encode_Vision_State(1U, vis, wire, sizeof(wire));
+            Vision_Uart_RxCallback(wire, static_cast<uint16_t>(n));
+        };
+        uint32_t tm = 0U;
+        for (; tm < 200U; ++tm) {
+            if ((tm % 25U) == 0U) { feed_gate(CAMERA_VIEW_FAR, VIS_FLAG_TARGET_VALID, 0U); }
+            Step(tm, false);
+        }
+        Step(tm += 10U, true);
+        Step(tm += 30U, true);
+        assert(Rescue_Mission.Get_State() == MISSION_LAUNCH_CROSS_BUMPS);
+        for (int k = 0; k < 8000 && Rescue_Mission.Get_State() == MISSION_LAUNCH_CROSS_BUMPS; ++k) {
+            ++tm;
+            if ((tm % 40U) == 0U) { feed_gate(CAMERA_VIEW_FAR, VIS_FLAG_TARGET_VALID, 0U); }
+            Step(tm, false);
+            for (int i = 0; i < 2; ++i) {
+                M2006[i].angle += M2006[i].omega * 0.001f;
+                M2006[i].omega += 40.0f * M2006[i].torque * 0.001f;
+            }
+        }
+        M2006[0].omega = M2006[1].omega = 0.0f;
+        for (int k = 0; k < 300 && Rescue_Mission.Get_State() != MISSION_INSPECT_CORRAL; ++k) {
+            ++tm;
+            if ((tm % 25U) == 0U) { feed_gate(CAMERA_VIEW_FAR, VIS_FLAG_TARGET_VALID, 0U); }
+            Step(tm, false);
+        }
+        assert(Rescue_Mission.Get_State() == MISSION_INSPECT_CORRAL);
+        for (int k = 0; k < 1000 && Rescue_Mission.Get_State() == MISSION_INSPECT_CORRAL; ++k) {
+            ++tm;
+            if ((tm % 25U) == 0U) { feed_gate(CAMERA_VIEW_NEAR, VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR, 1U); }
+            Step(tm, false);
+        }
+        assert(Rescue_Mission.Get_State() == MISSION_CLOSE_GATE_VERIFY);
+        const uint16_t before_us = Gate_Servo.Get_Current_Us();
+        assert(before_us < Gate_Closed_Us && !Gate_Servo.Is_Settled());
+
+        // Inject UART RX fault mid-close -> Gate_Servo MUST abort closing and retract to Gate_Open_Us!
+        huart1.rx_healthy = false;
+        ++huart1.rx_epoch;
+        for (unsigned elapsed = 0U; elapsed < 650U; ++elapsed) {
+            Step(++tm, false);
+            assert((Telemetry_Snapshot.status_flags & TEL_FLAG_VISION_FRESH) == 0U);
+            assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_UART_RX) != 0U);
+            assert(!Rescue_Mission.Is_Gate_Closed_Cmd());
+            assert(Gate_Servo.Get_Current_Us() <= before_us);
+        }
+        assert(Gate_Servo.Get_Current_Us() == Gate_Open_Us && Gate_Servo.Is_Settled());
+        assert(Rescue_Mission.Get_State() == MISSION_INSPECT_CORRAL);
+        std::puts("PASS: UART RX fault mid-gate-close immediately aborts blind closure and retracts gate to open");
+        return 0;
+    }
+
     const bool can_tx_complete = argc > 1 && std::strcmp(argv[1], "can_tx_complete") == 0;
     const bool can_standstill_hw = argc > 1 && std::strcmp(argv[1], "can_standstill_hw") == 0;
     if (can_tx_complete || can_standstill_hw) {
@@ -1172,5 +1240,5 @@ cmd = ["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-Wno-unused-variable
 if os.name == "nt":
     cmd.append("-static")
 subprocess.run(cmd, check=True)
-for mode in ([], ["held"], ["comp"], ["can_fault"], ["frozen"], ["cold_boot"], ["servo_fail"], ["reverse_abort"], ["uart_unhealthy"], ["standstill_can"], ["irq_races"], ["uart_atomic"], ["resync_drain"], ["can_tx_complete"], ["can_standstill_hw"]):
+for mode in ([], ["held"], ["comp"], ["can_fault"], ["frozen"], ["cold_boot"], ["servo_fail"], ["reverse_abort"], ["uart_unhealthy"], ["standstill_can"], ["irq_races"], ["uart_atomic"], ["resync_drain"], ["gate_blind_abort"], ["can_tx_complete"], ["can_standstill_hw"]):
     subprocess.run([str(exe), *mode], check=True)
