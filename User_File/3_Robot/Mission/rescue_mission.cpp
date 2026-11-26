@@ -457,7 +457,9 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         }
         else
         {
-            if (!vision_fresh && Gate_Closed_Cmd && !in.gate_settled)
+            const bool near_view_ok = vision_fresh && in.camera_settled &&
+                                      (Latest_Vision.camera_view == CAMERA_VIEW_NEAR);
+            if (!near_view_ok && Gate_Closed_Cmd && !in.gate_settled)
             {
                 Clear_Cargo();
                 Gate_Closed_Cmd = false;
@@ -828,6 +830,11 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         out.drive_action = DRIVE_ACTION_SOFT_STOP;
         if (in.chassis_active || !in.camera_settled)
         {
+            if (!in.camera_settled)
+            {
+                Confirm_Count = 0U;
+                Has_Confirm_Frame = false;
+            }
             break;
         }
         if ((uint32_t)(in.now_ms - State_Enter_Ms) >= Config.inspect_timeout_ms)
@@ -836,8 +843,13 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             Enter_State(MISSION_BACK_OUT_SEPARATE, in.now_ms);
             break;
         }
-        if (Latest_Vision.camera_view != CAMERA_VIEW_NEAR ||
-            (Has_Confirm_Frame && Latest_Vision.frame_seq == Last_Confirm_Frame_Seq))
+        if (Latest_Vision.camera_view != CAMERA_VIEW_NEAR)
+        {
+            Confirm_Count = 0U;
+            Has_Confirm_Frame = false;
+            break;
+        }
+        if (Has_Confirm_Frame && Latest_Vision.frame_seq == Last_Confirm_Frame_Seq)
         {
             break;
         }
@@ -1009,8 +1021,22 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             Enter_State(MISSION_BACK_OUT_SEPARATE, in.now_ms);
             break;
         }
-        if (!in.camera_settled || Latest_Vision.camera_view != CAMERA_VIEW_NEAR ||
-            (Has_Confirm_Frame && Latest_Vision.frame_seq == Last_Confirm_Frame_Seq))
+        if (!in.camera_settled || Latest_Vision.camera_view != CAMERA_VIEW_NEAR)
+        {
+            Confirm_Count = 0U;
+            Has_Confirm_Frame = false;
+            // Require a settled NEAR view throughout an unsettled gate closure; never keep
+            // commanding the corral arm closed while receiving FAR/TRANSITION frames!
+            if (!in.gate_settled)
+            {
+                Clear_Cargo();
+                Gate_Closed_Cmd = false;
+                Camera_Near_Cmd = true;
+                Enter_State(MISSION_INSPECT_CORRAL, in.now_ms);
+            }
+            break;
+        }
+        if (Has_Confirm_Frame && Latest_Vision.frame_seq == Last_Confirm_Frame_Seq)
         {
             break;
         }
@@ -1134,6 +1160,11 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             out.drive_action = DRIVE_ACTION_SOFT_STOP;
             if (in.chassis_active || !in.camera_settled)
             {
+                if (!in.camera_settled)
+                {
+                    Confirm_Count = 0U;
+                    Has_Confirm_Frame = false;
+                }
                 break;
             }
             if ((uint32_t)(in.now_ms - State_Enter_Ms) >= Config.inspect_timeout_ms)
@@ -1142,8 +1173,13 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                 Enter_State(MISSION_FIND_HOME, in.now_ms);
                 break;
             }
-            if (Latest_Vision.camera_view != CAMERA_VIEW_NEAR ||
-                (Has_Confirm_Frame && Latest_Vision.frame_seq == Last_Confirm_Frame_Seq))
+            if (Latest_Vision.camera_view != CAMERA_VIEW_NEAR)
+            {
+                Confirm_Count = 0U;
+                Has_Confirm_Frame = false;
+                break;
+            }
+            if (Has_Confirm_Frame && Latest_Vision.frame_seq == Last_Confirm_Frame_Seq)
             {
                 break;
             }

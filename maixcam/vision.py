@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .config import RescueVisionConfig
 from .protocol import (
@@ -65,6 +65,8 @@ class Blob:
     h: int
     pixels: int
     density: float = 1.0  # pixels / (w * h)
+    in_corral: Optional[bool] = None
+    in_sweep: Optional[bool] = None
 
     @property
     def cx(self) -> float:
@@ -852,11 +854,17 @@ class RescueVisionProcessor:
             corral_roi = self.cfg.near_corral_roi
             sweep_roi = self.cfg.near_sweep_roi
 
-            green_cnt = sum(1 for b in blocks if b.label == "green" and _blob_in_roi(b, corral_roi))
-            black_cnt = sum(1 for b in blocks if b.label == "black" and _blob_in_roi(b, corral_roi))
-            orange_cnt = sum(1 for b in blocks if b.label == "orange" and _blob_in_roi(b, corral_roi))
-            cyan_cnt = sum(1 for b in hazards if _blob_in_roi(b, corral_roi))
-            unknown_cnt = sum(1 for b in unknowns if _blob_in_roi(b, corral_roi))
+            def _in_corral(b: Blob) -> bool:
+                return b.in_corral if b.in_corral is not None else _blob_in_roi(b, corral_roi)
+
+            def _in_sweep(b: Blob) -> bool:
+                return b.in_sweep if b.in_sweep is not None else _blob_in_roi(b, sweep_roi)
+
+            green_cnt = sum(1 for b in blocks if b.label == "green" and _in_corral(b))
+            black_cnt = sum(1 for b in blocks if b.label == "black" and _in_corral(b))
+            orange_cnt = sum(1 for b in blocks if b.label == "orange" and _in_corral(b))
+            cyan_cnt = sum(1 for b in hazards if _in_corral(b))
+            unknown_cnt = sum(1 for b in unknowns if _in_corral(b))
 
             state.corral_green_cnt = min(255, green_cnt)
             state.corral_black_cnt = min(255, black_cnt)
@@ -868,8 +876,8 @@ class RescueVisionProcessor:
             if corral_safe:
                 flags |= VIS_FLAG_CORRAL_SAFE
 
-            # Sweep zone must be clear of ANY block, cyan hazard, or unknown foreground.
-            sweep_occupied = any(_blob_in_roi(b, sweep_roi) for b in blocks + hazards + unknowns)
+            # Sweep zone must be clear of ANY block, cyan hazard, or unknown foreground with actual pixels in sweep_roi.
+            sweep_occupied = any(_in_sweep(b) for b in blocks + hazards + unknowns)
             if not sweep_occupied:
                 flags |= VIS_FLAG_SWEEP_CLEAR
 
@@ -1261,12 +1269,49 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                 seen_scan_rois.add(key)
                 scan_rois.append((clipped, merge_fg))
 
-        emitted_unknown_rects = set(emitted_rejected_object_rects)
+        corral_clipped = _clip_roi(cfg.near_corral_roi)
+        sweep_clipped = _clip_roi(cfg.near_sweep_roi)
+
+        def _pts_hit_roi(pts: Sequence[Tuple[int, int]], target: Optional[Tuple[int, int, int, int]]) -> bool:
+            if target is None:
+                return False
+            tx1, ty1, tw, th = target
+            tx2, ty2 = tx1 + tw, ty1 + th
+            return any(tx1 <= px < tx2 and ty1 <= py < ty2 for px, py in pts)
+
+        emitted_unknown_idx: Dict[Tuple[int, int, int, int], int] = {}
+
+        def _emit_unknown(unk: Blob) -> None:
+            rect = (unk.x, unk.y, unk.w, unk.h)
+            if rect in emitted_rejected_object_rects:
+                return
+            prev_idx = emitted_unknown_idx.get(rect)
+            if prev_idx is None:
+                emitted_unknown_idx[rect] = len(blobs)
+                blobs.append(unk)
+            else:
+                prev = blobs[prev_idx]
+                ic = (
+                    (bool(prev.in_corral) or bool(unk.in_corral))
+                    if (prev.in_corral is not None or unk.in_corral is not None)
+                    else None
+                )
+                isw = (
+                    (bool(prev.in_sweep) or bool(unk.in_sweep))
+                    if (prev.in_sweep is not None or unk.in_sweep is not None)
+                    else None
+                )
+                if ic != prev.in_corral or isw != prev.in_sweep or unk.pixels > prev.pixels:
+                    px = max(prev.pixels, unk.pixels)
+                    blobs[prev_idx] = Blob(
+                        "unknown", prev.x, prev.y, prev.w, prev.h, px, min(1.0, px / float(prev.w * prev.h)), ic, isw
+                    )
 
         # Tier 1: Exact per-pixel verified connected-component mask + tight unexplained connected components!
         if get_lab is not None:
             fw, fh = cfg.frame_width, cfg.frame_height
             explained = [[False] * fw for _ in range(fh)]
+            comp_pts_by_key: Dict[Tuple[str, int, int, int, int, int], List[Tuple[int, int]]] = {}
             for label in (_SURFACE_LABELS + _OBJECT_LABELS):
                 vlist = verified_by_label[label]
                 if not vlist or label not in cfg.lab_thresholds:
@@ -1307,14 +1352,68 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                         cnt = len(comp_pts)
                         cand_blob = Blob(label, min_x, min_y, cw, ch, cnt, cnt / float(cw * ch))
                         if _is_verified_blob_for_label(cand_blob, cfg):
+                            comp_pts_by_key[(label, min_x, min_y, cw, ch, cnt)] = comp_pts
                             for px_x, px_y in comp_pts:
                                 explained[px_y][px_x] = True
+
+            # Annotate all object/hazard blobs with exact pixel-clipped corral/sweep occupancy.
+            for idx_b, b in enumerate(blobs):
+                if b.label not in _OBJECT_LABELS:
+                    continue
+                if b.pixels >= b.w * b.h:
+                    ic = corral_clipped is not None and _rects_intersect(b.x, b.y, b.w, b.h, *corral_clipped)
+                    isw = sweep_clipped is not None and _rects_intersect(b.x, b.y, b.w, b.h, *sweep_clipped)
+                else:
+                    pts = comp_pts_by_key.get((b.label, b.x, b.y, b.w, b.h, b.pixels))
+                    if pts is None and b.label in cfg.lab_thresholds:
+                        thresh_b = cfg.lab_thresholds[b.label]
+                        bx1, by1, bx2, by2 = max(0, b.x), max(0, b.y), min(fw, b.x2), min(fh, b.y2)
+                        vis_b = [[False] * (bx2 - bx1) for _ in range(by2 - by1)]
+                        for yy in range(by1, by2):
+                            for xx in range(bx1, bx2):
+                                if vis_b[yy - by1][xx - bx1] or not _lab_in_thresh(get_lab(xx, yy), thresh_b):
+                                    continue
+                                st_b = [(xx, yy)]
+                                vis_b[yy - by1][xx - bx1] = True
+                                c_pts: List[Tuple[int, int]] = []
+                                mn_x = mx_x = xx
+                                mn_y = mx_y = yy
+                                while st_b:
+                                    cx, cy = st_b.pop()
+                                    c_pts.append((cx, cy))
+                                    if cx < mn_x:
+                                        mn_x = cx
+                                    if cx > mx_x:
+                                        mx_x = cx
+                                    if cy < mn_y:
+                                        mn_y = cy
+                                    if cy > mx_y:
+                                        mx_y = cy
+                                    for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+                                        if bx1 <= nx < bx2 and by1 <= ny < by2 and not vis_b[ny - by1][nx - bx1]:
+                                            if _lab_in_thresh(get_lab(nx, ny), thresh_b):
+                                                vis_b[ny - by1][nx - bx1] = True
+                                                st_b.append((nx, ny))
+                                if (mn_x, mn_y, mx_x - mn_x + 1, mx_y - mn_y + 1, len(c_pts)) == (
+                                    b.x, b.y, b.w, b.h, b.pixels
+                                ):
+                                    pts = c_pts
+                                    break
+                            if pts is not None:
+                                break
+                    if pts is not None:
+                        ic = _pts_hit_roi(pts, corral_clipped)
+                        isw = _pts_hit_roi(pts, sweep_clipped)
+                    else:
+                        ic = corral_clipped is not None and _rects_intersect(b.x, b.y, b.w, b.h, *corral_clipped)
+                        isw = sweep_clipped is not None and _rects_intersect(b.x, b.y, b.w, b.h, *sweep_clipped)
+                blobs[idx_b] = Blob(b.label, b.x, b.y, b.w, b.h, b.pixels, b.density, ic, isw)
 
             for roi, merge_small in scan_rois:
                 rx, ry, rw, rh = roi
                 x1, y1, x2, y2 = rx, ry, rx + rw, ry + rh
                 vis_u = [[False] * rw for _ in range(rh)]
-                small_comps: List[Tuple[int, int, int, int, int]] = []
+                small_comps: List[Tuple[int, int, int, int, int, bool, bool]] = []
                 for yy in range(y1, y2):
                     for xx in range(x1, x2):
                         if vis_u[yy - y1][xx - x1] or explained[yy][xx]:
@@ -1323,11 +1422,13 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                             continue
                         stack = [(xx, yy)]
                         vis_u[yy - y1][xx - x1] = True
+                        u_pts: List[Tuple[int, int]] = []
                         min_x = max_x = xx
                         min_y = max_y = yy
                         cnt = 0
                         while stack:
                             cx, cy = stack.pop()
+                            u_pts.append((cx, cy))
                             cnt += 1
                             if cx < min_x:
                                 min_x = cx
@@ -1348,13 +1449,12 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                                         stack.append((nx, ny))
                         cw = max_x - min_x + 1
                         ch = max_y - min_y + 1
+                        u_ic = _pts_hit_roi(u_pts, corral_clipped)
+                        u_isw = _pts_hit_roi(u_pts, sweep_clipped)
                         if cnt >= cfg.min_hazard_pixels:
-                            rect = (min_x, min_y, cw, ch)
-                            if rect not in emitted_unknown_rects:
-                                emitted_unknown_rects.add(rect)
-                                blobs.append(Blob("unknown", min_x, min_y, cw, ch, cnt, cnt / float(cw * ch)))
+                            _emit_unknown(Blob("unknown", min_x, min_y, cw, ch, cnt, cnt / float(cw * ch), u_ic, u_isw))
                         elif merge_small:
-                            small_comps.append((min_x, min_y, max_x + 1, max_y + 1, cnt))
+                            small_comps.append((min_x, min_y, max_x + 1, max_y + 1, cnt, u_ic, u_isw))
                 if merge_small and small_comps:
                     tot = sum(c[4] for c in small_comps)
                     if tot >= cfg.min_hazard_pixels:
@@ -1363,10 +1463,9 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                         mx2 = max(c[2] for c in small_comps)
                         my2 = max(c[3] for c in small_comps)
                         mw, mh = max(1, mx2 - mx1), max(1, my2 - my1)
-                        rect = (mx1, my1, mw, mh)
-                        if rect not in emitted_unknown_rects:
-                            emitted_unknown_rects.add(rect)
-                            blobs.append(Blob("unknown", mx1, my1, mw, mh, tot, min(1.0, tot / float(mw * mh))))
+                        m_ic = any(c[5] for c in small_comps)
+                        m_isw = any(c[6] for c in small_comps)
+                        _emit_unknown(Blob("unknown", mx1, my1, mw, mh, tot, min(1.0, tot / float(mw * mh)), m_ic, m_isw))
             return blobs
 
         # Tier 2: Real MaixPy Image exact component-level unknown detection using ONLY crop/binary/find_blobs!
@@ -1421,11 +1520,55 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                     if not covered_by_other:
                         unverified_set_b.append(c)
 
-            corral_clipped = _clip_roi(cfg.near_corral_roi)
             rle_cache: Dict[
                 Tuple[str, Tuple[int, int, int, int]],
                 Tuple[List[List[int]], List[Tuple[int, int, int, int, int]], bool],
             ] = {}
+
+            def _rle_fill_mask(
+                src_img,
+                thresh_list,
+                box: Tuple[int, int, int, int],
+                grid: List[List[bool]],
+                ox: int,
+                oy: int,
+                val: bool = True,
+            ) -> None:
+                bx1, by1, bx2, by2 = box
+                bw, bh = bx2 - bx1, by2 - by1
+                if bw <= 0 or bh <= 0:
+                    return
+                gh = len(grid)
+                gw = len(grid[0]) if gh else 0
+                if bh <= bw:
+                    for yy in range(by1, by2):
+                        gy = yy - oy
+                        if not (0 <= gy < gh):
+                            continue
+                        row_g = grid[gy]
+                        for run in _find_blobs_unit_stride(
+                            src_img, thresh_list, roi=(bx1, yy, bw, 1), pixels_threshold=1, area_threshold=1, merge=False
+                        ):
+                            rx1 = max(bx1, int(run.x()))
+                            rx2 = min(bx2, int(run.x()) + max(1, int(run.w())))
+                            for xx in range(rx1, rx2):
+                                gx = xx - ox
+                                if 0 <= gx < gw:
+                                    row_g[gx] = val
+                else:
+                    for xx in range(bx1, bx2):
+                        gx = xx - ox
+                        if not (0 <= gx < gw):
+                            continue
+                        for run in _find_blobs_unit_stride(
+                            src_img, thresh_list, roi=(xx, by1, 1, bh), pixels_threshold=1, area_threshold=1, merge=False
+                        ):
+                            ry1 = max(by1, int(run.y()))
+                            ry2 = min(by2, int(run.y()) + max(1, int(run.h())))
+                            for yy in range(ry1, ry2):
+                                gy = yy - oy
+                                if 0 <= gy < gh:
+                                    grid[gy][gx] = val
 
             def _resolve_exact_label_components(
                 label: str,
@@ -1641,67 +1784,363 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                         )
                 return out_exact
 
+            def _obj_blob_hits_roi_tier2(b: Blob, target: Optional[Tuple[int, int, int, int]]) -> bool:
+                if target is None:
+                    return False
+                inter = _rect_intersection(b.x, b.y, b.w, b.h, *target)
+                if inter is None:
+                    return False
+                if b.pixels >= b.w * b.h:
+                    return True
+                t_b = cfg.lab_thresholds.get(b.label)
+                if t_b is None:
+                    return True
+                ix1, iy1, ix2, iy2 = inter
+                hits = _find_blobs_unit_stride(
+                    img, [tuple(t_b)], roi=(ix1, iy1, ix2 - ix1, iy2 - iy1), pixels_threshold=1, area_threshold=1, merge=False
+                )
+                if not hits:
+                    return False
+                others = [
+                    o
+                    for o in (verified_by_label.get(b.label, []) + unverified_by_label.get(b.label, []))
+                    if o is not b and _rects_intersect(ix1, iy1, ix2 - ix1, iy2 - iy1, o.x, o.y, o.w, o.h)
+                ]
+                if not others:
+                    return True
+                parents = [b] + others
+                ux1 = min(ix1, *(p.x for p in parents))
+                uy1 = min(iy1, *(p.y for p in parents))
+                ux2 = max(ix2, *(p.x2 for p in parents))
+                uy2 = max(iy2, *(p.y2 for p in parents))
+                exp_g = {(p.x, p.y, p.w, p.h, p.pixels) for p in parents}
+                cid_grid, geoms, _ = _resolve_exact_label_components(b.label, t_b, (ux1, uy1, ux2, uy2), exp_g)
+                b_geom = (b.x, b.y, b.w, b.h, b.pixels)
+                b_cids = {cid for cid, g in enumerate(geoms) if g == b_geom}
+                for yy in range(iy1, iy2):
+                    row_c = cid_grid[yy - uy1]
+                    for xx in range(ix1, ix2):
+                        if row_c[xx - ux1] in b_cids:
+                            return True
+                return False
+
+            for idx_b, b in enumerate(blobs):
+                if b.label not in _OBJECT_LABELS:
+                    continue
+                blobs[idx_b] = Blob(
+                    b.label,
+                    b.x,
+                    b.y,
+                    b.w,
+                    b.h,
+                    b.pixels,
+                    b.density,
+                    _obj_blob_hits_roi_tier2(b, corral_clipped),
+                    _obj_blob_hits_roi_tier2(b, sweep_clipped),
+                )
+
+            def _fill_unverified_comp_in_grid(
+                c: Blob, box: Tuple[int, int, int, int], grid: List[List[bool]], ox: int, oy: int
+            ) -> None:
+                c_thresh = cfg.lab_thresholds.get(c.label)
+                if c_thresh is None:
+                    return
+                inter = _rect_intersection(box[0], box[1], box[2] - box[0], box[3] - box[1], c.x, c.y, c.w, c.h)
+                if inter is None:
+                    return
+                ix1, iy1, ix2, iy2 = inter
+                others = [
+                    o
+                    for o in (verified_by_label.get(c.label, []) + unverified_by_label.get(c.label, []))
+                    if o is not c and _rects_intersect(ix1, iy1, ix2 - ix1, iy2 - iy1, o.x, o.y, o.w, o.h)
+                ]
+                if not others:
+                    _rle_fill_mask(img, [tuple(c_thresh)], inter, grid, ox, oy, True)
+                    return
+                parents = [c] + others
+                ux1 = min(ix1, *(p.x for p in parents))
+                uy1 = min(iy1, *(p.y for p in parents))
+                ux2 = max(ix2, *(p.x2 for p in parents))
+                uy2 = max(iy2, *(p.y2 for p in parents))
+                exp_g = {(p.x, p.y, p.w, p.h, p.pixels) for p in parents}
+                cid_grid, geoms, _ = _resolve_exact_label_components(c.label, c_thresh, (ux1, uy1, ux2, uy2), exp_g)
+                v_geoms = {(v.x, v.y, v.w, v.h, v.pixels) for v in verified_by_label.get(c.label, [])}
+                c_geom = (c.x, c.y, c.w, c.h, c.pixels)
+                c_cids = {cid for cid, g in enumerate(geoms) if g == c_geom and g not in v_geoms}
+                for yy in range(iy1, iy2):
+                    row_c = cid_grid[yy - uy1]
+                    row_g = grid[yy - oy]
+                    for xx in range(ix1, ix2):
+                        if row_c[xx - ux1] in c_cids:
+                            row_g[xx - ox] = True
+
+            def _clear_verified_other_in_grid(
+                other_label: str, box: Tuple[int, int, int, int], grid: List[List[bool]], ox: int, oy: int
+            ) -> None:
+                o_thresh = cfg.lab_thresholds.get(other_label)
+                if o_thresh is None:
+                    return
+                v_hit = [
+                    v
+                    for v in verified_by_label.get(other_label, [])
+                    if _rects_intersect(box[0], box[1], box[2] - box[0], box[3] - box[1], v.x, v.y, v.w, v.h)
+                ]
+                if not v_hit:
+                    return
+                u_hit = [
+                    u
+                    for u in unverified_by_label.get(other_label, [])
+                    if _rects_intersect(box[0], box[1], box[2] - box[0], box[3] - box[1], u.x, u.y, u.w, u.h)
+                ]
+                if not u_hit:
+                    for v in v_hit:
+                        inter = _rect_intersection(box[0], box[1], box[2] - box[0], box[3] - box[1], v.x, v.y, v.w, v.h)
+                        if inter is not None:
+                            _rle_fill_mask(img, [tuple(o_thresh)], inter, grid, ox, oy, False)
+                    return
+                parents = v_hit + u_hit
+                ux1 = min(box[0], *(p.x for p in parents))
+                uy1 = min(box[1], *(p.y for p in parents))
+                ux2 = max(box[2], *(p.x2 for p in parents))
+                uy2 = max(box[3], *(p.y2 for p in parents))
+                exp_g = {(p.x, p.y, p.w, p.h, p.pixels) for p in parents}
+                cid_grid, geoms, _ = _resolve_exact_label_components(other_label, o_thresh, (ux1, uy1, ux2, uy2), exp_g)
+                v_geoms = {(v.x, v.y, v.w, v.h, v.pixels) for v in v_hit}
+                v_cids = {cid for cid, g in enumerate(geoms) if g in v_geoms}
+                for yy in range(box[1], box[3]):
+                    row_c = cid_grid[yy - uy1]
+                    row_g = grid[yy - oy]
+                    for xx in range(box[0], box[2]):
+                        if row_c[xx - ux1] in v_cids:
+                            row_g[xx - ox] = False
+
+            def _extract_8conn_from_grid(
+                grid: List[List[bool]], ox: int, oy: int, merge_small_flag: bool
+            ) -> None:
+                gh = len(grid)
+                gw = len(grid[0]) if gh else 0
+                vis_g = [[False] * gw for _ in range(gh)]
+                small_g: List[Tuple[int, int, int, int, int, bool, bool]] = []
+                for gy in range(gh):
+                    row_g = grid[gy]
+                    for gx in range(gw):
+                        if vis_g[gy][gx] or not row_g[gx]:
+                            continue
+                        vis_g[gy][gx] = True
+                        st_g = [(gx, gy)]
+                        pts_g: List[Tuple[int, int]] = []
+                        mn_x = mx_x = gx
+                        mn_y = mx_y = gy
+                        cnt = 0
+                        while st_g:
+                            cx, cy = st_g.pop()
+                            pts_g.append((ox + cx, oy + cy))
+                            cnt += 1
+                            if cx < mn_x:
+                                mn_x = cx
+                            if cx > mx_x:
+                                mx_x = cx
+                            if cy < mn_y:
+                                mn_y = cy
+                            if cy > mx_y:
+                                mx_y = cy
+                            for dx, dy in (
+                                (-1, -1), (0, -1), (1, -1),
+                                (-1, 0), (1, 0),
+                                (-1, 1), (0, 1), (1, 1),
+                            ):
+                                nx, ny = cx + dx, cy + dy
+                                if 0 <= nx < gw and 0 <= ny < gh and not vis_g[ny][nx] and grid[ny][nx]:
+                                    vis_g[ny][nx] = True
+                                    st_g.append((nx, ny))
+                        cw = mx_x - mn_x + 1
+                        ch = mx_y - mn_y + 1
+                        u_ic = _pts_hit_roi(pts_g, corral_clipped)
+                        u_isw = _pts_hit_roi(pts_g, sweep_clipped)
+                        if cnt >= cfg.min_hazard_pixels:
+                            _emit_unknown(
+                                Blob("unknown", ox + mn_x, oy + mn_y, cw, ch, cnt, cnt / float(cw * ch), u_ic, u_isw)
+                            )
+                        elif merge_small_flag:
+                            small_g.append((ox + mn_x, oy + mn_y, ox + mx_x + 1, oy + mx_y + 1, cnt, u_ic, u_isw))
+                if merge_small_flag and small_g:
+                    tot = sum(c[4] for c in small_g)
+                    if tot >= cfg.min_hazard_pixels:
+                        mx1 = min(c[0] for c in small_g)
+                        my1 = min(c[1] for c in small_g)
+                        mx2 = max(c[2] for c in small_g)
+                        my2 = max(c[3] for c in small_g)
+                        mw, mh = max(1, mx2 - mx1), max(1, my2 - my1)
+                        m_ic = any(c[5] for c in small_g)
+                        m_isw = any(c[6] for c in small_g)
+                        _emit_unknown(
+                            Blob("unknown", mx1, my1, mw, mh, tot, min(1.0, tot / float(mw * mh)), m_ic, m_isw)
+                        )
+
             for roi, merge_small in scan_rois:
                 rx, ry, rw, rh = roi
                 roi_img = img.crop(rx, ry, rw, rh)
                 matched_mask = roi_img.binary(all_known_thresholds, invert=False, copy=True)
                 uncal_raw = _find_blobs_unit_stride(matched_mask, black, pixels_threshold=1, area_threshold=1, merge=False)
+
+                roi_set_b: List[Blob] = []
+                seen_unverified_geoms = set()
+                for c in unverified_set_b:
+                    comp_key = (c.label, c.x, c.y, c.w, c.h, c.pixels)
+                    if comp_key in seen_unverified_geoms:
+                        continue
+                    if not _rects_intersect(rx, ry, rw, rh, c.x, c.y, c.w, c.h):
+                        continue
+                    seen_unverified_geoms.add(comp_key)
+                    roi_set_b.append(c)
+
+                # Detect whether any overlapping custom LAB bands can share pixels inside this ROI
+                # (either across two Set-B labels or between Set-B and an overlapping verified class).
+                roi_b_labels = sorted({c.label for c in roi_set_b if c.label in cfg.lab_thresholds})
+                has_band_overlap = False
+                for i_lbl in range(len(roi_b_labels)):
+                    ti = cfg.lab_thresholds[roi_b_labels[i_lbl]]
+                    for j_lbl in range(i_lbl + 1, len(roi_b_labels)):
+                        if _lab_ranges_overlap(ti, cfg.lab_thresholds[roi_b_labels[j_lbl]]):
+                            has_band_overlap = True
+                            break
+                    if has_band_overlap:
+                        break
+                overlapping_verified_others: List[str] = []
+                for other in (_SURFACE_LABELS + _OBJECT_LABELS):
+                    if other not in cfg.lab_thresholds or not verified_by_label[other]:
+                        continue
+                    to = cfg.lab_thresholds[other]
+                    if any(other != lbl and _lab_ranges_overlap(cfg.lab_thresholds[lbl], to) for lbl in roi_b_labels):
+                        if any(_rects_intersect(rx, ry, rw, rh, v.x, v.y, v.w, v.h) for v in verified_by_label[other]):
+                            overlapping_verified_others.append(other)
+                            has_band_overlap = True
+
+                if has_band_overlap:
+                    # Exact unique-pixel boolean union across Set A + all active Set-B labels minus
+                    # verified overlapping-band pixels -> zero double-counting across LAB bands!
+                    cand_boxes: List[Tuple[int, int, int, int]] = []
+                    for item in uncal_raw:
+                        ix1 = rx + int(item.x())
+                        iy1 = ry + int(item.y())
+                        cand_boxes.append((ix1, iy1, ix1 + max(1, int(item.w())), iy1 + max(1, int(item.h()))))
+                    for c in roi_set_b:
+                        inter = _rect_intersection(rx, ry, rw, rh, c.x, c.y, c.w, c.h)
+                        if inter is not None:
+                            cand_boxes.append(inter)
+                    if cand_boxes:
+                        bx1 = max(rx, min(b[0] for b in cand_boxes))
+                        by1 = max(ry, min(b[1] for b in cand_boxes))
+                        bx2 = min(rx + rw, max(b[2] for b in cand_boxes))
+                        by2 = min(ry + rh, max(b[3] for b in cand_boxes))
+                        if bx2 > bx1 and by2 > by1:
+                            unk_grid = [[False] * (bx2 - bx1) for _ in range(by2 - by1)]
+                            for item in uncal_raw:
+                                mx1 = int(item.x())
+                                my1 = int(item.y())
+                                mx2 = mx1 + max(1, int(item.w()))
+                                my2 = my1 + max(1, int(item.h()))
+                                _rle_fill_mask(matched_mask, black, (mx1, my1, mx2, my2), unk_grid, bx1 - rx, by1 - ry, True)
+                            for c in roi_set_b:
+                                _fill_unverified_comp_in_grid(c, (bx1, by1, bx2, by2), unk_grid, bx1, by1)
+                            for other in overlapping_verified_others:
+                                _clear_verified_other_in_grid(other, (bx1, by1, bx2, by2), unk_grid, bx1, by1)
+                            _extract_8conn_from_grid(unk_grid, bx1, by1, merge_small)
+                    continue
+
                 roi_cands: List[Blob] = []
                 for item in uncal_raw:
                     w = max(1, int(item.w()))
                     h = max(1, int(item.h()))
                     px = int(item.pixels())
                     roi_cands.append(Blob("unknown", rx + int(item.x()), ry + int(item.y()), w, h, px, px / float(w * h)))
-                seen_unverified_geoms = set()
-                for c in unverified_set_b:
-                    comp_key = (c.label, c.x, c.y, c.w, c.h, c.pixels)
-                    if comp_key in seen_unverified_geoms:
-                        continue
-                    seen_unverified_geoms.add(comp_key)
+                for c in roi_set_b:
                     inter = _rect_intersection(rx, ry, rw, rh, c.x, c.y, c.w, c.h)
                     if inter is None:
                         continue
                     ix1, iy1, ix2, iy2 = inter
                     iw, ih = max(1, ix2 - ix1), max(1, iy2 - iy1)
                     if ix1 == c.x and iy1 == c.y and iw == c.w and ih == c.h:
-                        # If a concave unverified component fits inside a wide ROI while its AABB overlaps
-                        # corral_roi with ZERO actual pixels inside corral_roi, split outside corral_roi so
-                        # it never falsely inflates corral_unknown_cnt!
-                        if (
-                            corral_clipped is not None
-                            and roi != corral_clipped
-                            and c.pixels < c.w * c.h
-                            and _rects_intersect(c.x, c.y, c.w, c.h, *corral_clipped)
-                        ):
-                            ci = _rect_intersection(c.x, c.y, c.w, c.h, *corral_clipped)
-                            in_corral = (
-                                _actual_unverified_subblobs_in_rect(c, ci[0], ci[1], ci[2] - ci[0], ci[3] - ci[1])
-                                if ci is not None
-                                else []
-                            )
-                            if not in_corral and ci is not None:
-                                cx1, cy1, cx2, cy2 = ci
-                                strips = (
-                                    (c.x, c.y, c.w, cy1 - c.y),
-                                    (c.x, cy2, c.w, c.y2 - cy2),
-                                    (c.x, cy1, cx1 - c.x, cy2 - cy1),
-                                    (cx2, cy1, c.x2 - cx2, cy2 - cy1),
-                                )
-                                for sx, sy, sw, sh in strips:
-                                    roi_cands.extend(_actual_unverified_subblobs_in_rect(c, sx, sy, sw, sh))
-                                continue
                         roi_cands.append(Blob("unknown", c.x, c.y, c.w, c.h, c.pixels, c.density))
                     else:
                         roi_cands.extend(_actual_unverified_subblobs_in_rect(c, ix1, iy1, iw, ih))
+
+                def _unknown_hits_roi_tier2(
+                    unk: Blob, target: Optional[Tuple[int, int, int, int]], require_min_comp: bool
+                ) -> bool:
+                    if target is None:
+                        return False
+                    if roi == target:
+                        return True
+                    ci = _rect_intersection(unk.x, unk.y, unk.w, unk.h, *target)
+                    if ci is None:
+                        return False
+                    if unk.pixels >= unk.w * unk.h:
+                        return True
+                    cx1, cy1, cx2, cy2 = ci
+                    has_raw_hit = bool(
+                        _find_blobs_unit_stride(
+                            matched_mask,
+                            black,
+                            roi=(cx1 - rx, cy1 - ry, cx2 - cx1, cy2 - cy1),
+                            pixels_threshold=1,
+                            area_threshold=1,
+                            merge=False,
+                        )
+                    )
+                    if not has_raw_hit:
+                        for c in roi_set_b:
+                            if _rects_intersect(cx1, cy1, cx2 - cx1, cy2 - cy1, c.x, c.y, c.w, c.h):
+                                if _actual_unverified_subblobs_in_rect(c, cx1, cy1, cx2 - cx1, cy2 - cy1):
+                                    has_raw_hit = True
+                                    break
+                    if not has_raw_hit:
+                        return False
+                    # Verify that the hit pixel inside ci actually belongs to unk's connected component
+                    # (not a sub-threshold stray speck sitting inside a concave AABB corner).
+                    bx1, by1, bx2, by2 = unk.x, unk.y, unk.x2, unk.y2
+                    ugrid = [[False] * (bx2 - bx1) for _ in range(by2 - by1)]
+                    _rle_fill_mask(
+                        matched_mask, black, (bx1 - rx, by1 - ry, bx2 - rx, by2 - ry), ugrid, bx1 - rx, by1 - ry, True
+                    )
+                    for c in roi_set_b:
+                        _fill_unverified_comp_in_grid(c, (bx1, by1, bx2, by2), ugrid, bx1, by1)
+                    gh, gw = by2 - by1, bx2 - bx1
+                    vis_u = [[False] * gw for _ in range(gh)]
+                    for gy in range(gh):
+                        for gx in range(gw):
+                            if vis_u[gy][gx] or not ugrid[gy][gx]:
+                                continue
+                            vis_u[gy][gx] = True
+                            st_u = [(gx, gy)]
+                            cnt = 0
+                            hit_ci = False
+                            while st_u:
+                                px_x, px_y = st_u.pop()
+                                cnt += 1
+                                gx_abs, gy_abs = bx1 + px_x, by1 + px_y
+                                if cx1 <= gx_abs < cx2 and cy1 <= gy_abs < cy2:
+                                    hit_ci = True
+                                for dx, dy in (
+                                    (-1, -1), (0, -1), (1, -1),
+                                    (-1, 0), (1, 0),
+                                    (-1, 1), (0, 1), (1, 1),
+                                ):
+                                    nx, ny = px_x + dx, px_y + dy
+                                    if 0 <= nx < gw and 0 <= ny < gh and not vis_u[ny][nx] and ugrid[ny][nx]:
+                                        vis_u[ny][nx] = True
+                                        st_u.append((nx, ny))
+                            if hit_ci and (not require_min_comp or cnt >= cfg.min_hazard_pixels):
+                                return True
+                    return False
 
                 merged_cands = _merge_adjacent_unknowns(roi_cands)
                 small_cands: List[Blob] = []
                 for unk in merged_cands:
                     if unk.pixels >= cfg.min_hazard_pixels:
-                        rect = (unk.x, unk.y, unk.w, unk.h)
-                        if rect not in emitted_unknown_rects:
-                            emitted_unknown_rects.add(rect)
-                            blobs.append(unk)
+                        u_ic = _unknown_hits_roi_tier2(unk, corral_clipped, require_min_comp=True)
+                        u_isw = _unknown_hits_roi_tier2(unk, sweep_clipped, require_min_comp=True)
+                        _emit_unknown(Blob("unknown", unk.x, unk.y, unk.w, unk.h, unk.pixels, unk.density, u_ic, u_isw))
                     elif merge_small:
                         small_cands.append(unk)
                 if merge_small and small_cands:
@@ -1712,13 +2151,15 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                         mx2 = max(b.x2 for b in small_cands)
                         my2 = max(b.y2 for b in small_cands)
                         mw, mh = max(1, mx2 - mx1), max(1, my2 - my1)
-                        rect = (mx1, my1, mw, mh)
-                        if rect not in emitted_unknown_rects:
-                            emitted_unknown_rects.add(rect)
-                            blobs.append(Blob("unknown", mx1, my1, mw, mh, tot, min(1.0, tot / float(mw * mh))))
+                        m_ic = any(_unknown_hits_roi_tier2(b, corral_clipped, require_min_comp=False) for b in small_cands)
+                        m_isw = any(_unknown_hits_roi_tier2(b, sweep_clipped, require_min_comp=False) for b in small_cands)
+                        _emit_unknown(
+                            Blob("unknown", mx1, my1, mw, mh, tot, min(1.0, tot / float(mw * mh)), m_ic, m_isw)
+                        )
             return blobs
 
         # Tier 3: Fallback for find_blobs-only mocks without pixel access or binary().
+        emitted_unknown_rects = set(emitted_rejected_object_rects) | set(emitted_unknown_idx.keys())
         for roi, merge_fg in scan_rois:
             fg_blobs = _find_blobs_unit_stride(
                 img,

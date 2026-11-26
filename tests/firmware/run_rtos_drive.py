@@ -735,7 +735,30 @@ int main(int argc, char **argv) {
         }
         assert(Gate_Servo.Get_Current_Us() == Gate_Open_Us && Gate_Servo.Is_Settled());
         assert(Rescue_Mission.Get_State() == MISSION_INSPECT_CORRAL);
-        std::puts("PASS: UART RX fault mid-gate-close immediately aborts blind closure and retracts gate to open");
+
+        // Finding 1 (R10c): Recover UART, re-enter MISSION_CLOSE_GATE_VERIFY, and feed healthy advancing
+        // FAR frames for 600 ms while gate is still closing (!Is_Settled) -> MUST IMMEDIATELY abort
+        // closure on the first wrong-view frame and retract gate back to Gate_Open_Us!
+        huart1.rx_healthy = true;
+        Step(++tm, false);
+        for (int k = 0; k < 1000 && Rescue_Mission.Get_State() == MISSION_INSPECT_CORRAL; ++k) {
+            ++tm;
+            if ((tm % 25U) == 0U) { feed_gate(CAMERA_VIEW_NEAR, VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR, 1U); }
+            Step(tm, false);
+        }
+        assert(Rescue_Mission.Get_State() == MISSION_CLOSE_GATE_VERIFY);
+        const uint16_t before_wrong_view_us = Gate_Servo.Get_Current_Us();
+        assert(before_wrong_view_us < Gate_Closed_Us && !Gate_Servo.Is_Settled());
+        for (unsigned elapsed = 0U; elapsed < 600U; ++elapsed) {
+            if ((elapsed % 25U) == 0U) { feed_gate(CAMERA_VIEW_FAR, VIS_FLAG_TARGET_VALID, 0U); }
+            Step(++tm, false);
+            assert((Telemetry_Snapshot.status_flags & TEL_FLAG_VISION_FRESH) != 0U);
+            assert(!Rescue_Mission.Is_Gate_Closed_Cmd());
+            assert(Gate_Servo.Get_Current_Us() <= before_wrong_view_us);
+        }
+        assert(Gate_Servo.Get_Current_Us() == Gate_Open_Us && Gate_Servo.Is_Settled());
+        assert(Rescue_Mission.Get_State() == MISSION_INSPECT_CORRAL);
+        std::puts("PASS: UART RX fault and wrong-view frames mid-gate-close immediately abort blind closure and retract gate to open");
         return 0;
     }
 

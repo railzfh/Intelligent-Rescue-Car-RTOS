@@ -241,6 +241,60 @@ static void Test_Cyan_Interrupts_Unsettled_Gate_Closure()
     bout = blind_m.Update(bin);
     assert(!bout.gate_closed);
     assert(blind_m.Get_State() == MISSION_INSPECT_CORRAL);
+
+    // Finding 1 (R10c): Healthy UART + fresh advancing FAR / TRANSITION frames while gate is closing
+    // (!gate_settled) MUST ALSO immediately abort blind closure (NEVER keep commanding closed for 600 ms!)
+    // and reset any confirmation streak when near view is lost even after settled!
+    for (int k = 0; k < 2; ++k)
+    {
+        bin.now_ms = (bt += 40U);
+        assert(blind_m.On_Vision_State(Make_Near_Vision(bseq++, 1U, 0U, 0U, 0U, 0U, safe), bt));
+        blind_m.Update(bin);
+    }
+    assert(blind_m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
+    assert(blind_m.Is_Gate_Closed_Cmd());
+
+    // Fresh FAR frame arrives while gate is still closing (!gate_settled) -> immediate abort!
+    bin.gate_settled = false;
+    bin.now_ms = (bt += 20U);
+    assert(blind_m.On_Vision_State(Make_Far_Vision(bseq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID), bt));
+    bout = blind_m.Update(bin);
+    assert(!bout.gate_closed);
+    assert(!blind_m.Is_Gate_Closed_Cmd());
+    assert(blind_m.Get_State() == MISSION_INSPECT_CORRAL);
+
+    // Re-enter CLOSE_GATE_VERIFY, settle gate, build 2 NEAR confirmation frames, then lose NEAR view
+    // (TRANSITION frame) -> gate stays safely closed (already settled), confirmation streak resets so
+    // a single subsequent NEAR frame CANNOT immediately advance to FIND_HOME!
+    bin.gate_settled = true;
+    for (int k = 0; k < 3; ++k)
+    {
+        bin.now_ms = (bt += 40U);
+        assert(blind_m.On_Vision_State(Make_Near_Vision(bseq++, 1U, 0U, 0U, 0U, 0U, safe), bt));
+        blind_m.Update(bin);
+    }
+    assert(blind_m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
+    for (int k = 0; k < 2; ++k)
+    {
+        bin.now_ms = (bt += 40U);
+        assert(blind_m.On_Vision_State(Make_Near_Vision(bseq++, 1U, 0U, 0U, 0U, 0U, safe), bt));
+        blind_m.Update(bin);
+    }
+    assert(blind_m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
+    // Inject TRANSITION frame -> resets confirmation streak while keeping settled gate stationary!
+    Struct_Vision_State trans{};
+    trans.frame_seq = bseq++;
+    trans.camera_view = CAMERA_VIEW_TRANSITION;
+    bin.now_ms = (bt += 40U);
+    assert(blind_m.On_Vision_State(trans, bt));
+    bout = blind_m.Update(bin);
+    assert(bout.gate_closed);
+    assert(blind_m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
+    // Single NEAR frame after TRANSITION MUST NOT advance to FIND_HOME (needs full 3-frame streak again)!
+    bin.now_ms = (bt += 40U);
+    assert(blind_m.On_Vision_State(Make_Near_Vision(bseq++, 1U, 0U, 0U, 0U, 0U, safe), bt));
+    blind_m.Update(bin);
+    assert(blind_m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
 }
 
 static void Test_Full_First_Green_Delivery_And_Proven_Rear_Corridor()

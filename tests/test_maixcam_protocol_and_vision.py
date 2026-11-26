@@ -1517,6 +1517,80 @@ class MaixcamVisionAndUITest(unittest.TestCase):
             self.assertEqual(st_ce_haz.corral_unknown_cnt, 1, cls.__name__)
             self.assertFalse(st_ce_haz.flags & VIS_FLAG_CORRAL_SAFE, cls.__name__)
 
+        # 6. Finding 2 (R10c): Overlapping custom LAB bands matching the SAME 40-px unverified patch
+        #    inside corral MUST count UNIQUE pixels (40 < min_hazard_pixels=60), NEVER double-counting
+        #    to 80 px! Also check partial overlap: 55 unique px stays safe, 60 unique px flags unsafe!
+        ov_band_cfg = RescueVisionConfig()
+        ov_band_cfg.lab_thresholds["orange"] = [35, 85, 18, 65, 20, 75]
+        ov_band_cfg.lab_thresholds["red_zone"] = [25, 75, 25, 78, 5, 45]  # overlaps orange on (50, 45, 30)!
+        shared_lab = (50, 45, 30)  # matches BOTH orange and red_zone!
+        orange_only_lab = (65, 45, 60)  # matches ONLY orange!
+        red_only_lab = (35, 45, 15)     # matches ONLY red_zone!
+        for cls in (_FakeMaixImage, _FakeMaixBinaryImage, _FakeMaixNativeStrideImage):
+            # 40-px (8x5) shared patch -> 40 unique px < 60 -> MUST NOT become 80-px unknown!
+            img_ov40 = cls(320, 240, floor_lab)
+            img_ov40.fill_rect(120, 150, 8, 5, shared_lab)
+            blobs_ov40 = extract_blobs_from_maix_image(img_ov40, ov_band_cfg, scan_unknown_near=True)
+            self.assertEqual([b for b in blobs_ov40 if b.label == "unknown"], [], cls.__name__)
+            st_ov40 = RescueVisionProcessor(ov_band_cfg).process(blobs_ov40, **kw)
+            self.assertEqual(st_ov40.corral_unknown_cnt, 0, cls.__name__)
+            self.assertTrue(st_ov40.flags & VIS_FLAG_CORRAL_SAFE, cls.__name__)
+
+            # Partial overlap: 20 orange-only + 15 shared + 20 red-only = 55 unique px (< 60 -> SAFE!),
+            # even though orange sees 35 px and red_zone sees 35 px (sum=70 >= 60)!
+            img_ov55 = cls(320, 240, floor_lab)
+            img_ov55.fill_rect(120, 150, 4, 5, orange_only_lab)  # 20 px
+            img_ov55.fill_rect(124, 150, 3, 5, shared_lab)       # 15 px
+            img_ov55.fill_rect(127, 150, 4, 5, red_only_lab)     # 20 px -> total unique = 55 px!
+            blobs_ov55 = extract_blobs_from_maix_image(img_ov55, ov_band_cfg, scan_unknown_near=True)
+            self.assertEqual([b for b in blobs_ov55 if b.label == "unknown"], [], cls.__name__)
+            st_ov55 = RescueVisionProcessor(ov_band_cfg).process(blobs_ov55, **kw)
+            self.assertEqual(st_ov55.corral_unknown_cnt, 0, cls.__name__)
+            self.assertTrue(st_ov55.flags & VIS_FLAG_CORRAL_SAFE, cls.__name__)
+
+            # Add 5 more red-only pixels -> 60 unique px (>= 60 -> UNSAFE across ALL tiers!).
+            img_ov55.fill_rect(131, 150, 1, 5, red_only_lab)
+            blobs_ov60 = extract_blobs_from_maix_image(img_ov55, ov_band_cfg, scan_unknown_near=True)
+            self.assertEqual(len([b for b in blobs_ov60 if b.label == "unknown"]), 1, cls.__name__)
+            st_ov60 = RescueVisionProcessor(ov_band_cfg).process(blobs_ov60, **kw)
+            self.assertEqual(st_ov60.corral_unknown_cnt, 1, cls.__name__)
+            self.assertFalse(st_ov60.flags & VIS_FLAG_CORRAL_SAFE, cls.__name__)
+
+        # 7. Finding 3 (R10c): With default ROIs (near_drop_roi=[40,20,240,108], near_sweep_roi=[232,118,64,106]),
+        #    an 84-px L-shaped unknown patch inside near_drop_roi with ZERO actual pixels inside near_sweep_roi
+        #    (even though its concave AABB overlaps near_sweep_roi!) MUST keep SWEEP_CLEAR=True and
+        #    CORRAL_SAFE=True while STILL blocking DROP_PATH_CLEAR=False across ALL three image tiers!
+        #    Same for a concave cyan hazard outside near_sweep_roi; and protruding into near_sweep_roi clears SWEEP_CLEAR!
+        cyan_lab = (68, -25, -20)
+        for cls in (_FakeMaixImage, _FakeMaixBinaryImage, _FakeMaixNativeStrideImage):
+            img_sw = cls(320, 240, floor_lab)
+            # L-shape strictly inside near_drop_roi (x: 40..280, y: 20..128) and strictly outside near_sweep_roi (x>=232, y>=118):
+            # top bar: (228, 115, 22, 2) -> 44 px (y=115..116 < 118)
+            # left bar: (228, 117, 4, 10) -> 40 px (x=228..231 < 232, y=117..126 < 128)
+            # Total = 84 px >= 60, AABB = (228, 115, 22, 12) overlaps sweep [232..296, 118..224] with 0 actual pixels!
+            img_sw.fill_rect(228, 115, 22, 2, unknown_lab)
+            img_sw.fill_rect(228, 117, 4, 10, unknown_lab)
+            blobs_sw = extract_blobs_from_maix_image(img_sw, self.cfg, scan_unknown_near=True)
+            st_sw = RescueVisionProcessor(self.cfg).process(blobs_sw, **kw)
+            self.assertTrue(st_sw.flags & VIS_FLAG_SWEEP_CLEAR, cls.__name__)
+            self.assertTrue(st_sw.flags & VIS_FLAG_CORRAL_SAFE, cls.__name__)
+            self.assertFalse(st_sw.flags & VIS_FLAG_DROP_PATH_CLEAR, cls.__name__)
+
+            # Same geometry with cyan hazard -> SWEEP_CLEAR=True, DROP_PATH_CLEAR=False!
+            img_sw_c = cls(320, 240, floor_lab)
+            img_sw_c.fill_rect(228, 115, 22, 2, cyan_lab)
+            img_sw_c.fill_rect(228, 117, 4, 10, cyan_lab)
+            blobs_sw_c = extract_blobs_from_maix_image(img_sw_c, self.cfg, scan_unknown_near=True)
+            st_sw_c = RescueVisionProcessor(self.cfg).process(blobs_sw_c, **kw)
+            self.assertTrue(st_sw_c.flags & VIS_FLAG_SWEEP_CLEAR, cls.__name__)
+            self.assertFalse(st_sw_c.flags & VIS_FLAG_DROP_PATH_CLEAR, cls.__name__)
+
+            # Positive sweep control: extend L-shape 4 pixels INTO near_sweep_roi at (232, 118, 4, 4) -> SWEEP_CLEAR=False!
+            img_sw.fill_rect(232, 118, 4, 4, unknown_lab)
+            blobs_sw_hit = extract_blobs_from_maix_image(img_sw, self.cfg, scan_unknown_near=True)
+            st_sw_hit = RescueVisionProcessor(self.cfg).process(blobs_sw_hit, **kw)
+            self.assertFalse(st_sw_hit.flags & VIS_FLAG_SWEEP_CLEAR, cls.__name__)
+
     def test_home_half_match_checks_full_corral_width_and_opponent_zone(self) -> None:
         # Home x=100..320 (cx=210, left material half=[100, 192]).
         # Center=160, corral_align_half_w_px=24 => footprint [136, 184] strictly inside [100, 192]!
