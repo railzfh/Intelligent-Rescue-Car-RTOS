@@ -26,10 +26,21 @@ bool Class_Rescue_Mission::On_Set_Config(const Struct_Match_Config_Cmd &cfg)
     {
         return false;
     }
+    const uint8_t prev_mode = Run_Mode;
     Team = cfg.team;
     Start_Zone = cfg.start_zone;
     Run_Mode = cfg.run_mode;
     Max_Materials_Per_Trip = std::clamp<uint8_t>(cfg.max_materials_per_trip, 1U, 3U);
+    if (Run_Mode != RESCUE_MODE_BENCH_STRAIGHT &&
+        (prev_mode == RESCUE_MODE_BENCH_STRAIGHT || Gate_Closed_Cmd || Camera_Near_Cmd))
+    {
+        // Clear any bench actuator overrides when entering/leaving into competition mode and require
+        // settled open/FAR servos plus a fresh post-settle FAR frame before launch.
+        Gate_Closed_Cmd = false;
+        Camera_Near_Cmd = false;
+        Pre_Match_Need_Post_Settle_Far = true;
+        Pre_Match_Settle_Accept_Id = Vision_Accept_Counter;
+    }
     return true;
 }
 
@@ -57,19 +68,61 @@ bool Class_Rescue_Mission::On_Vision_State(const Struct_Vision_State &vis, uint3
     Latest_Vision = vis;
     Last_Vision_Frame_Seq = vis.frame_seq;
     Last_Vision_Ms = now_ms;
+    ++Vision_Accept_Counter;
     Vision_Received = true;
     Vision_Invalidated_By_Rx_Fault = false;
+    if ((vis.flags & (VIS_FLAG_OPPONENT_NEAR | VIS_FLAG_OPPONENT_ZONE_NEAR)) != 0U)
+    {
+        Pending_Opponent_Alert_Event = true;
+    }
+    if (vis.camera_view != CAMERA_VIEW_FAR)
+    {
+        Pending_Non_Far_View_Event = true;
+    }
     if (vis.camera_view != CAMERA_VIEW_NEAR)
     {
         // Latch any accepted non-NEAR frame so a later NEAR frame in the same UART drain
         // cannot hide a wrong-view interruption during unsettled gate closure or NEAR confirmations.
         Pending_Non_Near_View_Event = true;
     }
-    else if (Validate_Corral(vis) == CORRAL_ILLEGAL_HAZARD_OR_EXCESS)
+    else
     {
-        // Latch any accepted NEAR hazard frame so a subsequent clean frame in the same drain
-        // cannot hide an illegal corral/sweep hazard.
-        Pending_Near_Hazard_Event = true;
+        const Enum_Corral_Verdict v = Validate_Corral(vis);
+        if (v == CORRAL_ILLEGAL_HAZARD_OR_EXCESS)
+        {
+            // Latch any accepted NEAR hazard frame so a subsequent clean frame in the same drain
+            // cannot hide an illegal corral/sweep hazard.
+            Pending_Near_Hazard_Event = true;
+        }
+        if (v != CORRAL_VALID_MATERIALS && v != CORRAL_VALID_CASUALTY)
+        {
+            Pending_Near_Non_Valid_Corral_Event = true;
+        }
+        if ((vis.flags & VIS_FLAG_DROP_PATH_CLEAR) == 0U)
+        {
+            Pending_Drop_Path_Blocked_Event = true;
+        }
+        if ((vis.flags & VIS_FLAG_DROP_BASELINE_READY) == 0U)
+        {
+            Pending_Drop_Baseline_Not_Ready_Event = true;
+        }
+        if ((vis.flags & VIS_FLAG_HOME_HALF_MATCH) == 0U)
+        {
+            Pending_Home_Half_Mismatch_Event = true;
+        }
+        if (State == MISSION_DROP_OPEN_AND_PUSH && Sub_Phase <= 1U)
+        {
+            const bool cargo_ok = (Cargo_Is_Casualty && v == CORRAL_VALID_CASUALTY) ||
+                                  (!Cargo_Is_Casualty && v == CORRAL_VALID_MATERIALS);
+            const bool exact_ok = (Sub_Phase == 0U) ||
+                                  (vis.corral_green_cnt == Cargo_Green &&
+                                   vis.corral_black_cnt == Cargo_Black &&
+                                   vis.corral_orange_cnt == Cargo_Orange);
+            if (!cargo_ok || !exact_ok)
+            {
+                Pending_Near_Cargo_Mismatch_Event = true;
+            }
+        }
     }
     if (vis.camera_view != CAMERA_VIEW_NEAR || (vis.flags & VIS_FLAG_DROP_CONFIRMED) == 0U)
     {
@@ -133,7 +186,14 @@ void Class_Rescue_Mission::Fault_Stop(uint32_t now_ms)
     Gate_Closed_Cmd = false;
     Camera_Near_Cmd = false;
     Pending_Non_Near_View_Event = false;
+    Pending_Non_Far_View_Event = false;
     Pending_Near_Hazard_Event = false;
+    Pending_Near_Non_Valid_Corral_Event = false;
+    Pending_Opponent_Alert_Event = false;
+    Pending_Drop_Path_Blocked_Event = false;
+    Pending_Drop_Baseline_Not_Ready_Event = false;
+    Pending_Home_Half_Mismatch_Event = false;
+    Pending_Near_Cargo_Mismatch_Event = false;
     Pending_Drop_Unconfirmed_Event = false;
     if (is_competition_active)
     {
@@ -238,21 +298,34 @@ Enum_Corral_Verdict Class_Rescue_Mission::Validate_Corral(const Struct_Vision_St
     return CORRAL_ILLEGAL_HAZARD_OR_EXCESS;
 }
 
+void Class_Rescue_Mission::Reset_Confirm_Streak()
+{
+    Confirm_Count = 0U;
+    // Anchor confirmation boundary at the current accepted vision counter so any post-interruption
+    // or post-settle confirmation MUST come from strictly newer accepted frames.
+    Confirm_Boundary_Accept_Id = Vision_Accept_Counter;
+}
+
 void Class_Rescue_Mission::Enter_State(Enum_Mission_State next, uint32_t now_ms)
 {
     State = next;
     State_Enter_Ms = now_ms;
     Sub_Phase = 0U;
-    Confirm_Count = 0U;
-    Has_Confirm_Frame = false;
-    Last_Confirm_Frame_Seq = 0U;
+    Reset_Confirm_Streak();
     Visual_Stall_Counter_Ms = 0U;
     Pending_Escape_Reverse_M = 0.0f;
     Standstill_Abrupt_Stop = false;
     Gate_Open_Settled_Latched = false;
     Gate_Settled_Frame_Seq = 0U;
     Pending_Non_Near_View_Event = false;
+    Pending_Non_Far_View_Event = false;
     Pending_Near_Hazard_Event = false;
+    Pending_Near_Non_Valid_Corral_Event = false;
+    Pending_Opponent_Alert_Event = false;
+    Pending_Drop_Path_Blocked_Event = false;
+    Pending_Drop_Baseline_Not_Ready_Event = false;
+    Pending_Home_Half_Mismatch_Event = false;
+    Pending_Near_Cargo_Mismatch_Event = false;
     Pending_Drop_Unconfirmed_Event = false;
 }
 
@@ -466,10 +539,24 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
 
     const bool vision_fresh = Is_Vision_Fresh(in.now_ms) && in.uart_rx_healthy;
     const bool non_near_view_event = Pending_Non_Near_View_Event;
+    const bool non_far_view_event = Pending_Non_Far_View_Event;
     const bool near_hazard_event = Pending_Near_Hazard_Event;
+    const bool near_non_valid_corral_event = Pending_Near_Non_Valid_Corral_Event;
+    const bool opponent_alert_event = Pending_Opponent_Alert_Event;
+    const bool drop_path_blocked_event = Pending_Drop_Path_Blocked_Event;
+    const bool drop_baseline_not_ready_event = Pending_Drop_Baseline_Not_Ready_Event;
+    const bool home_half_mismatch_event = Pending_Home_Half_Mismatch_Event;
+    const bool near_cargo_mismatch_event = Pending_Near_Cargo_Mismatch_Event;
     const bool drop_unconfirmed_event = Pending_Drop_Unconfirmed_Event;
     Pending_Non_Near_View_Event = false;
+    Pending_Non_Far_View_Event = false;
     Pending_Near_Hazard_Event = false;
+    Pending_Near_Non_Valid_Corral_Event = false;
+    Pending_Opponent_Alert_Event = false;
+    Pending_Drop_Path_Blocked_Event = false;
+    Pending_Drop_Baseline_Not_Ready_Event = false;
+    Pending_Home_Half_Mismatch_Event = false;
+    Pending_Near_Cargo_Mismatch_Event = false;
     Pending_Drop_Unconfirmed_Event = false;
 
     // Global standstill interlock after any cancelled/interrupted/completed reverse transition:
@@ -487,10 +574,9 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         {
             const bool near_view_ok = vision_fresh && !non_near_view_event && !near_hazard_event &&
                                       in.camera_settled && (Latest_Vision.camera_view == CAMERA_VIEW_NEAR);
-            if (!near_view_ok)
+            if (!near_view_ok || !in.wheels_still || in.chassis_active)
             {
-                Confirm_Count = 0U;
-                Has_Confirm_Frame = false;
+                Reset_Confirm_Streak();
                 if (Gate_Closed_Cmd && !in.gate_settled)
                 {
                     Clear_Cargo();
@@ -515,7 +601,8 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
 
     const bool rear_sensor_clear = vision_fresh && ((Latest_Vision.flags & VIS_FLAG_REAR_CLEAR) != 0U);
     const bool opponent_alert =
-        vision_fresh && ((Latest_Vision.flags & (VIS_FLAG_OPPONENT_NEAR | VIS_FLAG_OPPONENT_ZONE_NEAR)) != 0U);
+        vision_fresh && (opponent_alert_event ||
+                         ((Latest_Vision.flags & (VIS_FLAG_OPPONENT_NEAR | VIS_FLAG_OPPONENT_ZONE_NEAR)) != 0U));
 
     // Update proven rear swept corridor and cumulative progress watchdog during active competition.
     if (is_competition_active)
@@ -595,8 +682,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                 Vision_Outage_Start_Ms = in.now_ms;
             }
             Interrupted_By_Stale_Vision = true;
-            Confirm_Count = 0U;
-            Has_Confirm_Frame = false;
+            Reset_Confirm_Streak();
             if ((uint32_t)(in.now_ms - Vision_Outage_Start_Ms) >= Config.vision_abort_ms)
             {
                 Fault_Stop(in.now_ms);
@@ -731,6 +817,22 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
     {
     case MISSION_PRE_MATCH:
         out.drive_action = DRIVE_ACTION_IDLE;
+        if (Run_Mode != RESCUE_MODE_BENCH_STRAIGHT)
+        {
+            Gate_Closed_Cmd = false;
+            Camera_Near_Cmd = false;
+            if (!in.gate_settled || !in.camera_settled || !vision_fresh)
+            {
+                Pre_Match_Need_Post_Settle_Far = true;
+                Pre_Match_Settle_Accept_Id = Vision_Accept_Counter;
+            }
+            else if (Pre_Match_Need_Post_Settle_Far && !non_far_view_event &&
+                     Latest_Vision.camera_view == CAMERA_VIEW_FAR &&
+                     Vision_Accept_Counter != Pre_Match_Settle_Accept_Id)
+            {
+                Pre_Match_Need_Post_Settle_Far = false;
+            }
+        }
         if (in.button_pressed && in.can_launch)
         {
             if (Run_Mode == RESCUE_MODE_BENCH_STRAIGHT)
@@ -738,7 +840,13 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                 Enter_State(MISSION_BENCH_STRAIGHT, in.now_ms);
                 out.drive_action = DRIVE_ACTION_BENCH_STRAIGHT;
             }
-            else if ((Team == RESCUE_TEAM_RED || Team == RESCUE_TEAM_BLUE) && vision_fresh)
+            else if ((Team == RESCUE_TEAM_RED || Team == RESCUE_TEAM_BLUE) &&
+                     vision_fresh &&
+                     !Gate_Closed_Cmd && !Camera_Near_Cmd &&
+                     in.gate_settled && in.camera_settled &&
+                     !non_far_view_event &&
+                     Latest_Vision.camera_view == CAMERA_VIEW_FAR &&
+                     !Pre_Match_Need_Post_Settle_Far)
             {
                 Config_Locked = true;
                 Match_Start_Ms = in.now_ms;
@@ -760,7 +868,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             }
             else
             {
-                // Refuse blind competition launch if team not selected or MaixCAM offline.
+                // Refuse blind competition launch if team not selected, MaixCAM offline, or servos/FAR view not settled.
                 out.launch_rejected_cue = true;
             }
         }
@@ -861,13 +969,9 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         Gate_Closed_Cmd = false;
         Camera_Near_Cmd = true;
         out.drive_action = DRIVE_ACTION_SOFT_STOP;
-        if (in.chassis_active || !in.camera_settled)
+        if (in.chassis_active || !in.wheels_still || !in.camera_settled)
         {
-            if (non_near_view_event || !in.camera_settled)
-            {
-                Confirm_Count = 0U;
-                Has_Confirm_Frame = false;
-            }
+            Reset_Confirm_Streak();
             break;
         }
         if ((uint32_t)(in.now_ms - State_Enter_Ms) >= Config.inspect_timeout_ms)
@@ -884,20 +988,22 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         }
         if (non_near_view_event || Latest_Vision.camera_view != CAMERA_VIEW_NEAR)
         {
-            Confirm_Count = 0U;
-            Has_Confirm_Frame = false;
+            Reset_Confirm_Streak();
             break;
         }
-        if (Has_Confirm_Frame && Latest_Vision.frame_seq == Last_Confirm_Frame_Seq)
+        if (Vision_Accept_Counter == Confirm_Boundary_Accept_Id)
         {
             break;
         }
-        Has_Confirm_Frame = true;
-        Last_Confirm_Frame_Seq = Latest_Vision.frame_seq;
+        Confirm_Boundary_Accept_Id = Vision_Accept_Counter;
         {
             const Enum_Corral_Verdict verdict = Validate_Corral(Latest_Vision);
             if (verdict == CORRAL_VALID_MATERIALS || verdict == CORRAL_VALID_CASUALTY)
             {
+                if (near_non_valid_corral_event)
+                {
+                    Confirm_Count = 0U;
+                }
                 if (++Confirm_Count >= Config.confirm_frames_required)
                 {
                     Cargo_Is_Casualty = (verdict == CORRAL_VALID_CASUALTY);
@@ -1068,13 +1174,12 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             Enter_State(MISSION_BACK_OUT_SEPARATE, in.now_ms);
             break;
         }
-        if (non_near_view_event || !in.camera_settled || Latest_Vision.camera_view != CAMERA_VIEW_NEAR)
+        if (in.chassis_active || !in.wheels_still ||
+            non_near_view_event || !in.camera_settled || Latest_Vision.camera_view != CAMERA_VIEW_NEAR)
         {
-            Confirm_Count = 0U;
-            Has_Confirm_Frame = false;
-            // Require a continuous settled NEAR view throughout an unsettled gate closure; never keep
-            // commanding the corral arm closed while receiving FAR/TRANSITION frames (even if followed
-            // by a NEAR frame in the same UART drain)!
+            Reset_Confirm_Streak();
+            // Require continuous standstill and a settled NEAR view throughout an unsettled gate
+            // closure; retract immediately if wheels move or NEAR view is interrupted.
             if (!in.gate_settled)
             {
                 Clear_Cargo();
@@ -1084,12 +1189,11 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             }
             break;
         }
-        if (Has_Confirm_Frame && Latest_Vision.frame_seq == Last_Confirm_Frame_Seq)
+        if (Vision_Accept_Counter == Confirm_Boundary_Accept_Id)
         {
             break;
         }
-        Has_Confirm_Frame = true;
-        Last_Confirm_Frame_Seq = Latest_Vision.frame_seq;
+        Confirm_Boundary_Accept_Id = Vision_Accept_Counter;
         {
             const Enum_Corral_Verdict verdict = Validate_Corral(Latest_Vision);
             // Continuously inspect hazards EVEN WHILE gate is still moving; cancel immediately!
@@ -1104,11 +1208,15 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             // Only count confirmation frames after the gate has mechanically settled.
             if (!in.gate_settled)
             {
-                Confirm_Count = 0U;
+                Reset_Confirm_Streak();
                 break;
             }
             if (verdict == CORRAL_VALID_MATERIALS || verdict == CORRAL_VALID_CASUALTY)
             {
+                if (near_non_valid_corral_event)
+                {
+                    Confirm_Count = 0U;
+                }
                 if (++Confirm_Count >= Config.confirm_frames_required)
                 {
                     Cargo_Is_Casualty = (verdict == CORRAL_VALID_CASUALTY);
@@ -1206,13 +1314,9 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         if (Sub_Phase == 0U)
         {
             out.drive_action = DRIVE_ACTION_SOFT_STOP;
-            if (in.chassis_active || !in.camera_settled)
+            if (in.chassis_active || !in.wheels_still || !in.camera_settled)
             {
-                if (non_near_view_event || !in.camera_settled)
-                {
-                    Confirm_Count = 0U;
-                    Has_Confirm_Frame = false;
-                }
+                Reset_Confirm_Streak();
                 break;
             }
             if ((uint32_t)(in.now_ms - State_Enter_Ms) >= Config.inspect_timeout_ms)
@@ -1221,7 +1325,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                 Enter_State(MISSION_FIND_HOME, in.now_ms);
                 break;
             }
-            if (near_hazard_event)
+            if (near_hazard_event || near_cargo_mismatch_event)
             {
                 Clear_Cargo();
                 Gate_Closed_Cmd = false;
@@ -1229,18 +1333,27 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                 Enter_State(MISSION_BACK_OUT_SEPARATE, in.now_ms);
                 break;
             }
+            if (drop_path_blocked_event || drop_baseline_not_ready_event)
+            {
+                Start_Escape(in, 0.0f, out);
+                break;
+            }
+            if (home_half_mismatch_event)
+            {
+                Camera_Near_Cmd = false;
+                Enter_State(MISSION_APPROACH_HOME, in.now_ms);
+                break;
+            }
             if (non_near_view_event || Latest_Vision.camera_view != CAMERA_VIEW_NEAR)
             {
-                Confirm_Count = 0U;
-                Has_Confirm_Frame = false;
+                Reset_Confirm_Streak();
                 break;
             }
-            if (Has_Confirm_Frame && Latest_Vision.frame_seq == Last_Confirm_Frame_Seq)
+            if (Vision_Accept_Counter == Confirm_Boundary_Accept_Id)
             {
                 break;
             }
-            Has_Confirm_Frame = true;
-            Last_Confirm_Frame_Seq = Latest_Vision.frame_seq;
+            Confirm_Boundary_Accept_Id = Vision_Accept_Counter;
             const Enum_Corral_Verdict verdict = Validate_Corral(Latest_Vision);
             const bool cargo_matches = (Cargo_Is_Casualty && verdict == CORRAL_VALID_CASUALTY) ||
                                        (!Cargo_Is_Casualty && verdict == CORRAL_VALID_MATERIALS);
@@ -1290,13 +1403,22 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                 out.drive_action = DRIVE_ACTION_EMERGENCY_STOP;
                 break;
             }
-            if (near_hazard_event)
+            if (near_hazard_event || drop_path_blocked_event || drop_baseline_not_ready_event ||
+                near_cargo_mismatch_event)
             {
                 Clear_Cargo();
                 Gate_Closed_Cmd = false;
                 Camera_Near_Cmd = false;
                 Enter_State(MISSION_BACK_OUT_SEPARATE, in.now_ms);
                 out.drive_action = DRIVE_ACTION_EMERGENCY_STOP;
+                break;
+            }
+            if (home_half_mismatch_event)
+            {
+                Gate_Closed_Cmd = true;
+                Camera_Near_Cmd = true;
+                Enter_State(MISSION_CLOSE_GATE_VERIFY, in.now_ms);
+                out.drive_action = DRIVE_ACTION_SOFT_STOP;
                 break;
             }
             // Continuously recheck latest NEAR frame for corral/sweep/path safety, exact cargo match,
@@ -1368,12 +1490,14 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             const bool near_view_ok = !non_near_view_event && !near_hazard_event && in.camera_settled &&
                                       Latest_Vision.camera_view == CAMERA_VIEW_NEAR;
             const bool push_safe = near_view_ok &&
+                                   !drop_path_blocked_event &&
                                    (Latest_Vision.flags & VIS_FLAG_CORRAL_SAFE) != 0U &&
                                    (Latest_Vision.flags & VIS_FLAG_SWEEP_CLEAR) != 0U &&
                                    (Latest_Vision.flags & VIS_FLAG_DROP_PATH_CLEAR) != 0U &&
                                    Latest_Vision.corral_cyan_cnt == 0U &&
                                    Latest_Vision.corral_unknown_cnt == 0U;
-            const bool half_ok = (Latest_Vision.flags & VIS_FLAG_HOME_HALF_MATCH) != 0U;
+            const bool half_ok = !home_half_mismatch_event &&
+                                 (Latest_Vision.flags & VIS_FLAG_HOME_HALF_MATCH) != 0U;
             if (!push_safe || !half_ok)
             {
                 Clear_Cargo();
@@ -1471,9 +1595,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                 Sub_Phase = 2U;
                 State_Enter_Ms = in.now_ms;
                 Standstill_Abrupt_Stop = true;
-                Confirm_Count = 0U;
-                Has_Confirm_Frame = false;
-                Last_Confirm_Frame_Seq = 0U;
+                Reset_Confirm_Streak();
                 Engage_Standstill_Gate(in.now_ms, in);
                 out.drive_action = DRIVE_ACTION_EMERGENCY_STOP;
             }
@@ -1482,9 +1604,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                 Sub_Phase = 2U;
                 State_Enter_Ms = in.now_ms;
                 Standstill_Abrupt_Stop = false;
-                Confirm_Count = 0U;
-                Has_Confirm_Frame = false;
-                Last_Confirm_Frame_Seq = 0U;
+                Reset_Confirm_Streak();
                 if (in.use_motor_feedback_seq)
                 {
                     Engage_Standstill_Gate(in.now_ms, in);
@@ -1501,6 +1621,13 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             const bool reverse_clearance_lost = Is_Reverse_Clearance_Lost(rear_sensor_clear);
             const bool hard_stop =
                 Standstill_Abrupt_Stop || reverse_clearance_lost || opponent_alert || in.chassis_stalled;
+            if (in.chassis_active || !in.wheels_still ||
+                non_near_view_event || !in.camera_settled || Latest_Vision.camera_view != CAMERA_VIEW_NEAR)
+            {
+                // Reset confirmation streak and anchor boundary BEFORE any early return so wheel motion,
+                // camera transition, or wrong-view interruption can never preserve or recount prior frames.
+                Reset_Confirm_Streak();
+            }
             if (in.chassis_active || !in.wheels_still)
             {
                 // Never leave drop verification into search/motion while wheels are still moving!
@@ -1526,16 +1653,14 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             }
             if (non_near_view_event || !in.camera_settled || Latest_Vision.camera_view != CAMERA_VIEW_NEAR)
             {
-                Confirm_Count = 0U;
-                Has_Confirm_Frame = false;
+                Reset_Confirm_Streak();
                 break;
             }
-            if (Has_Confirm_Frame && Latest_Vision.frame_seq == Last_Confirm_Frame_Seq)
+            if (Vision_Accept_Counter == Confirm_Boundary_Accept_Id)
             {
                 break;
             }
-            Has_Confirm_Frame = true;
-            Last_Confirm_Frame_Seq = Latest_Vision.frame_seq;
+            Confirm_Boundary_Accept_Id = Vision_Accept_Counter;
             if ((Latest_Vision.flags & VIS_FLAG_DROP_CONFIRMED) != 0U)
             {
                 if (drop_unconfirmed_event)

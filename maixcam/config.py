@@ -61,6 +61,7 @@ class RescueVisionConfig:
     material_half_on_left_blue: bool = True
     half_match_margin_px: int = 18
     corral_align_half_w_px: int = 24
+    ramp_home_max_gap_px: int = 12
 
     # NEAR-view calibrated ROIs (camera pitched down onto corral mouth & ramp drop zone).
     near_corral_roi: List[int] = field(default_factory=lambda: [88, 128, 144, 96])

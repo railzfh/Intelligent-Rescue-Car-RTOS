@@ -508,7 +508,7 @@ class RescueVisionProcessor:
         other_bounds: Tuple[float, float],
     ) -> Tuple[Tuple[int, int, int], Tuple[int, int, int], Tuple[int, int, int]]:
         """Partition blocks in/on home or ramp into (target_half, other_half, misplaced) counts."""
-        ramp_inner_y = assoc_ramp.y
+        inner_limit_y = min(home.y2, assoc_ramp.y)
         ramp_bot_y = assoc_ramp.y2
         tgt = [0, 0, 0]
         oth = [0, 0, 0]
@@ -519,10 +519,10 @@ class RescueVisionProcessor:
             if idx is None:
                 continue
             in_home = _rects_intersect(b.x, b.y, b.w, b.h, home.x, home.y, home.w, home.h)
-            on_ramp = b.y < ramp_bot_y and b.y2 > ramp_inner_y and b.x < home.x2 and b.x2 > home.x
+            on_ramp = b.y < ramp_bot_y and b.y2 > inner_limit_y and b.x < home.x2 and b.x2 > home.x
             if not (in_home or on_ramp):
                 continue
-            if not on_ramp and b.y >= home.y and b.y2 <= ramp_inner_y:
+            if not on_ramp and b.y >= home.y and b.y2 <= inner_limit_y:
                 if target_bounds[1] > target_bounds[0] and b.x >= target_bounds[0] and b.x2 <= target_bounds[1]:
                     tgt[idx] += 1
                     continue
@@ -553,9 +553,20 @@ class RescueVisionProcessor:
         half_x1, half_x2, aim_x = self._target_half_bounds(home, team, carrying_casualty)
         home_err_mrad = self.bearing_mrad(aim_x)
 
-        # Associate a purple ramp horizontally overlapping own safe zone.
-        assoc_ramps = [r for r in ramps if r.x < home.x2 and r.x2 > home.x]
-        assoc_ramp = max(assoc_ramps, key=lambda r: r.pixels) if assoc_ramps else None
+        # Associate a purple ramp horizontally overlapping own safe zone AND vertically adjacent
+        # to home's lower approach edge; fail closed if none or multiple ambiguous ramps match.
+        max_gap = max(0, int(self.cfg.ramp_home_max_gap_px))
+        assoc_ramps = [
+            r
+            for r in ramps
+            if r.x < home.x2
+            and r.x2 > home.x
+            and r.y > home.y
+            and r.y >= home.y2 - max(r.h, max_gap)
+            and r.y <= home.y2 + max_gap
+            and r.y2 >= home.y2 - max_gap
+        ]
+        assoc_ramp = assoc_ramps[0] if len(assoc_ramps) == 1 else None
         ramp_y = assoc_ramp.y2 if assoc_ramp is not None else home.y2
         home_dist_mm = self.estimate_far_distance_mm(ramp_y)
 
@@ -584,7 +595,7 @@ class RescueVisionProcessor:
         top_y = min(home.y, corral_roi[1])
         bot_y = max(home.y2, corral_roi[1] + corral_roi[3])
         corridor_roi = [corral_roi[0], top_y, corral_roi[2], max(1, bot_y - top_y)]
-        ramp_inner_y = assoc_ramp.y
+        ramp_inner_y = min(home.y2, assoc_ramp.y)
         ramp_bot_y = assoc_ramp.y2
         for bad in hazards + unknowns:
             in_home = _rects_intersect(bad.x, bad.y, bad.w, bad.h, home.x, home.y, home.w, home.h)
@@ -1406,7 +1417,8 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
 
     verified_surface_geoms = set()
     emitted_rejected_object_rects = set()
-    raw_obj_cands: List[Tuple[Blob, bool]] = []
+    # (blob, meets_label_min_area, is_verified_object)
+    raw_obj_cands: List[Tuple[Blob, bool, bool]] = []
 
     for label in ordered_labels:
         thresh = cfg.lab_thresholds[label]
@@ -1421,7 +1433,14 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
 
         # In NEAR mode, capture all connected components (merge=False, x_stride=1, y_stride=1) so detached
         # unverified patches inside concave verified components (e.g. a C-shaped ramp) are separated by component!
-        px_thr = 1 if (scan_unknown_near and label in (_SURFACE_LABELS + _OBJECT_LABELS)) else min_area
+        # For object labels in FAR mode, capture down to min(min_area, min_hazard_pixels) so competing
+        # overlapping alternate-class evidence participates in cross-label disambiguation too.
+        if scan_unknown_near and label in (_SURFACE_LABELS + _OBJECT_LABELS):
+            px_thr = 1
+        elif label in _OBJECT_LABELS:
+            px_thr = min(min_area, cfg.min_hazard_pixels)
+        else:
+            px_thr = min_area
         found = _find_blobs_unit_stride(img, [tuple(thresh)], pixels_threshold=px_thr, area_threshold=px_thr, merge=False)
         for item in found:
             w = max(1, int(item.w()))
@@ -1449,19 +1468,38 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                 elif scan_unknown_near:
                     unverified_by_label[label].append(b)
             elif label in _OBJECT_LABELS:
-                if px >= min_area:
-                    raw_obj_cands.append((b, _is_verified_object_blob(b, cfg.min_hazard_pixels, cfg)))
+                cand_min = min(min_area, cfg.min_hazard_pixels)
+                if px >= cand_min:
+                    meets_min = px >= min_area
+                    is_ver = meets_min and _is_verified_object_blob(b, cfg.min_hazard_pixels, cfg)
+                    raw_obj_cands.append((b, meets_min, is_ver))
                 elif scan_unknown_near:
                     unverified_by_label[label].append(b)
             elif px >= min_area:
                 blobs.append(b)
 
     # Cross-label object disambiguation BEFORE emitting verified or rejected objects into blobs:
-    # When custom object LAB bands overlap on the same foreground pixels, never double-count a single
-    # patch as two classes (e.g. green + orange) or two rejected unknowns (e.g. 9600 px oversized patch).
+    # Include competing components down to min_hazard_pixels while retaining each label's min_area
+    # to accept a standalone legal block.
     accounted_obj_pts: set[Tuple[int, int]] = set()
     accounted_obj_boxes: List[Tuple[int, int, int, int]] = []
+    accounted_clusters: List[Tuple[set[Tuple[int, int]], Tuple[int, int, int, int]]] = []
     accounted_rejected_blobs: List[Blob] = []
+
+    def _emit_singleton_obj(b: Blob, meets_min: bool, is_ver: bool) -> None:
+        if not meets_min:
+            if scan_unknown_near:
+                unverified_by_label[b.label].append(b)
+            return
+        blobs.append(b)
+        if is_ver:
+            verified_by_label[b.label].append(b)
+        else:
+            emitted_rejected_object_rects.add((b.x, b.y, b.w, b.h))
+            if b.pixels >= cfg.min_hazard_pixels:
+                accounted_rejected_blobs.append(b)
+            elif scan_unknown_near:
+                unverified_by_label[b.label].append(b)
 
     pot_obj_pairs: List[Tuple[int, int]] = []
     for i_c in range(len(raw_obj_cands)):
@@ -1480,16 +1518,8 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                 pot_obj_pairs.append((i_c, j_c))
 
     if not pot_obj_pairs:
-        for b, is_ver in raw_obj_cands:
-            blobs.append(b)
-            if is_ver:
-                verified_by_label[b.label].append(b)
-            else:
-                emitted_rejected_object_rects.add((b.x, b.y, b.w, b.h))
-                if b.pixels >= cfg.min_hazard_pixels:
-                    accounted_rejected_blobs.append(b)
-                elif scan_unknown_near:
-                    unverified_by_label[b.label].append(b)
+        for b, meets_min, is_ver in raw_obj_cands:
+            _emit_singleton_obj(b, meets_min, is_ver)
     else:
         cand_pts_cache: Dict[int, set[Tuple[int, int]]] = {}
 
@@ -1575,67 +1605,35 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
 
         for members in clusters_by_root.values():
             if len(members) == 1:
-                b, is_ver = raw_obj_cands[members[0]]
-                blobs.append(b)
-                if is_ver:
-                    verified_by_label[b.label].append(b)
-                else:
-                    emitted_rejected_object_rects.add((b.x, b.y, b.w, b.h))
-                    if b.pixels >= cfg.min_hazard_pixels:
-                        accounted_rejected_blobs.append(b)
-                    elif scan_unknown_near:
-                        unverified_by_label[b.label].append(b)
+                b, meets_min, is_ver = raw_obj_cands[members[0]]
+                _emit_singleton_obj(b, meets_min, is_ver)
                 continue
 
-            cyan_members = [m for m in members if raw_obj_cands[m][0].label == "cyan"]
-            if cyan_members:
-                cyan_pts: set[Tuple[int, int]] = set()
-                for m in cyan_members:
-                    b_c = raw_obj_cands[m][0]
-                    blobs.append(b_c)
-                    verified_by_label["cyan"].append(b_c)
-                    cyan_pts.update(_get_cand_pixels(m))
-                union_pts: set[Tuple[int, int]] = set(cyan_pts)
-                for m in members:
-                    if m not in cyan_members:
-                        union_pts.update(_get_cand_pixels(m))
-                # Only suppress non-cyan tail pixels if they do not intrude into corral/sweep beyond cyan.
-                corral_extra = _pts_hit_roi(union_pts, corral_clipped) and not _pts_hit_roi(cyan_pts, corral_clipped)
-                sweep_extra = _pts_hit_roi(union_pts, sweep_clipped) and not _pts_hit_roi(cyan_pts, sweep_clipped)
-                if corral_extra or sweep_extra:
-                    suppress_pts = cyan_pts
-                    if scan_unknown_near:
-                        for m in members:
-                            if m not in cyan_members:
-                                b_m = raw_obj_cands[m][0]
-                                unverified_by_label[b_m.label].append(b_m)
-                else:
-                    suppress_pts = union_pts
-                if suppress_pts:
-                    sx1 = min(p[0] for p in suppress_pts)
-                    sy1 = min(p[1] for p in suppress_pts)
-                    sx2 = max(p[0] for p in suppress_pts) + 1
-                    sy2 = max(p[1] for p in suppress_pts) + 1
-                    accounted_obj_pts.update(suppress_pts)
-                    accounted_obj_boxes.append((sx1, sy1, sx2, sy2))
-            else:
-                union_pts = set()
-                for m in members:
-                    union_pts.update(_get_cand_pixels(m))
-                if not union_pts:
-                    continue
-                ux1 = min(p[0] for p in union_pts)
-                uy1 = min(p[1] for p in union_pts)
-                ux2 = max(p[0] for p in union_pts) + 1
-                uy2 = max(p[1] for p in union_pts) + 1
-                uw, uh = max(1, ux2 - ux1), max(1, uy2 - uy1)
-                ucnt = len(union_pts)
-                u_ic = _pts_hit_roi(union_pts, corral_clipped) if scan_unknown_near else None
-                u_isw = _pts_hit_roi(union_pts, sweep_clipped) if scan_unknown_near else None
-                blobs.append(Blob("unknown", ux1, uy1, uw, uh, ucnt, min(1.0, ucnt / float(uw * uh)), u_ic, u_isw))
-                emitted_rejected_object_rects.add((ux1, uy1, uw, uh))
-                accounted_obj_pts.update(union_pts)
-                accounted_obj_boxes.append((ux1, uy1, ux2, uy2))
+            union_pts: set[Tuple[int, int]] = set()
+            for m in members:
+                union_pts.update(_get_cand_pixels(m))
+            if not union_pts:
+                continue
+            ux1 = min(p[0] for p in union_pts)
+            uy1 = min(p[1] for p in union_pts)
+            ux2 = max(p[0] for p in union_pts) + 1
+            uy2 = max(p[1] for p in union_pts) + 1
+            uw, uh = max(1, ux2 - ux1), max(1, uy2 - uy1)
+            ucnt = len(union_pts)
+            u_ic = _pts_hit_roi(union_pts, corral_clipped) if scan_unknown_near else None
+            u_isw = _pts_hit_roi(union_pts, sweep_clipped) if scan_unknown_near else None
+
+            # Retain cyan hazard priority while always using the FULL connected conflict footprint
+            # across every safety region (corral, sweep, drop ROI, home, ramp) with no second
+            # minimum-size test on clipped non-cyan tails.
+            has_cyan = any(raw_obj_cands[m][0].label == "cyan" for m in members)
+            emit_label = "cyan" if has_cyan else "unknown"
+            merged_blob = Blob(emit_label, ux1, uy1, uw, uh, ucnt, min(1.0, ucnt / float(uw * uh)), u_ic, u_isw)
+            blobs.append(merged_blob)
+            emitted_rejected_object_rects.add((ux1, uy1, uw, uh))
+            accounted_obj_pts.update(union_pts)
+            accounted_obj_boxes.append((ux1, uy1, ux2, uy2))
+            accounted_clusters.append((union_pts, (ux1, uy1, ux2, uy2)))
 
     # In NEAR view, detect unexplained non-floor foreground across ALL fixed near ROIs PLUS the dynamic
     # home zone, ramp band, and projected push-corridor geometry, masking ONLY verified connected
@@ -1727,7 +1725,7 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                 (rb.label, rb.x, rb.y, rb.w, rb.h, rb.pixels) for rb in accounted_rejected_blobs
             }
             for idx_b, b in enumerate(blobs):
-                if b.label not in _OBJECT_LABELS:
+                if b.label not in _OBJECT_LABELS or (b.in_corral is not None and b.in_sweep is not None):
                     continue
                 b_key = (b.label, b.x, b.y, b.w, b.h, b.pixels)
                 is_accounted_rej = b_key in accounted_rejected_keys
@@ -2064,7 +2062,7 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                 return False
 
             for idx_b, b in enumerate(blobs):
-                if b.label not in _OBJECT_LABELS:
+                if b.label not in _OBJECT_LABELS or (b.in_corral is not None and b.in_sweep is not None):
                     continue
                 blobs[idx_b] = Blob(
                     b.label,
@@ -2473,12 +2471,12 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                 merge=merge_fg,
             )
             for item in fg_blobs:
-                fx, fy, fw, fh = int(item.x()), int(item.y()), max(1, int(item.w())), max(1, int(item.h()))
+                fx, fy, fg_w, fg_h = int(item.x()), int(item.y()), max(1, int(item.w())), max(1, int(item.h()))
                 px = int(item.pixels())
                 if px < cfg.min_hazard_pixels:
                     continue
-                fg = Blob("unknown", fx, fy, fw, fh, px, px / float(fw * fh))
-                fg_roi = (fx, fy, fw, fh)
+                fg = Blob("unknown", fx, fy, fg_w, fg_h, px, px / float(fg_w * fg_h))
+                fg_roi = (fx, fy, fg_w, fg_h)
                 if fg_roi in emitted_unknown_rects:
                     continue
                 roi_surfaces: List[Blob] = []
@@ -2510,7 +2508,35 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                         ):
                             roi_objects.append(sub)
 
-                explained_px, union_area = _unique_explained_pixels(fg, roi_objects + roi_surfaces, cfg=cfg)
+                roi_accounted: List[Blob] = []
+                fx2, fy2 = fx + fg_w, fy + fg_h
+                for cl_pts, (ax1, ay1, ax2, ay2) in accounted_clusters:
+                    if not _rects_intersect(fx, fy, fg_w, fg_h, ax1, ay1, ax2 - ax1, ay2 - ay1):
+                        continue
+                    in_fg = [(x, y) for x, y in cl_pts if fx <= x < fx2 and fy <= y < fy2]
+                    if in_fg:
+                        px1 = min(p[0] for p in in_fg)
+                        py1 = min(p[1] for p in in_fg)
+                        px2 = max(p[0] for p in in_fg) + 1
+                        py2 = max(p[1] for p in in_fg) + 1
+                        pw, ph = max(1, px2 - px1), max(1, py2 - py1)
+                        pcnt = len(in_fg)
+                        roi_accounted.append(Blob("_accounted", px1, py1, pw, ph, pcnt, pcnt / float(pw * ph)))
+                for rb in accounted_rejected_blobs:
+                    inter = _rect_intersection(fx, fy, fg_w, fg_h, rb.x, rb.y, rb.w, rb.h)
+                    if inter is None:
+                        continue
+                    ix1, iy1, ix2, iy2 = inter
+                    iw, ih = max(1, ix2 - ix1), max(1, iy2 - iy1)
+                    if rb.pixels >= rb.w * rb.h:
+                        roi_accounted.append(Blob("_accounted", ix1, iy1, iw, ih, iw * ih, 1.0))
+                    elif rb.label in cfg.lab_thresholds:
+                        for sub in _extract_roi_blobs_for_label(img, "_accounted", cfg.lab_thresholds[rb.label], (ix1, iy1, iw, ih)):
+                            roi_accounted.append(sub)
+
+                explained_px, union_area = _unique_explained_pixels(
+                    fg, roi_objects + roi_surfaces + roi_accounted, cfg=cfg
+                )
                 unexplained_px = max(0, fg.pixels - explained_px)
                 pixel_coverage = explained_px / float(max(1, fg.pixels))
                 area_coverage = union_area / float(max(1, fg.w * fg.h))

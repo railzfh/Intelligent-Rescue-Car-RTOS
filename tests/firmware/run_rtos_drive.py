@@ -324,8 +324,10 @@ int main(int argc, char **argv) {
         vis.flags = VIS_FLAG_TARGET_VALID;
         assert(Rescue_Mission.On_Vision_State(vis, 1U));
         Step(0U, false);
+        vis.frame_seq++;
+        assert(Rescue_Mission.On_Vision_State(vis, 1U));
         Struct_Mission_Inputs min{};
-        min.can_launch = min.hardware_ready = min.button_pressed = min.wheels_still = min.camera_settled = true;
+        min.can_launch = min.hardware_ready = min.button_pressed = min.wheels_still = min.gate_settled = min.camera_settled = true;
         min.now_ms = 1U;
         Rescue_Mission.Update(min);
         min.button_pressed = false;
@@ -443,7 +445,7 @@ int main(int argc, char **argv) {
             Vision_Uart_RxCallback(buf, static_cast<uint16_t>(n));
         };
         uint32_t tm = 120U;
-        for (; tm < 220U; ++tm) {
+        for (; tm < 260U; ++tm) {
             if ((tm % 30U) == 0U) { feed_far_r7(fseq++, TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 190U); }
             Step(tm, false);
         }
@@ -583,9 +585,14 @@ int main(int argc, char **argv) {
         huart1.rx_healthy = true;
         Step(5U, false);
         Feed_Config(RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION);
-        Feed_Vision(1U);
-        for (uint32_t t = 10U; t < 40U; ++t) { Step(t, false); }
-        Step(40U, true);
+        uint16_t aseq = 1U;
+        uint32_t at = 10U;
+        for (; at < 190U; ++at) {
+            if ((at % 40U) == 0U) { Feed_Vision(aseq++); }
+            Step(at, false);
+        }
+        assert(Gate_Servo.Is_Settled() && Pitch_Servo.Is_Settled());
+        Step(at += 10U, true);
         static unsigned nonzero_after_uart_fault = 0U;
         nonzero_after_uart_fault = 0U;
         on_can_tx = [](FDCAN_HandleTypeDef *) {
@@ -595,7 +602,7 @@ int main(int argc, char **argv) {
         };
         // 1 = pre-drain check (no frames in ring), 2 = atomic mission+actuator+CAN commit check!
         huart1.inject_fault_at_epoch_read = 2U;
-        Step(70U, true);
+        Step(at += 30U, true);
         assert(!huart1.rx_healthy);
         assert(nonzero_after_uart_fault == 0U);
         assert(Rescue_Mission.Get_State() == MISSION_PRE_MATCH);
@@ -610,11 +617,11 @@ int main(int argc, char **argv) {
         // ZERO nonzero CAN commands may ever be enqueued after the UART error ISR executes, telemetry
         // for the committed tick stays internally consistent, and the very next tick immediately stops!
         huart1.rx_healthy = true;
-        Step(80U, false);
-        Step(110U, false);
-        Feed_Vision(2U);
-        Step(120U, false);
-        Step(130U, true);
+        Step(at += 10U, false);
+        Step(at += 30U, false);
+        Feed_Vision(aseq++);
+        Step(at += 10U, false);
+        Step(at += 10U, true);
         each_unmask = [] {
             if (M2006[0].torque != 0.0f || M2006[1].torque != 0.0f) {
                 huart1.rx_healthy = false;
@@ -622,23 +629,68 @@ int main(int argc, char **argv) {
                 each_unmask = nullptr;
             }
         };
-        Step(160U, true);
+        Step(at += 30U, true);
         assert(!huart1.rx_healthy);
         assert(nonzero_after_uart_fault == 0U);
         assert(Rescue_Mission.Is_Config_Locked());
         assert((Telemetry_Snapshot.status_flags & TEL_FLAG_VISION_FRESH) != 0U);
         on_can_tx = nullptr;
         // Very next tick observes the deferred UART fault immediately, clears VISION_FRESH, and stops chassis!
-        Step(161U, false);
+        Step(++at, false);
         assert((Telemetry_Snapshot.status_flags & TEL_FLAG_VISION_FRESH) == 0U);
         assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_UART_RX) != 0U);
         assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_STOPPING || Chassis_Drive.Get_Mode() == CHASSIS_MODE_IDLE);
-        uint32_t t_stop = 161U;
+        uint32_t t_stop = at;
         for (int k = 0; k < 100 && Chassis_Drive.Is_Active(); ++k) {
             Step(++t_stop, false);
         }
         Stopped();
         std::puts("PASS: atomic UART RX validation covers frame commit, match lock, CAN TX submissions, and deferred unmask ISR");
+        return 0;
+    }
+
+    const bool uart_overflow = argc > 1 && std::strcmp(argv[1], "uart_overflow") == 0;
+    if (uart_overflow) {
+        // Finding 2 (R12): UART RX ring overflow dropping bytes/frames MUST flush ring & parser,
+        // invalidate vision, expose FAULT_FLAG_UART_RX, refuse launch, and require a fresh post-overflow frame!
+        Feed_Config(RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION);
+        Feed_Vision(1U);
+        for (uint32_t t = 0U; t < 310U; ++t) {
+            if (t == 200U) { Feed_Vision(2U); }
+            Step(t, false);
+        }
+        Step(310U, true);
+        // Fill the 256-byte ring with a clean frame + padding, then overflow with an opponent-zone warning frame.
+        Feed_Vision(3U);
+        uint8_t pad[227] = {};
+        Vision_Uart_RxCallback(pad, sizeof(pad));
+        Feed_Vision(4U, VIS_FLAG_OPPONENT_ZONE_NEAR);
+        assert(Vision_Rx_Overflow_Count > 0U);
+        Step(340U, true);
+        assert(Rescue_Mission.Get_State() == MISSION_PRE_MATCH);
+        assert((Telemetry_Snapshot.status_flags & TEL_FLAG_VISION_FRESH) == 0U);
+        assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_UART_RX) != 0U);
+        Stopped();
+
+        // Next tick with NO new frame -> vision MUST remain invalidated and launch MUST remain refused!
+        Step(350U, false);
+        Step(380U, false);
+        Step(390U, true);
+        Step(420U, true);
+        assert(Rescue_Mission.Get_State() == MISSION_PRE_MATCH);
+        assert((Telemetry_Snapshot.status_flags & TEL_FLAG_VISION_FRESH) == 0U);
+        Stopped();
+
+        // Brand-new post-overflow FAR frame cleanly restores VISION_FRESH and allows launch!
+        Feed_Vision(5U);
+        Step(430U, false);
+        Step(460U, false);
+        assert((Telemetry_Snapshot.status_flags & TEL_FLAG_VISION_FRESH) != 0U);
+        assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_UART_RX) == 0U);
+        Step(470U, true);
+        Step(500U, true);
+        assert(Rescue_Mission.Get_State() == MISSION_LAUNCH_CROSS_BUMPS);
+        std::puts("PASS: UART RX ring overflow flushes ring/parser, invalidates vision, blocks launch, and recovers on fresh frame");
         return 0;
     }
 
@@ -1135,21 +1187,26 @@ int main(int argc, char **argv) {
 
     if (can_fault) {
         Feed_Config(RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION);
-        Feed_Vision(1U);
-        Step(0, false); Step(30, false);
-        Step(40, true); Step(70, true);
+        uint16_t cfseq = 1U;
+        uint32_t cft = 0U;
+        for (; cft < 190U; ++cft) {
+            if ((cft % 40U) == 0U) { Feed_Vision(cfseq++); }
+            Step(cft, false);
+        }
+        assert(Gate_Servo.Is_Settled() && Pitch_Servo.Is_Settled());
+        Step(cft += 10U, true); Step(cft += 30U, true);
         assert(Rescue_Mission.Get_State() == MISSION_LAUNCH_CROSS_BUMPS);
         assert(M2006[0].torque < 0 && M2006[1].torque > 0);
 
         hfdcan1.fail = true;
-        Feed_Vision(2U);
-        Step(80, false);
+        Feed_Vision(cfseq++);
+        Step(cft += 10U, false);
         assert(Rescue_Mission.Get_State() == MISSION_FAULT_STOP);
         Stopped();
 
         hfdcan1.fail = false;
-        Feed_Vision(3U);
-        Step(90, false);
+        Feed_Vision(cfseq++);
+        Step(cft += 10U, false);
         assert(Rescue_Mission.Get_State() == MISSION_FAULT_STOP);
         Stopped();
         std::puts("PASS: competition CAN TX failure latches MISSION_FAULT_STOP with zero torque");
@@ -1159,19 +1216,24 @@ int main(int argc, char **argv) {
     if (frozen) {
         Feed_Config(RESCUE_TEAM_BLUE, 2U, RESCUE_MODE_COMPETITION);
         uint16_t fseq = 1U;
-        Feed_Vision(fseq++);
-        Step(0, false); Step(30, false);
-        Step(40, true); Step(70, true);
+        uint32_t ft = 0U;
+        for (; ft < 190U; ++ft) {
+            if ((ft % 40U) == 0U) { Feed_Vision(fseq++); }
+            Step(ft, false);
+        }
+        assert(Gate_Servo.Is_Settled() && Pitch_Servo.Is_Settled());
+        Step(ft += 10U, true); Step(ft += 30U, true);
         assert(Rescue_Mission.Get_State() == MISSION_LAUNCH_CROSS_BUMPS);
 
         uint32_t fault_at_ms = 0U;
-        for (uint32_t t = 71U; t <= 12000U; ++t) {
+        const uint32_t launch_ms = ft;
+        for (uint32_t t = launch_ms + 1U; t <= launch_ms + 12000U; ++t) {
             if ((t % 50U) == 0U) {
                 Feed_Vision(fseq++);
             }
             Step(t, false);
             if (Rescue_Mission.Get_State() == MISSION_FAULT_STOP) {
-                fault_at_ms = t;
+                fault_at_ms = t - launch_ms;
                 break;
             }
         }
@@ -1190,22 +1252,26 @@ int main(int argc, char **argv) {
         assert(Rescue_Mission.Get_State() == MISSION_PRE_MATCH);
 
         Feed_Config(RESCUE_TEAM_BLUE, 2U, RESCUE_MODE_COMPETITION);
-        Feed_Vision(1U);
-        Step(80, false, true);
-        Step(110, false, true);
+        uint16_t cseq = 1U;
+        uint32_t ct = 80U;
+        for (; ct < 260U; ++ct) {
+            if ((ct % 40U) == 0U) { Feed_Vision(cseq++); }
+            Step(ct, false, true);
+        }
+        assert(Gate_Servo.Is_Settled() && Pitch_Servo.Is_Settled());
         assert(Status_LED_Color.Blue > 200U && Status_LED_Color.Red == 0U);
         assert(Telemetry_Snapshot.team == RESCUE_TEAM_BLUE && Telemetry_Snapshot.start_zone == 2U);
 
-        Step(120, true, true);
-        Step(150, true, true);
+        Step(ct += 10U, true, true);
+        Step(ct += 30U, true, true);
         assert(Rescue_Mission.Get_State() == MISSION_LAUNCH_CROSS_BUMPS);
         assert(Rescue_Mission.Is_Config_Locked());
         assert(M2006[0].torque < 0 && M2006[1].torque > 0);
         Feed_Config(RESCUE_TEAM_RED, 4U, RESCUE_MODE_COMPETITION);
-        Step(160, false, true);
+        Step(ct += 10U, false, true);
         assert(Rescue_Mission.Get_Team() == RESCUE_TEAM_BLUE);
-        Battery.Update(19.0f, 170U);
-        now_ms = 170U;
+        Battery.Update(19.0f, ct + 10U);
+        now_ms = ct + 10U;
         Drive_Control();
         Stopped();
         assert(!Gate_Servo.Is_Enabled() && !Pitch_Servo.Is_Enabled());
@@ -1271,6 +1337,7 @@ int main(int argc, char **argv) {
     Step(550, false); Step(580, false); Step(590, true); Step(620, true);
     Stopped();
     std::puts("PASS: early/held key, forward signs, IMU/CAN/feedback faults, low-voltage latch");
+    return 0;
 }
 '''
 source = out / "test_rtos_drive.cpp"
@@ -1287,5 +1354,5 @@ cmd = ["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-Wno-unused-variable
 if os.name == "nt":
     cmd.append("-static")
 subprocess.run(cmd, check=True)
-for mode in ([], ["held"], ["comp"], ["can_fault"], ["frozen"], ["cold_boot"], ["servo_fail"], ["reverse_abort"], ["uart_unhealthy"], ["standstill_can"], ["irq_races"], ["uart_atomic"], ["resync_drain"], ["gate_blind_abort"], ["can_tx_complete"], ["can_standstill_hw"]):
+for mode in ([], ["held"], ["comp"], ["can_fault"], ["frozen"], ["cold_boot"], ["servo_fail"], ["reverse_abort"], ["uart_unhealthy"], ["standstill_can"], ["irq_races"], ["uart_atomic"], ["uart_overflow"], ["resync_drain"], ["gate_blind_abort"], ["can_tx_complete"], ["can_standstill_hw"]):
     subprocess.run([str(exe), *mode], check=True)

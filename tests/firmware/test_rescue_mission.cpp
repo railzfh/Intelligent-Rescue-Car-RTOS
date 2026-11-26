@@ -42,6 +42,9 @@ static void Test_Freshness_Nonconsecutive_Replay_Wrap_And_Restart()
     Struct_Mission_Inputs in{};
     in.hardware_ready = true;
     in.can_launch = true;
+    in.wheels_still = true;
+    in.gate_settled = true;
+    in.camera_settled = true;
 
     // Cannot launch competition without team & fresh vision.
     in.now_ms = 100U;
@@ -97,6 +100,7 @@ static void Test_Stale_Vision_And_Opponent_Interlock_During_Moving_States()
     in.hardware_ready = true;
     in.can_launch = true;
     in.button_pressed = true;
+    in.wheels_still = true;
     in.gate_settled = true;
     in.camera_settled = true;
     auto out = mission.Update(in);
@@ -154,6 +158,7 @@ static void Test_Cyan_Interrupts_Unsettled_Gate_Closure()
     in.hardware_ready = true;
     in.can_launch = true;
     in.button_pressed = true;
+    in.wheels_still = true;
     in.gate_settled = true;
     in.camera_settled = true;
     mission.Update(in);
@@ -200,6 +205,7 @@ static void Test_Cyan_Interrupts_Unsettled_Gate_Closure()
     bin.hardware_ready = true;
     bin.can_launch = true;
     bin.button_pressed = true;
+    bin.wheels_still = true;
     bin.gate_settled = true;
     bin.camera_settled = true;
     blind_m.Update(bin);
@@ -1017,6 +1023,7 @@ static void Test_Same_Cargo_Reverify_After_Escape_Cannot_Bypass_Recovery_Budget(
     in.hardware_ready = true;
     in.can_launch = true;
     in.button_pressed = true;
+    in.wheels_still = true;
     in.gate_settled = true;
     in.camera_settled = true;
     mission.Update(in);
@@ -1427,6 +1434,236 @@ static void Test_Drop_Verify_Requires_Consecutive_Near_Frames()
     assert(dm.Get_Delivered_Green() == 1U);
 }
 
+static void Test_Round12_Push_Same_Drain_Standstill_Bench_Leave_And_Interrupted_Drop()
+{
+    const uint16_t safe = VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR;
+    const uint16_t aligned = safe | VIS_FLAG_HOME_VALID | VIS_FLAG_HOME_HALF_MATCH |
+                             VIS_FLAG_DROP_PATH_CLEAR | VIS_FLAG_DROP_BASELINE_READY;
+
+    struct Harness
+    {
+        Class_Rescue_Mission m;
+        Struct_Mission_Inputs in{};
+        uint16_t seq = 1U;
+        uint32_t t = 1000U;
+        Struct_Mission_Output tick(uint32_t dt = 10U)
+        {
+            in.now_ms = (t += dt);
+            return m.Update(in);
+        }
+        void far(uint8_t type, uint16_t flags, uint16_t dist)
+        {
+            assert(m.On_Vision_State(Make_Far_Vision(seq++, type, flags, 0, dist), t));
+        }
+        void near(uint8_t g, uint16_t flags)
+        {
+            assert(m.On_Vision_State(Make_Near_Vision(seq++, g, 0U, 0U, 0U, 0U, flags), t));
+        }
+        void to_inspect()
+        {
+            assert(m.On_Set_Config({RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION, 1U}));
+            in.hardware_ready = in.can_launch = in.wheels_still = in.gate_settled = in.camera_settled = true;
+            in.button_pressed = true;
+            far(TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 190U);
+            assert(tick().drive_action == DRIVE_ACTION_START_DISTANCE);
+            in.button_pressed = false;
+            in.chassis_motion_done = true;
+            tick();
+            in.chassis_motion_done = false;
+            tick();
+            tick();
+            assert(m.Get_State() == MISSION_INSPECT_CORRAL);
+        }
+        void to_opening()
+        {
+            to_inspect();
+            for (unsigned i = 0; i < 6U; ++i)
+            {
+                near(1U, VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR);
+                tick();
+            }
+            assert(m.Get_State() == MISSION_FIND_HOME);
+            far(TARGET_NONE, VIS_FLAG_HOME_VALID, 500U);
+            tick();
+            far(TARGET_NONE, VIS_FLAG_HOME_VALID | VIS_FLAG_HOME_HALF_MATCH, 200U);
+            tick();
+            const uint16_t al = VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR | VIS_FLAG_HOME_VALID |
+                                VIS_FLAG_HOME_HALF_MATCH | VIS_FLAG_DROP_PATH_CLEAR | VIS_FLAG_DROP_BASELINE_READY;
+            for (unsigned i = 0; i < 3U; ++i)
+            {
+                near(1U, al);
+                tick();
+            }
+            assert(m.Get_State() == MISSION_DROP_OPEN_AND_PUSH);
+            assert(!tick().gate_closed);
+        }
+        void to_pushing()
+        {
+            to_opening();
+            const uint16_t al = VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR | VIS_FLAG_HOME_VALID |
+                                VIS_FLAG_HOME_HALF_MATCH | VIS_FLAG_DROP_PATH_CLEAR | VIS_FLAG_DROP_BASELINE_READY;
+            near(1U, al | VIS_FLAG_GATE_OPEN_SETTLED_ACK);
+            assert(tick().drive_action == DRIVE_ACTION_START_DISTANCE);
+        }
+        void to_verifying()
+        {
+            to_pushing();
+            in.chassis_motion_done = true;
+            near(0U, VIS_FLAG_CORRAL_SAFE | VIS_FLAG_SWEEP_CLEAR | VIS_FLAG_HOME_VALID |
+                         VIS_FLAG_HOME_HALF_MATCH | VIS_FLAG_DROP_PATH_CLEAR);
+            tick();
+            in.chassis_motion_done = false;
+            assert(m.Get_State() == MISSION_DROP_BACKOUT_VERIFY);
+        }
+    };
+
+    // 1. P1-3: Idle drive with moving wheels MUST NOT authorize gate closure, and losing standstill
+    //    during unsettled gate closure MUST immediately retract gate to open!
+    {
+        Harness h;
+        h.to_inspect();
+        h.in.chassis_active = false;
+        h.in.wheels_still = false;
+        for (unsigned i = 0; i < 4U; ++i)
+        {
+            h.near(1U, safe);
+            const auto out = h.tick();
+            assert(!out.gate_closed);
+            assert(h.m.Get_State() == MISSION_INSPECT_CORRAL);
+        }
+        // Once wheels settle, must still need 3 fresh post-standstill NEAR frames.
+        h.in.wheels_still = true;
+        assert(!h.tick().gate_closed); // no new frame -> cannot recount cached frame!
+        for (unsigned i = 0; i < 2U; ++i)
+        {
+            h.near(1U, safe);
+            assert(!h.tick().gate_closed);
+        }
+        h.near(1U, safe);
+        assert(h.tick().gate_closed);
+        assert(h.m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
+        // Losing standstill mid-closure (!gate_settled) immediately retracts!
+        h.in.gate_settled = false;
+        h.in.wheels_still = false;
+        h.near(1U, safe);
+        const auto retract = h.tick();
+        assert(!retract.gate_closed);
+        assert(h.m.Get_State() == MISSION_INSPECT_CORRAL);
+    }
+
+    // 2. P1-4: Leaving bench clears actuator overrides; competition launch requires settled open/FAR
+    //    servos AND a fresh post-settle FAR frame (never cached NEAR or pre-settle FAR)!
+    {
+        Harness h;
+        h.in.hardware_ready = h.in.can_launch = h.in.wheels_still = true;
+        assert(h.m.On_Set_Config({RESCUE_TEAM_RED, 1U, RESCUE_MODE_BENCH_STRAIGHT, 1U}));
+        assert(h.m.On_Bench_Actuator({BENCH_SERVO_POS_B, BENCH_SERVO_POS_B, 0U}));
+        assert(h.m.Is_Gate_Closed_Cmd() && h.m.Is_Camera_Near_Cmd());
+        assert(h.m.On_Set_Config({RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION, 1U}));
+        assert(!h.m.Is_Gate_Closed_Cmd() && !h.m.Is_Camera_Near_Cmd());
+        h.near(0U, safe);
+        const auto pre = h.tick();
+        assert(!pre.gate_closed && !pre.camera_near);
+        h.in.button_pressed = true;
+        auto out = h.tick();
+        assert(out.drive_action == DRIVE_ACTION_IDLE && out.launch_rejected_cue);
+        // Even a pre-settle FAR frame followed by settling with no new frame MUST still refuse launch!
+        h.far(TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 500U);
+        out = h.tick();
+        assert(out.drive_action == DRIVE_ACTION_IDLE);
+        h.in.gate_settled = true;
+        h.in.camera_settled = true;
+        out = h.tick();
+        assert(out.drive_action == DRIVE_ACTION_IDLE && out.launch_rejected_cue);
+        // Fresh post-settle FAR frame authorizes competition launch!
+        h.far(TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 500U);
+        out = h.tick();
+        assert(out.drive_action == DRIVE_ACTION_START_DISTANCE);
+        assert(h.m.Get_State() == MISSION_LAUNCH_CROSS_BUMPS);
+    }
+
+    // 3. P1-1: Same-drain path block / opponent alert / half mismatch MUST NOT be hidden by a clean tail frame!
+    {
+        Harness h;
+        h.to_opening();
+        h.near(1U, aligned & ~VIS_FLAG_DROP_PATH_CLEAR);
+        h.near(1U, aligned | VIS_FLAG_GATE_OPEN_SETTLED_ACK);
+        const auto out = h.tick();
+        assert(out.drive_action == DRIVE_ACTION_EMERGENCY_STOP);
+        assert(h.m.Get_State() == MISSION_BACK_OUT_SEPARATE);
+    }
+    {
+        Harness h;
+        h.to_pushing();
+        h.in.chassis_active = true;
+        h.in.wheels_still = false;
+        h.near(0U, aligned & ~VIS_FLAG_DROP_PATH_CLEAR);
+        h.near(0U, aligned);
+        const auto out = h.tick();
+        assert(out.drive_action == DRIVE_ACTION_EMERGENCY_STOP);
+        assert(h.m.Get_State() == MISSION_BACK_OUT_SEPARATE);
+    }
+    {
+        Harness h;
+        h.to_opening();
+        h.near(1U, aligned | VIS_FLAG_OPPONENT_ZONE_NEAR);
+        h.near(1U, aligned | VIS_FLAG_GATE_OPEN_SETTLED_ACK);
+        const auto out = h.tick();
+        assert(out.drive_action != DRIVE_ACTION_START_DISTANCE);
+        assert(h.m.Get_State() == MISSION_ESCAPE_RECOVERY);
+    }
+    {
+        Harness h;
+        h.to_opening();
+        h.near(1U, aligned & ~VIS_FLAG_HOME_HALF_MATCH);
+        h.near(1U, aligned | VIS_FLAG_GATE_OPEN_SETTLED_ACK);
+        const auto out = h.tick();
+        assert(out.drive_action == DRIVE_ACTION_SOFT_STOP);
+        assert(h.m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
+    }
+
+    // 4. P2-1: Interrupted confirmation streaks (unsettled camera without new frame, OR moving FAR)
+    //    MUST NOT recount cached frames or preserve Confirm_Count!
+    {
+        Harness h;
+        h.to_verifying();
+        h.near(0U, safe | VIS_FLAG_DROP_CONFIRMED);
+        h.tick();
+        h.in.camera_settled = false;
+        h.tick();
+        h.in.camera_settled = true;
+        h.tick(); // No new frame since unsettled edge -> MUST NOT recount cached frame!
+        for (unsigned i = 0; i < 2U; ++i)
+        {
+            h.near(0U, safe | VIS_FLAG_DROP_CONFIRMED);
+            h.tick();
+        }
+        assert(h.m.Get_Delivered_Green() == 0U);
+        assert(!h.m.Is_First_Green_Unlocked());
+        h.near(0U, safe | VIS_FLAG_DROP_CONFIRMED);
+        h.tick();
+        assert(h.m.Get_Delivered_Green() == 1U);
+        assert(h.m.Is_First_Green_Unlocked());
+    }
+    {
+        Harness h;
+        h.to_verifying();
+        for (unsigned i = 0; i < 2U; ++i)
+        {
+            h.near(0U, safe | VIS_FLAG_DROP_CONFIRMED);
+            h.tick();
+        }
+        h.in.wheels_still = false;
+        h.far(TARGET_NONE, 0U, 0U);
+        h.tick();
+        h.in.wheels_still = true;
+        h.near(0U, safe | VIS_FLAG_DROP_CONFIRMED);
+        h.tick();
+        assert(h.m.Get_Delivered_Green() == 0U);
+        assert(!h.m.Is_First_Green_Unlocked());
+    }
+}
+
 int main()
 {
     Test_Freshness_Nonconsecutive_Replay_Wrap_And_Restart();
@@ -1440,5 +1677,7 @@ int main()
     Test_Same_Cargo_Reverify_After_Escape_Cannot_Bypass_Recovery_Budget();
     Test_Braking_Phase_Vision_Outage_And_Uart_Rx_Unhealthy();
     Test_Drop_Verify_Requires_Consecutive_Near_Frames();
-    std::puts("PASS: rescue mission replay/wrap, stale/opponent interlock, gate/push hazard abort, margin reverse + standstill, braking outage gate, drop consecutive confirm, bounded recovery");
+    Test_Round12_Push_Same_Drain_Standstill_Bench_Leave_And_Interrupted_Drop();
+    std::puts("PASS: rescue mission replay/wrap, stale/opponent interlock, gate/push hazard abort, margin reverse + standstill, braking outage gate, drop consecutive confirm, R12 safety invariants, bounded recovery");
+    return 0;
 }

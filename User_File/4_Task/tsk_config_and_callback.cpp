@@ -117,6 +117,7 @@ static uint8_t Vision_Rx_Ring[Vision_Rx_Ring_Size] = {};
 static volatile uint16_t Vision_Rx_Head = 0U;
 static volatile uint16_t Vision_Rx_Tail = 0U;
 static volatile uint32_t Vision_Rx_Overflow_Count = 0U;
+static uint32_t Last_Vision_Rx_Overflow_Count = 0U;
 static uint32_t Last_Uart_Rx_Epoch = 0U;
 static bool Vision_Rx_Was_Healthy = true;
 static bool Standstill_Zero_Tx_Armed[2] = {};
@@ -273,17 +274,19 @@ static void Drive_Notify_Buzzer(bool can_start, bool reject_cue, uint32_t now_ms
     }
 }
 
-static bool Vision_Sample_Rx_State(bool &healthy, bool &fault_latched, uint32_t &epoch)
+static bool Vision_Sample_Rx_State(bool &healthy, bool &fault_latched, uint32_t &epoch, uint32_t &overflow_count)
 {
-    // Read epoch before health/fault while caller masks IRQs so validation and commit are atomic
-    // against HAL_UART_ErrorCallback.
+    // Read epoch and ring-overflow counter before health/fault while caller masks IRQs so
+    // validation and commit are atomic against HAL_UART_ErrorCallback and Vision_Uart_RxCallback.
     epoch = UART_Get_Rx_Epoch(&huart1);
+    overflow_count = Vision_Rx_Overflow_Count;
     healthy = UART_Is_Rx_Healthy(&huart1);
     fault_latched = UART_Is_Rx_Fault_Latched(&huart1);
     return healthy && !fault_latched;
 }
 
-static bool Vision_Commit_Frame(const Struct_Rescue_Frame &frame, uint32_t now_ms, uint32_t expected_epoch)
+static bool Vision_Commit_Frame(const Struct_Rescue_Frame &frame, uint32_t now_ms,
+                                uint32_t expected_epoch, uint32_t expected_overflow)
 {
     Struct_Vision_Heartbeat hb{};
     Struct_Match_Config_Cmd cfg{};
@@ -311,14 +314,16 @@ static bool Vision_Commit_Frame(const Struct_Rescue_Frame &frame, uint32_t now_m
         return true;
     }
 
-    // Atomic validation + frame commit with UART error ISR masked.
+    // Atomic validation + frame commit with UART RX/error IRQs masked.
     bool commit_ok = false;
     const uint32_t mask = __get_PRIMASK();
     __disable_irq();
     bool rx_h = false;
     bool rx_f = false;
     uint32_t rx_ep = 0U;
-    if (Vision_Sample_Rx_State(rx_h, rx_f, rx_ep) && rx_ep == expected_epoch)
+    uint32_t rx_ov = 0U;
+    if (Vision_Sample_Rx_State(rx_h, rx_f, rx_ep, rx_ov) &&
+        rx_ep == expected_epoch && rx_ov == expected_overflow)
     {
         commit_ok = true;
         if (frame.msg_type == RESCUE_MSG_HEARTBEAT)
@@ -341,6 +346,7 @@ static bool Vision_Commit_Frame(const Struct_Rescue_Frame &frame, uint32_t now_m
     else
     {
         Last_Uart_Rx_Epoch = UART_Get_Rx_Epoch(&huart1);
+        Last_Vision_Rx_Overflow_Count = Vision_Rx_Overflow_Count;
         Vision_Rx_Tail = Vision_Rx_Head;
         Rescue_Mission.On_Uart_Rx_Fault();
         Vision_Rx_Was_Healthy = false;
@@ -354,7 +360,7 @@ static bool Vision_Commit_Frame(const Struct_Rescue_Frame &frame, uint32_t now_m
     return true;
 }
 
-static bool Vision_Drain_Rx(uint32_t now_ms, uint32_t expected_epoch)
+static bool Vision_Drain_Rx(uint32_t now_ms, uint32_t expected_epoch, uint32_t expected_overflow)
 {
     uint16_t tail = Vision_Rx_Tail;
     const uint16_t head = Vision_Rx_Head;
@@ -363,7 +369,7 @@ static bool Vision_Drain_Rx(uint32_t now_ms, uint32_t expected_epoch)
     // Drain any complete frame already buffered inside the parser before consuming new UART bytes.
     while (Vision_Parser.Poll_Buffered_Frame(frame))
     {
-        if (!Vision_Commit_Frame(frame, now_ms, expected_epoch))
+        if (!Vision_Commit_Frame(frame, now_ms, expected_epoch, expected_overflow))
         {
             return false;
         }
@@ -378,14 +384,39 @@ static bool Vision_Drain_Rx(uint32_t now_ms, uint32_t expected_epoch)
         }
         do
         {
-            if (!Vision_Commit_Frame(frame, now_ms, expected_epoch))
+            if (!Vision_Commit_Frame(frame, now_ms, expected_epoch, expected_overflow))
             {
                 return false;
             }
         } while (Vision_Parser.Poll_Buffered_Frame(frame));
     }
-    __DMB();
-    Vision_Rx_Tail = tail;
+    bool tail_ok = false;
+    const uint32_t mask = __get_PRIMASK();
+    __disable_irq();
+    bool rx_h = false;
+    bool rx_f = false;
+    uint32_t rx_ep = 0U;
+    uint32_t rx_ov = 0U;
+    if (Vision_Sample_Rx_State(rx_h, rx_f, rx_ep, rx_ov) &&
+        rx_ep == expected_epoch && rx_ov == expected_overflow)
+    {
+        Vision_Rx_Tail = tail;
+        tail_ok = true;
+    }
+    else
+    {
+        Last_Uart_Rx_Epoch = UART_Get_Rx_Epoch(&huart1);
+        Last_Vision_Rx_Overflow_Count = Vision_Rx_Overflow_Count;
+        Vision_Rx_Tail = Vision_Rx_Head;
+        Rescue_Mission.On_Uart_Rx_Fault();
+        Vision_Rx_Was_Healthy = false;
+    }
+    __set_PRIMASK(mask);
+    if (!tail_ok)
+    {
+        Vision_Parser.Reset();
+        return false;
+    }
     return true;
 }
 
@@ -503,19 +534,23 @@ static void Drive_Control()
     bool uart_rx_healthy = false;
     bool uart_rx_fault = false;
     uint32_t uart_rx_epoch = 0U;
+    uint32_t uart_rx_overflow = 0U;
     bool need_drain = false;
     bool need_parser_reset = false;
     {
         const uint32_t rx_mask = __get_PRIMASK();
         __disable_irq();
-        Vision_Sample_Rx_State(uart_rx_healthy, uart_rx_fault, uart_rx_epoch);
-        if (!uart_rx_healthy || uart_rx_fault || uart_rx_epoch != Last_Uart_Rx_Epoch)
+        Vision_Sample_Rx_State(uart_rx_healthy, uart_rx_fault, uart_rx_epoch, uart_rx_overflow);
+        const bool overflow_occurred = (uart_rx_overflow != Last_Vision_Rx_Overflow_Count);
+        if (!uart_rx_healthy || uart_rx_fault || uart_rx_epoch != Last_Uart_Rx_Epoch || overflow_occurred)
         {
             Last_Uart_Rx_Epoch = UART_Get_Rx_Epoch(&huart1);
+            Last_Vision_Rx_Overflow_Count = Vision_Rx_Overflow_Count;
             Vision_Rx_Tail = Vision_Rx_Head;
             Rescue_Mission.On_Uart_Rx_Fault();
-            Vision_Rx_Was_Healthy = uart_rx_healthy && !uart_rx_fault;
+            Vision_Rx_Was_Healthy = uart_rx_healthy && !uart_rx_fault && !overflow_occurred;
             uart_rx_healthy = false;
+            uart_rx_fault = uart_rx_fault || overflow_occurred;
             need_parser_reset = true;
         }
         else
@@ -534,10 +569,10 @@ static void Drive_Control()
     {
         Vision_Parser.Reset();
     }
-    if (need_drain && !Vision_Drain_Rx(now_ms, uart_rx_epoch))
+    if (need_drain && !Vision_Drain_Rx(now_ms, uart_rx_epoch, uart_rx_overflow))
     {
         uart_rx_healthy = false;
-        uart_rx_fault = UART_Is_Rx_Fault_Latched(&huart1);
+        uart_rx_fault = true;
     }
 
     // 舵机控制：等待首帧有效电池采样后再启动 PWM；真实电池故障或 PWM 启动失败则永久锁停。
@@ -614,15 +649,18 @@ static void Drive_Control()
         bool rx_ok_now = false;
         bool rx_fault_now = false;
         uint32_t rx_epoch_now = 0U;
-        Vision_Sample_Rx_State(rx_ok_now, rx_fault_now, rx_epoch_now);
-        if (!rx_ok_now || rx_fault_now || rx_epoch_now != Last_Uart_Rx_Epoch)
+        uint32_t rx_overflow_now = 0U;
+        Vision_Sample_Rx_State(rx_ok_now, rx_fault_now, rx_epoch_now, rx_overflow_now);
+        const bool rx_overflow_changed = (rx_overflow_now != Last_Vision_Rx_Overflow_Count);
+        if (!rx_ok_now || rx_fault_now || rx_epoch_now != Last_Uart_Rx_Epoch || rx_overflow_changed)
         {
             Last_Uart_Rx_Epoch = UART_Get_Rx_Epoch(&huart1);
+            Last_Vision_Rx_Overflow_Count = Vision_Rx_Overflow_Count;
             Vision_Rx_Tail = Vision_Rx_Head;
             Rescue_Mission.On_Uart_Rx_Fault();
             uart_rx_healthy = false;
-            uart_rx_fault = uart_rx_fault || rx_fault_now;
-            Vision_Rx_Was_Healthy = rx_ok_now && !rx_fault_now;
+            uart_rx_fault = uart_rx_fault || rx_fault_now || rx_overflow_changed;
+            Vision_Rx_Was_Healthy = rx_ok_now && !rx_fault_now && !rx_overflow_changed;
             reset_parser_after_commit = true;
         }
 
@@ -805,7 +843,9 @@ static void Drive_Control()
         tel.start_zone = Rescue_Mission.Get_Start_Zone();
         tel.run_mode = Rescue_Mission.Get_Run_Mode();
 
-        const bool pub_rx_ok = uart_rx_healthy && UART_Is_Rx_Healthy(&huart1) && !UART_Is_Rx_Fault_Latched(&huart1);
+        const bool pub_rx_ok = uart_rx_healthy && UART_Is_Rx_Healthy(&huart1) &&
+                               !UART_Is_Rx_Fault_Latched(&huart1) &&
+                               (Vision_Rx_Overflow_Count == Last_Vision_Rx_Overflow_Count);
         uint16_t status_flags = 0U;
         if (Rescue_Mission.Is_Config_Locked()) { status_flags |= TEL_FLAG_CONFIG_LOCKED; }
         if (battery_ready) { status_flags |= TEL_FLAG_BATTERY_OK; }

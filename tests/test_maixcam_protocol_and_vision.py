@@ -1765,6 +1765,128 @@ class MaixcamVisionAndUITest(unittest.TestCase):
         st_8c_hit = RescueVisionProcessor(self.cfg).process(blobs_8c_hit, **kw)
         self.assertFalse(st_8c_hit.flags & VIS_FLAG_SWEEP_CLEAR)
 
+    def test_round12_cyan_footprint_low_thresh_conflict_tier3_and_ramp_adjacency(self) -> None:
+        from types import SimpleNamespace
+
+        floor = (85, 0, 0)
+        shared_cg = (60, -25, 10)
+        green_only = (55, -35, 30)
+        orange_only = (65, 45, 60)
+        shared_go = (60, 10, 45)
+        red = (52, 56, 22)
+        purple = (45, 35, -30)
+        unknown_lab = (55, 0, 45)
+        kw = dict(camera_near_cmd=True, camera_settled=True, team=TEAM_RED, first_green_unlocked=False)
+
+        # 1. P1-5: Cyan conflict MUST retain cyan priority AND use the FULL connected conflict footprint
+        #    across ALL safety regions (drop ROI, sweep ROI, corral) with NO second min-size test on clipped tail!
+        cg_cfg = RescueVisionConfig()
+        cg_cfg.lab_thresholds["cyan"] = [48, 90, -48, -16, -42, 20]
+        cg_cfg.lab_thresholds["green"] = [30, 82, -60, -18, 0, 55]
+        for cls in (_FakeMaixImage, _FakeMaixBinaryImage, _FakeMaixNativeStrideImage):
+            # 100-px cyan-connected tail inside near_drop_roi (x=40..50) -> MUST clear DROP_PATH_CLEAR!
+            img_drop = cls(320, 240, floor)
+            img_drop.fill_rect(97, 25, 200, 50, red)
+            img_drop.fill_rect(97, 75, 200, 8, purple)
+            img_drop.fill_rect(30, 100, 10, 10, shared_cg)
+            img_drop.fill_rect(40, 100, 10, 10, green_only)
+            blobs_drop = extract_blobs_from_maix_image(img_drop, cg_cfg, scan_unknown_near=True)
+            self.assertEqual([b.label for b in blobs_drop if b.label in ("cyan", "green", "unknown")], ["cyan"], cls.__name__)
+            st_drop = RescueVisionProcessor(cg_cfg).process(blobs_drop, **kw)
+            self.assertFalse(st_drop.flags & VIS_FLAG_DROP_PATH_CLEAR, cls.__name__)
+
+            # 48-px (< min_hazard_pixels=60) cyan-connected tail inside near_sweep_roi -> MUST clear SWEEP_CLEAR!
+            img_sw = cls(320, 240, floor)
+            img_sw.fill_rect(232, 108, 12, 10, shared_cg)
+            img_sw.fill_rect(232, 118, 12, 4, green_only)
+            blobs_sw = extract_blobs_from_maix_image(img_sw, cg_cfg, scan_unknown_near=True)
+            self.assertEqual([b.label for b in blobs_sw if b.label in ("cyan", "green", "unknown")], ["cyan"], cls.__name__)
+            st_sw = RescueVisionProcessor(cg_cfg).process(blobs_sw, **kw)
+            self.assertFalse(st_sw.flags & VIS_FLAG_SWEEP_CLEAR, cls.__name__)
+
+        # 2. P2-2: Competing alternate-class components down to min_hazard_pixels (60) participate in
+        #    cross-label disambiguation, while standalone < min_block_pixels (90) is still NOT accepted as legal!
+        go_cfg = RescueVisionConfig()
+        go_cfg.lab_thresholds["green"] = [30, 82, -60, 20, 12, 55]
+        go_cfg.lab_thresholds["orange"] = [48, 88, 0, 58, 36, 78]
+        for cls in (_FakeMaixImage, _FakeMaixBinaryImage, _FakeMaixNativeStrideImage):
+            img_70 = cls(320, 240, floor)
+            img_70.fill_rect(120, 150, 5, 10, green_only)  # 50 green-only
+            img_70.fill_rect(125, 150, 7, 10, shared_go)   # 70 shared -> green=120, orange=70 (>= 60, < 90)!
+            blobs_70 = extract_blobs_from_maix_image(img_70, go_cfg, scan_unknown_near=True)
+            st_70 = RescueVisionProcessor(go_cfg).process(blobs_70, **kw)
+            self.assertEqual(st_70.corral_green_cnt, 0, cls.__name__)
+            self.assertEqual(st_70.corral_orange_cnt, 0, cls.__name__)
+            self.assertEqual(st_70.corral_unknown_cnt, 1, cls.__name__)
+            self.assertFalse(st_70.flags & VIS_FLAG_CORRAL_SAFE, cls.__name__)
+
+            # Standalone 70-px orange-only patch MUST NOT be accepted as a legal orange block!
+            img_only70 = cls(320, 240, floor)
+            img_only70.fill_rect(120, 150, 7, 10, orange_only)
+            blobs_only70 = extract_blobs_from_maix_image(img_only70, go_cfg, scan_unknown_near=True)
+            st_only70 = RescueVisionProcessor(go_cfg).process(blobs_only70, **kw)
+            self.assertEqual(st_only70.corral_orange_cnt, 0, cls.__name__)
+            self.assertEqual(st_only70.corral_unknown_cnt, 1, cls.__name__)
+
+        # 3. P2-3: Tier 3 (find_blobs-only adapter) subtracts accounted conflict/rejected pixels instead of
+        #    re-emitting ROI slices -> straddling 9600-px patch produces EXACTLY ONE unknown!
+        img_t3 = _FakeMaixImage(320, 240, floor)
+        img_t3.fill_rect(80, 120, 120, 80, shared_go)
+        t3_adapter = SimpleNamespace(find_blobs=img_t3.find_blobs)
+        blobs_t3 = extract_blobs_from_maix_image(t3_adapter, go_cfg, scan_unknown_near=True)
+        self.assertEqual([(b.label, b.pixels) for b in blobs_t3], [("unknown", 9600)])
+        st_t3 = RescueVisionProcessor(go_cfg).process(blobs_t3, **kw)
+        self.assertEqual(st_t3.corral_unknown_cnt, 1)
+        # Adding a separate 100-px uncalibrated object in corral is STILL detected!
+        img_t3.fill_rect(210, 150, 10, 10, unknown_lab)
+        blobs_t3_extra = extract_blobs_from_maix_image(SimpleNamespace(find_blobs=img_t3.find_blobs), go_cfg, scan_unknown_near=True)
+        st_t3_extra = RescueVisionProcessor(go_cfg).process(blobs_t3_extra, **kw)
+        self.assertEqual(st_t3_extra.corral_unknown_cnt, 2)
+
+        # 4. P2-4: Detached ramp MUST NOT override adjacent ramp or allow cargo past home.y2 to confirm!
+        proc = RescueVisionProcessor(self.cfg)
+        home = Blob("red_zone", 97, 25, 200, 50, 10000)         # y = 25..75
+        correct_ramp = Blob("purple_ramp", 97, 75, 190, 4, 760) # adjacent at y = 75..79
+        detached_ramp = Blob("purple_ramp", 97, 110, 200, 8, 1600)  # detached 35 px below!
+        surfaces = [home, correct_ramp, detached_ramp]
+        st_base = proc.process(
+            surfaces + [Blob("green", 140, 150, 12, 10, 120)],
+            True, True, TEAM_RED, False,
+            mission_state=MISSION_DROP_OPEN_AND_PUSH, gate_closed=True,
+        )
+        self.assertTrue(st_base.flags & VIS_FLAG_DROP_BASELINE_READY)
+        # Cargo ending at y=87 (> home.y2=75) MUST NOT confirm!
+        st_partial = proc.process(
+            surfaces + [Blob("green", 140, 69, 12, 18, 216)],
+            True, True, TEAM_RED, False,
+            mission_state=MISSION_DROP_BACKOUT_VERIFY, gate_closed=False,
+        )
+        self.assertFalse(st_partial.flags & VIS_FLAG_DROP_CONFIRMED)
+        # Cargo fully inside own material half AND behind home.y2=75 & correct_ramp.y=75 DOES confirm!
+        st_full = proc.process(
+            surfaces + [Blob("green", 140, 40, 12, 18, 216)],
+            True, True, TEAM_RED, False,
+            mission_state=MISSION_DROP_BACKOUT_VERIFY, gate_closed=False,
+        )
+        self.assertTrue(st_full.flags & VIS_FLAG_DROP_CONFIRMED)
+        # Ambiguous competing adjacent ramps -> fail closed!
+        amb_ramp_b = Blob("purple_ramp", 120, 79, 150, 4, 600)
+        st_amb = proc.process(
+            [home, correct_ramp, amb_ramp_b, Blob("green", 140, 40, 12, 18, 216)],
+            True, True, TEAM_RED, False,
+            mission_state=MISSION_DROP_BACKOUT_VERIFY, gate_closed=False,
+        )
+        self.assertFalse(st_amb.flags & VIS_FLAG_DROP_PATH_CLEAR)
+        self.assertFalse(st_amb.flags & VIS_FLAG_DROP_CONFIRMED)
+        # Only detached ramp (no adjacent ramp) -> fail closed!
+        st_det = proc.process(
+            [home, detached_ramp, Blob("green", 140, 40, 12, 18, 216)],
+            True, True, TEAM_RED, False,
+            mission_state=MISSION_DROP_BACKOUT_VERIFY, gate_closed=False,
+        )
+        self.assertFalse(st_det.flags & VIS_FLAG_DROP_PATH_CLEAR)
+        self.assertFalse(st_det.flags & VIS_FLAG_DROP_CONFIRMED)
+
     def test_home_half_match_checks_full_corral_width_and_opponent_zone(self) -> None:
         # Home x=100..320 (cx=210, left material half=[100, 192]).
         # Center=160, corral_align_half_w_px=24 => footprint [136, 184] strictly inside [100, 192]!

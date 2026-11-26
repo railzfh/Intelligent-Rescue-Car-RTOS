@@ -158,6 +158,7 @@ public:
 
 private:
     void Enter_State(Enum_Mission_State next, uint32_t now_ms);
+    void Reset_Confirm_Streak();
     void Clear_Cargo();
     void Record_Progress(uint32_t now_ms, bool reset_escapes);
     float Available_Reverse_M(bool vision_fresh, bool rear_sensor_clear,
@@ -193,6 +194,7 @@ private:
     bool Vision_Received = false;
     uint16_t Last_Vision_Frame_Seq = 0U;
     uint32_t Last_Vision_Ms = 0U;
+    uint32_t Vision_Accept_Counter = 0U;
     Struct_Vision_State Latest_Vision = {};
 
     bool Vision_Outage_Active = false;
@@ -200,11 +202,20 @@ private:
     bool Interrupted_By_Stale_Vision = false;
     bool Vision_Invalidated_By_Rx_Fault = false;
     bool Pending_Non_Near_View_Event = false;
+    bool Pending_Non_Far_View_Event = false;
     bool Pending_Near_Hazard_Event = false;
+    bool Pending_Near_Non_Valid_Corral_Event = false;
+    bool Pending_Opponent_Alert_Event = false;
+    bool Pending_Drop_Path_Blocked_Event = false;
+    bool Pending_Drop_Baseline_Not_Ready_Event = false;
+    bool Pending_Home_Half_Mismatch_Event = false;
+    bool Pending_Near_Cargo_Mismatch_Event = false;
     bool Pending_Drop_Unconfirmed_Event = false;
 
-    bool Has_Confirm_Frame = false;
-    uint16_t Last_Confirm_Frame_Seq = 0U;
+    bool Pre_Match_Need_Post_Settle_Far = false;
+    uint32_t Pre_Match_Settle_Accept_Id = 0U;
+
+    uint32_t Confirm_Boundary_Accept_Id = 0U;
     uint8_t Confirm_Count = 0U;
     uint32_t Visual_Stall_Counter_Ms = 0U;
     float Escape_Sign = 1.0f;
