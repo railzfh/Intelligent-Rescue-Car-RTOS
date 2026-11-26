@@ -1618,8 +1618,130 @@ static void Test_Round12_Push_Same_Drain_Standstill_Bench_Leave_And_Interrupted_
         h.near(1U, aligned & ~VIS_FLAG_HOME_HALF_MATCH);
         h.near(1U, aligned | VIS_FLAG_GATE_OPEN_SETTLED_ACK);
         const auto out = h.tick();
+        assert(!out.gate_closed);
         assert(out.drive_action == DRIVE_ACTION_SOFT_STOP);
-        assert(h.m.Get_State() == MISSION_CLOSE_GATE_VERIFY);
+        assert(h.m.Get_State() == MISSION_INSPECT_CORRAL);
+    }
+
+    // 5. Round 13 invariants:
+    //    5a. P1-1: Bench exit + FAR frame in one drain MUST command open first and refuse launch on that tick!
+    {
+        Harness h;
+        h.in.hardware_ready = h.in.can_launch = h.in.wheels_still = h.in.gate_settled = h.in.camera_settled = true;
+        assert(h.m.On_Set_Config({RESCUE_TEAM_RED, 1U, RESCUE_MODE_BENCH_STRAIGHT, 1U}));
+        assert(h.m.On_Bench_Actuator({BENCH_SERVO_POS_B, BENCH_SERVO_POS_A, 0U}));
+        assert(h.tick().gate_closed);
+        assert(h.m.On_Set_Config({RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION, 1U}));
+        h.far(TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 190U);
+        h.in.button_pressed = true;
+        const auto out1 = h.tick();
+        assert(!out1.gate_closed && out1.drive_action == DRIVE_ACTION_IDLE && out1.launch_rejected_cue);
+        // Only after open/FAR is settled AND a strictly newer post-settle FAR frame arrives does launch proceed!
+        h.far(TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 190U);
+        const auto out2 = h.tick();
+        assert(out2.drive_action == DRIVE_ACTION_START_DISTANCE);
+    }
+    //    5b. P1-2: Half-mismatch + FAR in one drain while moving/unsettled MUST keep gate open!
+    {
+        Harness h;
+        h.to_opening();
+        h.in.wheels_still = false;
+        h.in.chassis_active = true;
+        h.in.camera_settled = false;
+        h.near(1U, aligned & ~VIS_FLAG_HOME_HALF_MATCH);
+        h.far(TARGET_NONE, 0U, 0U);
+        const auto out = h.tick();
+        assert(!out.gate_closed);
+        assert(h.m.Get_State() == MISSION_INSPECT_CORRAL);
+    }
+    //    5c. P1-3: Opponent alert + clean FAR in same drain MUST inhibit pre-match competition launch!
+    {
+        Harness h;
+        h.in.hardware_ready = h.in.can_launch = h.in.wheels_still = h.in.gate_settled = h.in.camera_settled = true;
+        assert(h.m.On_Set_Config({RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION, 1U}));
+        h.far(TARGET_GREEN_MATERIAL, VIS_FLAG_OPPONENT_ZONE_NEAR, 500U);
+        h.far(TARGET_GREEN_MATERIAL, VIS_FLAG_TARGET_VALID, 500U);
+        h.in.button_pressed = true;
+        const auto out = h.tick();
+        assert(out.drive_action == DRIVE_ACTION_IDLE && out.launch_rejected_cue);
+        assert(!h.m.Is_Config_Locked());
+    }
+    //    5d. P1-4: Same-drain REAR_CLEAR=0 -> REAR_CLEAR=1 during unproven reverse MUST emergency-stop + standstill gate!
+    {
+        Harness h;
+        h.to_pushing();
+        h.in.chassis_motion_done = true;
+        h.near(0U, (aligned & ~VIS_FLAG_DROP_BASELINE_READY) | VIS_FLAG_REAR_CLEAR);
+        assert(h.tick().distance_m < 0.0f);
+        h.in.chassis_motion_done = false;
+        h.in.chassis_active = true;
+        h.in.wheels_still = false;
+        h.in.use_motor_feedback_seq = true;
+        h.near(0U, aligned & ~VIS_FLAG_DROP_BASELINE_READY);
+        h.near(0U, (aligned & ~VIS_FLAG_DROP_BASELINE_READY) | VIS_FLAG_REAR_CLEAR);
+        const auto out = h.tick();
+        assert(out.drive_action == DRIVE_ACTION_EMERGENCY_STOP);
+        assert(h.m.Is_Standstill_Gate_Pending_Boundary());
+    }
+    //    5e. P1-5: Push emergency-stop abort MUST engage standstill gate and block reverse/turn until fresh feedback!
+    {
+        Harness h;
+        h.to_pushing();
+        h.in.use_motor_feedback_seq = true;
+        h.in.motor_feedback_seq[0] = h.in.motor_feedback_seq[1] = 30U;
+        h.in.motor_feedback_ms[0] = h.in.motor_feedback_ms[1] = 100U;
+        h.in.chassis_active = true;
+        h.in.wheels_still = true;
+        h.near(1U, aligned & ~VIS_FLAG_DROP_PATH_CLEAR);
+        assert(h.tick().drive_action == DRIVE_ACTION_EMERGENCY_STOP);
+        assert(h.m.Is_Standstill_Gate_Pending_Boundary());
+        h.in.chassis_active = false;
+        h.near(1U, aligned | VIS_FLAG_REAR_CLEAR);
+        const auto blocked = h.tick();
+        assert(blocked.drive_action == DRIVE_ACTION_EMERGENCY_STOP);
+        const uint32_t bseq[2] = {30U, 30U};
+        const uint32_t bms[2] = {100U, 100U};
+        h.m.Latch_Standstill_Boundary(bseq, bms);
+        // Same pre-stop feedback seq/ms -> still blocked!
+        assert(h.tick().drive_action == DRIVE_ACTION_EMERGENCY_STOP);
+        // Fresh post-stop standstill samples from BOTH motors -> releases cleanly!
+        h.in.motor_feedback_seq[0] = h.in.motor_feedback_seq[1] = 31U;
+        h.in.motor_feedback_ms[0] = h.in.motor_feedback_ms[1] = 101U;
+        const auto released = h.tick();
+        assert(released.drive_action == DRIVE_ACTION_START_DISTANCE && released.distance_m < 0.0f);
+    }
+    //    5f. P2-2: Frame accepted while standstill gate is waiting MUST NOT count toward post-release drop confirm!
+    {
+        Harness h;
+        h.to_pushing();
+        h.in.use_motor_feedback_seq = true;
+        h.in.chassis_motion_done = true;
+        h.near(0U, safe | VIS_FLAG_HOME_HALF_MATCH | VIS_FLAG_DROP_PATH_CLEAR | VIS_FLAG_REAR_CLEAR);
+        assert(h.tick().distance_m < 0.0f);
+        h.in.wheels_still = false;
+        h.in.chassis_active = true;
+        h.in.chassis_motion_done = false;
+        h.near(0U, safe | VIS_FLAG_DROP_CONFIRMED);
+        assert(h.tick().drive_action == DRIVE_ACTION_EMERGENCY_STOP);
+        assert(h.m.Is_Standstill_Gate_Pending_Boundary());
+        h.in.wheels_still = true;
+        h.in.chassis_active = false;
+        h.near(0U, safe | VIS_FLAG_DROP_CONFIRMED);
+        assert(h.tick().drive_action == DRIVE_ACTION_EMERGENCY_STOP);
+        const uint32_t boundary[2] = {1U, 1U};
+        h.m.Latch_Standstill_Boundary(boundary, boundary);
+        h.in.motor_feedback_seq[0] = h.in.motor_feedback_seq[1] = 2U;
+        h.in.motor_feedback_ms[0] = h.in.motor_feedback_ms[1] = 1U;
+        h.tick();
+        assert(h.m.Get_Delivered_Green() == 0U);
+        h.near(0U, safe | VIS_FLAG_DROP_CONFIRMED);
+        h.tick();
+        h.near(0U, safe | VIS_FLAG_DROP_CONFIRMED);
+        h.tick();
+        assert(h.m.Get_Delivered_Green() == 0U);
+        h.near(0U, safe | VIS_FLAG_DROP_CONFIRMED);
+        h.tick();
+        assert(h.m.Get_Delivered_Green() == 1U);
     }
 
     // 4. P2-1: Interrupted confirmation streaks (unsettled camera without new frame, OR moving FAR)

@@ -510,6 +510,8 @@ class RescueVisionProcessor:
         """Partition blocks in/on home or ramp into (target_half, other_half, misplaced) counts."""
         inner_limit_y = min(home.y2, assoc_ramp.y)
         ramp_bot_y = assoc_ramp.y2
+        seam_x1 = min(home.x, assoc_ramp.x)
+        seam_x2 = max(home.x2, assoc_ramp.x2)
         tgt = [0, 0, 0]
         oth = [0, 0, 0]
         mis = [0, 0, 0]
@@ -519,7 +521,9 @@ class RescueVisionProcessor:
             if idx is None:
                 continue
             in_home = _rects_intersect(b.x, b.y, b.w, b.h, home.x, home.y, home.w, home.h)
-            on_ramp = b.y < ramp_bot_y and b.y2 > inner_limit_y and b.x < home.x2 and b.x2 > home.x
+            on_full_ramp = _rects_intersect(b.x, b.y, b.w, b.h, assoc_ramp.x, assoc_ramp.y, assoc_ramp.w, assoc_ramp.h)
+            in_home_ramp_seam = b.y < ramp_bot_y and b.y2 > inner_limit_y and b.x < seam_x2 and b.x2 > seam_x1
+            on_ramp = on_full_ramp or in_home_ramp_seam
             if not (in_home or on_ramp):
                 continue
             if not on_ramp and b.y >= home.y and b.y2 <= inner_limit_y:
@@ -2459,7 +2463,9 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
             return blobs
 
         # Tier 3: Fallback for find_blobs-only mocks without pixel access or binary().
-        emitted_unknown_rects = set(emitted_rejected_object_rects) | set(emitted_unknown_idx.keys())
+        # Always subtract verified/accounted component occupancy BEFORE deduplicating residuals so
+        # an unexplained foreground patch sharing an AABB with a concave conflict is never skipped.
+        emitted_tier3_residuals: set[Tuple[int, int, int, int]] = set()
         for roi, merge_fg in scan_rois:
             fg_blobs = _find_blobs_unit_stride(
                 img,
@@ -2477,7 +2483,7 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                     continue
                 fg = Blob("unknown", fx, fy, fg_w, fg_h, px, px / float(fg_w * fg_h))
                 fg_roi = (fx, fy, fg_w, fg_h)
-                if fg_roi in emitted_unknown_rects:
+                if fg_roi in emitted_tier3_residuals:
                     continue
                 roi_surfaces: List[Blob] = []
                 for surface_label in _SURFACE_LABELS:
@@ -2545,7 +2551,10 @@ def extract_blobs_from_maix_image(img, cfg: RescueVisionConfig, scan_unknown_nea
                     or pixel_coverage < 0.70
                     or (area_coverage < 0.70 and explained_px < fg.pixels)
                 ):
-                    emitted_unknown_rects.add(fg_roi)
-                    blobs.append(fg)
+                    emitted_tier3_residuals.add(fg_roi)
+                    emit_px = unexplained_px if roi_accounted and unexplained_px >= cfg.min_hazard_pixels else fg.pixels
+                    blobs.append(
+                        Blob("unknown", fg.x, fg.y, fg.w, fg.h, emit_px, min(1.0, emit_px / float(fg.w * fg.h)))
+                    )
 
     return blobs

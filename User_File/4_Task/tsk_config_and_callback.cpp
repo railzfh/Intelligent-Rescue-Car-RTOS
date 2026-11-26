@@ -120,6 +120,12 @@ static volatile uint32_t Vision_Rx_Overflow_Count = 0U;
 static uint32_t Last_Vision_Rx_Overflow_Count = 0U;
 static uint32_t Last_Uart_Rx_Epoch = 0U;
 static bool Vision_Rx_Was_Healthy = true;
+static volatile uint32_t Uart_Rx_Fault_Event_Seq = 0U;
+static volatile uint32_t Uart_Rx_Fault_Reported_Seq = 0U;
+static volatile uint32_t Telemetry_Snapshot_Rx_Seq = 0U;
+static volatile uint32_t Can_Tx_Fault_Event_Seq = 0U;
+static volatile uint32_t Can_Tx_Fault_Reported_Seq = 0U;
+static volatile uint32_t Telemetry_Snapshot_Can_Seq = 0U;
 static bool Standstill_Zero_Tx_Armed[2] = {};
 static uint32_t Standstill_Zero_Tx_Buffer[2] = {};
 static bool Standstill_Zero_Tx_Occurred[2] = {};
@@ -349,6 +355,7 @@ static bool Vision_Commit_Frame(const Struct_Rescue_Frame &frame, uint32_t now_m
         Last_Vision_Rx_Overflow_Count = Vision_Rx_Overflow_Count;
         Vision_Rx_Tail = Vision_Rx_Head;
         Rescue_Mission.On_Uart_Rx_Fault();
+        Uart_Rx_Fault_Event_Seq = Uart_Rx_Fault_Event_Seq + 1U;
         Vision_Rx_Was_Healthy = false;
     }
     __set_PRIMASK(mask);
@@ -409,6 +416,7 @@ static bool Vision_Drain_Rx(uint32_t now_ms, uint32_t expected_epoch, uint32_t e
         Last_Vision_Rx_Overflow_Count = Vision_Rx_Overflow_Count;
         Vision_Rx_Tail = Vision_Rx_Head;
         Rescue_Mission.On_Uart_Rx_Fault();
+        Uart_Rx_Fault_Event_Seq = Uart_Rx_Fault_Event_Seq + 1U;
         Vision_Rx_Was_Healthy = false;
     }
     __set_PRIMASK(mask);
@@ -499,9 +507,15 @@ static void Drive_Control()
             }
         }
     }
-    if (Standstill_Zero_Tx_Armed[0] && Standstill_Zero_Tx_Occurred[0] &&
-        Standstill_Zero_Tx_Armed[1] && Standstill_Zero_Tx_Occurred[1] &&
-        CAN_Is_Rx_Fifo0_Empty(&hfdcan1) && CAN_Is_Rx_Fifo0_Empty(&hfdcan2))
+    if (CAN_Is_Bus_Off_Latched(&hfdcan1) || CAN_Is_Bus_Off_Latched(&hfdcan2))
+    {
+        // 总线离线会经 HAL_FDCAN_Stop 清空发送请求，立刻失效待确认停稳证明。
+        Standstill_Zero_Tx_Armed[0] = Standstill_Zero_Tx_Armed[1] = false;
+        Standstill_Zero_Tx_Occurred[0] = Standstill_Zero_Tx_Occurred[1] = false;
+    }
+    else if (Standstill_Zero_Tx_Armed[0] && Standstill_Zero_Tx_Occurred[0] &&
+             Standstill_Zero_Tx_Armed[1] && Standstill_Zero_Tx_Occurred[1] &&
+             CAN_Is_Rx_Fifo0_Empty(&hfdcan1) && CAN_Is_Rx_Fifo0_Empty(&hfdcan2))
     {
         latch_standstill_now = true;
         latch_seq = fb_seq;
@@ -513,9 +527,9 @@ static void Drive_Control()
     const bool imu_quiet = Imu_Quiet;
     const float heading = Heading_Rad;
     const float yaw_rate = Yaw_Rate_Rad_S;
-    const bool battery_ready = Battery.Can_Run();
-    const bool battery_fault = Battery.Is_Fault_Latched();
-    const float pack_voltage = Battery.Get_Pack_Voltage();
+    bool battery_ready = Battery.Can_Run();
+    bool battery_fault = Battery.Is_Fault_Latched();
+    float pack_voltage = Battery.Get_Pack_Voltage();
     __set_PRIMASK(primask);
 
     if (latch_standstill_now)
@@ -529,10 +543,10 @@ static void Drive_Control()
     }
 
     // 1 ms 控制任务仅做非阻塞 RX 健康与纪元检查，绝不阻塞调用 HAL DMA 中止/重初始化；
-    // 任一 RX 异常或跨周期恢复均清空旧环缓冲、复位协议解析器并失效故障前缓存视觉帧，
-    // 且帧提交与状态机/执行器提交分别在关中断临界区内与 RX 故障中断保持原子性。
+    // 瞬态 RX 恢复或环缓冲溢出仅失效视觉并抑制运动，留待新帧安全重评估，同时保留诊断位直至 50 ms 遥测发出；
+    // 仅永久 DMA 故障锁存（uart_rx_perm_fault）才触发硬故障锁停。
     bool uart_rx_healthy = false;
-    bool uart_rx_fault = false;
+    bool uart_rx_perm_fault = false;
     uint32_t uart_rx_epoch = 0U;
     uint32_t uart_rx_overflow = 0U;
     bool need_drain = false;
@@ -540,17 +554,17 @@ static void Drive_Control()
     {
         const uint32_t rx_mask = __get_PRIMASK();
         __disable_irq();
-        Vision_Sample_Rx_State(uart_rx_healthy, uart_rx_fault, uart_rx_epoch, uart_rx_overflow);
+        Vision_Sample_Rx_State(uart_rx_healthy, uart_rx_perm_fault, uart_rx_epoch, uart_rx_overflow);
         const bool overflow_occurred = (uart_rx_overflow != Last_Vision_Rx_Overflow_Count);
-        if (!uart_rx_healthy || uart_rx_fault || uart_rx_epoch != Last_Uart_Rx_Epoch || overflow_occurred)
+        if (!uart_rx_healthy || uart_rx_perm_fault || uart_rx_epoch != Last_Uart_Rx_Epoch || overflow_occurred)
         {
             Last_Uart_Rx_Epoch = UART_Get_Rx_Epoch(&huart1);
             Last_Vision_Rx_Overflow_Count = Vision_Rx_Overflow_Count;
             Vision_Rx_Tail = Vision_Rx_Head;
             Rescue_Mission.On_Uart_Rx_Fault();
-            Vision_Rx_Was_Healthy = uart_rx_healthy && !uart_rx_fault && !overflow_occurred;
+            Uart_Rx_Fault_Event_Seq = Uart_Rx_Fault_Event_Seq + 1U;
+            Vision_Rx_Was_Healthy = uart_rx_healthy && !uart_rx_perm_fault && !overflow_occurred;
             uart_rx_healthy = false;
-            uart_rx_fault = uart_rx_fault || overflow_occurred;
             need_parser_reset = true;
         }
         else
@@ -572,7 +586,7 @@ static void Drive_Control()
     if (need_drain && !Vision_Drain_Rx(now_ms, uart_rx_epoch, uart_rx_overflow))
     {
         uart_rx_healthy = false;
-        uart_rx_fault = true;
+        uart_rx_perm_fault = UART_Is_Rx_Fault_Latched(&huart1);
     }
 
     // 舵机控制：等待首帧有效电池采样后再启动 PWM；真实电池故障或 PWM 启动失败则永久锁停。
@@ -607,8 +621,6 @@ static void Drive_Control()
         Pitch_Servo.Disable();
     }
 
-    const bool servos_ready =
-        Servos_Started && !Servos_Fault_Latched && Gate_Servo.Is_Enabled() && Pitch_Servo.Is_Enabled();
     const bool wheels_still = feedback_fresh && std::fabs(speed[0]) < 0.1f && std::fabs(speed[1]) < 0.1f;
     const bool can1_ready = Drive_Tx_Ready(hfdcan1);
     const bool can2_ready = Drive_Tx_Ready(hfdcan2);
@@ -646,29 +658,68 @@ static void Drive_Control()
     {
         const uint32_t commit_mask = __get_PRIMASK();
         __disable_irq();
+        // 在最终原子提交临界区内重新校验电池、CAN Bus-Off 与 UART RX 状态，防止采样后发生的
+        // ADC 故障中断、CAN 离线中断或 UART 异常中断与发车/扭矩/供电/遥测提交发生竞态。
+        Battery.Check_Timeout(now_ms);
+        battery_ready = Battery.Can_Run();
+        battery_fault = Battery.Is_Fault_Latched();
+        pack_voltage = Battery.Get_Pack_Voltage();
+        Battery_LED_Green = Battery.Get_LED_Green();
+        BSP_Power.Set_DC24_0(battery_ready);
+        BSP_Power.Set_DC24_1(battery_ready);
+        BSP_Power.Set_DC5(battery_ready && Board_Enable_DC5_Rail);
+        if (battery_fault || Servos_Fault_Latched)
+        {
+            Servos_Fault_Latched = true;
+            Gate_Servo.Disable();
+            Pitch_Servo.Disable();
+        }
+        else if (!battery_ready)
+        {
+            Gate_Servo.Disable();
+            Pitch_Servo.Disable();
+        }
+        const bool servos_ready_commit =
+            Servos_Started && !Servos_Fault_Latched && Gate_Servo.Is_Enabled() && Pitch_Servo.Is_Enabled();
+
+        const bool can1_bus_off = CAN_Consume_Bus_Off(&hfdcan1);
+        const bool can2_bus_off = CAN_Consume_Bus_Off(&hfdcan2);
+        const bool can_bus_off = can1_bus_off || can2_bus_off;
+        if (can_bus_off)
+        {
+            Standstill_Zero_Tx_Armed[0] = Standstill_Zero_Tx_Armed[1] = false;
+            Standstill_Zero_Tx_Occurred[0] = Standstill_Zero_Tx_Occurred[1] = false;
+            Can_Tx_Fault_Event_Seq = Can_Tx_Fault_Event_Seq + 1U;
+        }
+
         bool rx_ok_now = false;
-        bool rx_fault_now = false;
+        bool rx_perm_fault_now = false;
         uint32_t rx_epoch_now = 0U;
         uint32_t rx_overflow_now = 0U;
-        Vision_Sample_Rx_State(rx_ok_now, rx_fault_now, rx_epoch_now, rx_overflow_now);
+        Vision_Sample_Rx_State(rx_ok_now, rx_perm_fault_now, rx_epoch_now, rx_overflow_now);
         const bool rx_overflow_changed = (rx_overflow_now != Last_Vision_Rx_Overflow_Count);
-        if (!rx_ok_now || rx_fault_now || rx_epoch_now != Last_Uart_Rx_Epoch || rx_overflow_changed)
+        if (!rx_ok_now || rx_perm_fault_now || rx_epoch_now != Last_Uart_Rx_Epoch || rx_overflow_changed)
         {
             Last_Uart_Rx_Epoch = UART_Get_Rx_Epoch(&huart1);
             Last_Vision_Rx_Overflow_Count = Vision_Rx_Overflow_Count;
             Vision_Rx_Tail = Vision_Rx_Head;
             Rescue_Mission.On_Uart_Rx_Fault();
+            Uart_Rx_Fault_Event_Seq = Uart_Rx_Fault_Event_Seq + 1U;
             uart_rx_healthy = false;
-            uart_rx_fault = uart_rx_fault || rx_fault_now || rx_overflow_changed;
-            Vision_Rx_Was_Healthy = rx_ok_now && !rx_fault_now && !rx_overflow_changed;
+            uart_rx_perm_fault = uart_rx_perm_fault || rx_perm_fault_now;
+            Vision_Rx_Was_Healthy = rx_ok_now && !rx_perm_fault_now && !rx_overflow_changed;
             reset_parser_after_commit = true;
         }
 
         is_bench_mode = (Rescue_Mission.Get_Run_Mode() == RESCUE_MODE_BENCH_STRAIGHT);
-        ready = battery_ready && feedback_fresh && attitude_fresh && can1_ready && can2_ready &&
-                (is_bench_mode || (servos_ready && !uart_rx_fault));
+        ready = battery_ready && feedback_fresh && attitude_fresh &&
+                can1_ready && can2_ready && !can_bus_off &&
+                (is_bench_mode || (servos_ready_commit && !uart_rx_perm_fault));
         const bool can_start = ready && wheels_still && imu_quiet;
         can_launch_commit = can_start && (is_bench_mode || uart_rx_healthy);
+
+        const uint16_t desired_gate_us = Rescue_Mission.Is_Gate_Closed_Cmd() ? Gate_Closed_Us : Gate_Open_Us;
+        const uint16_t desired_pitch_us = Rescue_Mission.Is_Camera_Near_Cmd() ? Pitch_Near_Us : Pitch_Far_Us;
 
         const Enum_Mission_State prev_state = Rescue_Mission.Get_State();
         Struct_Mission_Inputs mission_in{};
@@ -684,8 +735,10 @@ static void Drive_Control()
         mission_in.chassis_motion_done = Chassis_Drive.Is_Motion_Done();
         mission_in.chassis_motion_aborted = Chassis_Drive.Is_Motion_Aborted();
         mission_in.chassis_stalled = Chassis_Drive.Is_Stalled();
-        mission_in.gate_settled = Gate_Servo.Is_Settled();
-        mission_in.camera_settled = Pitch_Servo.Is_Settled();
+        mission_in.gate_settled = servos_ready_commit && Gate_Servo.Is_Settled() &&
+                                  (Gate_Servo.Get_Target_Us() == desired_gate_us);
+        mission_in.camera_settled = servos_ready_commit && Pitch_Servo.Is_Settled() &&
+                                    (Pitch_Servo.Get_Target_Us() == desired_pitch_us);
         mission_in.forward_delta_m = forward_delta_m;
         mission_in.yaw_delta_rad = yaw_delta_rad;
         mission_in.motor_feedback_seq[0] = fb_seq[0];
@@ -696,7 +749,7 @@ static void Drive_Control()
 
         cmd = Rescue_Mission.Update(mission_in);
 
-        if (servos_ready)
+        if (servos_ready_commit)
         {
             Gate_Servo.Set_Target_Us(cmd.gate_closed ? Gate_Closed_Us : Gate_Open_Us);
             Pitch_Servo.Set_Target_Us(cmd.camera_near ? Pitch_Near_Us : Pitch_Far_Us);
@@ -764,6 +817,7 @@ static void Drive_Control()
         if (!can_tx_ok)
         {
             // CAN 发送失败必须立即锁停任务，防止下一周期自动恢复扭矩；并在可用总线上立刻补发零扭矩。
+            Can_Tx_Fault_Event_Seq = Can_Tx_Fault_Event_Seq + 1U;
             Straight_Drive.Stop();
             Chassis_Drive.Emergency_Stop();
             Rescue_Mission.Fault_Stop(now_ms);
@@ -786,9 +840,9 @@ static void Drive_Control()
 
         // Keep the reverse standstill gate closed until BOTH specific zero-torque CAN commands
         // positively complete transmission (TXBTO == 1, TXBRP == 0, TXBCF == 0) AND BOTH hardware
-        // RX FIFO0 queues are completely empty, so cancelled TXs or buffered pre-completion RX
-        // frames (even with a deferred RX IRQ) can NEVER release the standstill interlock!
-        if (can_tx_ok && can1_ready && can2_ready &&
+        // RX FIFO0 queues are completely empty, so cancelled TXs, bus-off restarts, or buffered
+        // pre-completion RX frames (even with a deferred RX IRQ) can NEVER release the standstill interlock!
+        if (!can_bus_off && can_tx_ok && can1_ready && can2_ready &&
             torque[0] == 0.0f && torque[1] == 0.0f &&
             Rescue_Mission.Is_Standstill_Gate_Pending_Boundary())
         {
@@ -846,6 +900,8 @@ static void Drive_Control()
         const bool pub_rx_ok = uart_rx_healthy && UART_Is_Rx_Healthy(&huart1) &&
                                !UART_Is_Rx_Fault_Latched(&huart1) &&
                                (Vision_Rx_Overflow_Count == Last_Vision_Rx_Overflow_Count);
+        const uint16_t pub_gate_us = Rescue_Mission.Is_Gate_Closed_Cmd() ? Gate_Closed_Us : Gate_Open_Us;
+        const uint16_t pub_pitch_us = Rescue_Mission.Is_Camera_Near_Cmd() ? Pitch_Near_Us : Pitch_Far_Us;
         uint16_t status_flags = 0U;
         if (Rescue_Mission.Is_Config_Locked()) { status_flags |= TEL_FLAG_CONFIG_LOCKED; }
         if (battery_ready) { status_flags |= TEL_FLAG_BATTERY_OK; }
@@ -854,23 +910,34 @@ static void Drive_Control()
         if (Rescue_Mission.Is_Vision_Fresh(now_ms) && pub_rx_ok) { status_flags |= TEL_FLAG_VISION_FRESH; }
         if (Rescue_Mission.Is_First_Green_Unlocked()) { status_flags |= TEL_FLAG_FIRST_GREEN_UNLOCKED; }
         if (Rescue_Mission.Is_Gate_Closed_Cmd()) { status_flags |= TEL_FLAG_GATE_CLOSED; }
-        if (Gate_Servo.Is_Settled()) { status_flags |= TEL_FLAG_GATE_SETTLED; }
+        if (servos_ready_commit && Gate_Servo.Is_Settled() && Gate_Servo.Get_Target_Us() == pub_gate_us)
+        {
+            status_flags |= TEL_FLAG_GATE_SETTLED;
+        }
         if (Rescue_Mission.Is_Camera_Near_Cmd()) { status_flags |= TEL_FLAG_CAMERA_NEAR; }
-        if (Pitch_Servo.Is_Settled()) { status_flags |= TEL_FLAG_CAMERA_SETTLED; }
+        if (servos_ready_commit && Pitch_Servo.Is_Settled() && Pitch_Servo.Get_Target_Us() == pub_pitch_us)
+        {
+            status_flags |= TEL_FLAG_CAMERA_SETTLED;
+        }
         if (Chassis_Drive.Is_Stalled()) { status_flags |= TEL_FLAG_STALLED; }
         if (Rescue_Mission.Is_Link_Alive(now_ms)) { status_flags |= TEL_FLAG_LINK_ALIVE; }
         if (Rescue_Mission.Is_Carrying_Casualty()) { status_flags |= TEL_FLAG_CARRYING_CASUALTY; }
         if (Rescue_Mission.Is_Drop_Pushing()) { status_flags |= TEL_FLAG_DROP_PUSHING; }
         tel.status_flags = status_flags;
 
+        const bool rx_diag_pending = (Uart_Rx_Fault_Event_Seq != Uart_Rx_Fault_Reported_Seq);
+        const bool can_diag_pending = (Can_Tx_Fault_Event_Seq != Can_Tx_Fault_Reported_Seq);
         uint16_t fault_flags = 0U;
         if (!battery_ready) { fault_flags |= FAULT_FLAG_BATTERY; }
         if (!feedback_fresh) { fault_flags |= FAULT_FLAG_MOTOR_TIMEOUT; }
         if (!attitude_fresh) { fault_flags |= FAULT_FLAG_IMU_TIMEOUT; }
-        if (!can1_ready || !can2_ready || !can_tx_ok) { fault_flags |= FAULT_FLAG_CAN_TX; }
+        if (!can1_ready || !can2_ready || !can_tx_ok || can_bus_off || can_diag_pending)
+        {
+            fault_flags |= FAULT_FLAG_CAN_TX;
+        }
         if (!Rescue_Mission.Is_Vision_Fresh(now_ms)) { fault_flags |= FAULT_FLAG_VISION_TIMEOUT; }
         if (Servos_Fault_Latched) { fault_flags |= FAULT_FLAG_SERVO; }
-        if (uart_rx_fault || !pub_rx_ok) { fault_flags |= FAULT_FLAG_UART_RX; }
+        if (uart_rx_perm_fault || !pub_rx_ok || rx_diag_pending) { fault_flags |= FAULT_FLAG_UART_RX; }
         tel.fault_flags = fault_flags;
 
         tel.battery_mv = (pack_voltage > 0.0f && std::isfinite(pack_voltage))
@@ -890,6 +957,8 @@ static void Drive_Control()
             Compute_Status_LED(battery_ready, ready && (is_bench_mode || pub_rx_ok), now_ms);
         Status_LED_Color = led;
         Telemetry_Snapshot = tel;
+        Telemetry_Snapshot_Rx_Seq = Uart_Rx_Fault_Event_Seq;
+        Telemetry_Snapshot_Can_Seq = Can_Tx_Fault_Event_Seq;
         __set_PRIMASK(commit_mask);
     }
     if (reset_parser_after_commit)
@@ -897,6 +966,43 @@ static void Drive_Control()
         Vision_Parser.Reset();
     }
     Drive_Notify_Buzzer(can_launch_commit, cmd.launch_rejected_cue, now_ms);
+}
+
+static bool Telemetry_Service_Tx()
+{
+    if (huart1.gState != HAL_UART_STATE_READY)
+    {
+        return false;
+    }
+    const uint32_t irq_state = __get_PRIMASK();
+    __disable_irq();
+    const Struct_Rescue_Telemetry tel = Telemetry_Snapshot;
+    const uint32_t rx_seq_seen = Telemetry_Snapshot_Rx_Seq;
+    const uint32_t can_seq_seen = Telemetry_Snapshot_Can_Seq;
+    __set_PRIMASK(irq_state);
+
+    const size_t len = Rescue_Encode_Telemetry(
+        Telemetry_Tx_Seq++, tel, Telemetry_Tx_Buffer, sizeof(Telemetry_Tx_Buffer));
+    if (len == 0U)
+    {
+        return false;
+    }
+    if (UART_Transmit_Data(&huart1, Telemetry_Tx_Buffer, static_cast<uint16_t>(len)) == HAL_OK)
+    {
+        const uint32_t ack_mask = __get_PRIMASK();
+        __disable_irq();
+        if ((tel.fault_flags & FAULT_FLAG_UART_RX) != 0U)
+        {
+            Uart_Rx_Fault_Reported_Seq = rx_seq_seen;
+        }
+        if ((tel.fault_flags & FAULT_FLAG_CAN_TX) != 0U)
+        {
+            Can_Tx_Fault_Reported_Seq = can_seq_seen;
+        }
+        __set_PRIMASK(ack_mask);
+        return true;
+    }
+    return false;
 }
 
 static void Wait_For_Next_Period(uint32_t &wake_tick, uint32_t period)
@@ -955,10 +1061,10 @@ void Task_Control_Run()
         Battery.Check_Timeout(HAL_GetTick());
         const bool battery_ready = Battery.Can_Run();
         Battery_LED_Green = Battery.Get_LED_Green();
-        __set_PRIMASK(irq_state);
         BSP_Power.Set_DC24_0(battery_ready);
         BSP_Power.Set_DC24_1(battery_ready);
         BSP_Power.Set_DC5(battery_ready && Board_Enable_DC5_Rail);
+        __set_PRIMASK(irq_state);
         Drive_Control();
         IWDG_Independent_Feed();
         Wait_For_Next_Period(wake_tick, 1U);
@@ -1009,7 +1115,6 @@ void Task_Status_Run()
         const uint32_t irq_state = __get_PRIMASK();
         __disable_irq();
         const Struct_WS2812_Color led = Status_LED_Color;
-        const Struct_Rescue_Telemetry tel = Telemetry_Snapshot;
         __set_PRIMASK(irq_state);
 
         BSP_WS2812.Set_RGB(led.Red, led.Green, led.Blue);
@@ -1018,19 +1123,11 @@ void Task_Status_Run()
         // 在非实时 10 ms 状态任务中执行 UART1 RX DMA 阻塞恢复，避免拖慢 1 ms 电机控制周期。
         (void)UART_Service_Rx_Recovery(&huart1);
 
-        // 每 50 ms (20 Hz) 发送遥测帧至 MaixCAM，仅在 DMA 空闲时发送静态缓冲区。
+        // 每 50 ms (20 Hz) 发送遥测帧至 MaixCAM，仅在 DMA 空闲时发送静态缓冲区并确认瞬态诊断已发出。
         if (++telemetry_div >= 5U)
         {
             telemetry_div = 0U;
-            if (huart1.gState == HAL_UART_STATE_READY)
-            {
-                const size_t len = Rescue_Encode_Telemetry(
-                    Telemetry_Tx_Seq++, tel, Telemetry_Tx_Buffer, sizeof(Telemetry_Tx_Buffer));
-                if (len > 0U)
-                {
-                    UART_Transmit_Data(&huart1, Telemetry_Tx_Buffer, static_cast<uint16_t>(len));
-                }
-            }
+            (void)Telemetry_Service_Tx();
         }
         Wait_For_Next_Period(wake_tick, 10U);
     }

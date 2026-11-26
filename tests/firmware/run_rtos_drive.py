@@ -67,16 +67,31 @@ struct Class_PWM_Servo {
     bool Is_Enabled() const { return ctrl.Is_Enabled(); }
     bool Is_Settled() const { return ctrl.Is_Settled(); }
     uint16_t Get_Current_Us() const { return ctrl.Get_Current_Us(); }
+    uint16_t Get_Target_Us() const { return ctrl.Get_Target_Us(); }
 };
+constexpr int FDCAN_DLC_BYTES_8 = 8, HAL_OK = 0, HAL_UART_STATE_READY = 0;
 struct UART_HandleTypeDef {
+    int gState = HAL_UART_STATE_READY;
     bool rx_healthy = true;
     bool rx_fault_latched = false;
     uint32_t rx_epoch = 0U;
     int service_rx_calls = 0;
     bool inject_fault_after_epoch_read = false;
     unsigned inject_fault_at_epoch_read = 0U;
+    uint8_t last_tx[RESCUE_PROTO_MAX_FRAME] = {};
+    uint16_t last_tx_len = 0U;
+    int tx_calls = 0;
 };
 UART_HandleTypeDef huart1;
+int UART_Transmit_Data(UART_HandleTypeDef *h, uint8_t *buf, uint16_t len) {
+    if (h == nullptr || buf == nullptr || len == 0U || len > sizeof(h->last_tx)) {
+        return 1;
+    }
+    std::memcpy(h->last_tx, buf, len);
+    h->last_tx_len = len;
+    ++h->tx_calls;
+    return HAL_OK;
+}
 bool UART_Service_Rx_Recovery(UART_HandleTypeDef *h) {
     ++h->service_rx_calls;
     return !h->rx_fault_latched;
@@ -96,6 +111,8 @@ uint32_t UART_Get_Rx_Epoch(UART_HandleTypeDef *h) {
 struct FDCAN_HandleTypeDef {
     bool fail = false;
     bool hold_tx = false;
+    bool bus_off_latched = false;
+    uint32_t bus_off_count = 0U;
     uint8_t next_slot = 0U;
     uint32_t latest_tx_buf = 0U;
     uint32_t txbrp = 0U;
@@ -114,10 +131,17 @@ struct FDCAN_HandleTypeDef {
         txbcf |= hit;
         if (hit != 0U) { ++cancels; }
     }
+    void inject_bus_off() {
+        bus_off_latched = true;
+        ++bus_off_count;
+        latest_tx_buf = 0U;
+        txbrp = 0U;
+        txbto = 0U;
+        txbcf = 0U;
+    }
 };
 FDCAN_HandleTypeDef hfdcan1, hfdcan2;
 uint8_t CAN1_0x200_Tx_Data[8], CAN2_0x200_Tx_Data[8];
-constexpr int FDCAN_DLC_BYTES_8 = 8, HAL_OK = 0;
 uint32_t now_ms = 0, irq_mask = 0;
 bool key = false;
 constexpr int KEY__INPUT_GPIO_Port = 0, KEY__INPUT_Pin = 0, GPIO_PIN_RESET = 0;
@@ -149,6 +173,14 @@ bool CAN_Is_Tx_Buffer_Occurred(const FDCAN_HandleTypeDef *c, uint32_t buf) {
     return buf != 0U && (c->txbto & buf) != 0U && (c->txbrp & buf) == 0U && (c->txbcf & buf) == 0U;
 }
 bool CAN_Is_Rx_Fifo0_Empty(const FDCAN_HandleTypeDef *c) { return c->rx_fifo0_level == 0U; }
+bool CAN_Is_Bus_Off_Latched(const FDCAN_HandleTypeDef *c) { return c != nullptr && c->bus_off_latched; }
+bool CAN_Consume_Bus_Off(FDCAN_HandleTypeDef *c) {
+    if (c == nullptr) { return false; }
+    const bool v = c->bus_off_latched;
+    c->bus_off_latched = false;
+    return v;
+}
+uint32_t CAN_Get_Bus_Off_Count(const FDCAN_HandleTypeDef *c) { return (c != nullptr) ? c->bus_off_count : 0U; }
 int CAN_Transmit_Data(FDCAN_HandleTypeDef *c, int, uint8_t *, int) {
     ++c->tx_calls;
     if (on_can_tx != nullptr) { on_can_tx(c); }
@@ -167,6 +199,14 @@ int CAN_Transmit_Data(FDCAN_HandleTypeDef *c, int, uint8_t *, int) {
     return 0;
 }
 struct { float volume = 0; void Set_Loudness(float v) { volume = v; } } BSP_Buzzer;
+struct {
+    bool dc24_0 = false;
+    bool dc24_1 = false;
+    bool dc5 = false;
+    void Set_DC24_0(bool v) { dc24_0 = v; }
+    void Set_DC24_1(bool v) { dc24_1 = v; }
+    void Set_DC5(bool v) { dc5 = v; }
+} BSP_Power;
 '''
 checks = r'''
 void Feed_Config(uint8_t team, uint8_t zone, uint8_t mode) {
@@ -174,6 +214,28 @@ void Feed_Config(uint8_t team, uint8_t zone, uint8_t mode) {
     static uint8_t seq = 1U;
     const size_t n = Rescue_Encode_Set_Config(seq++, {team, zone, mode, 1U}, buf, sizeof(buf));
     Vision_Uart_RxCallback(buf, static_cast<uint16_t>(n));
+}
+void Feed_Bench_Cmd(uint8_t gate_cmd, uint8_t pitch_cmd) {
+    uint8_t buf[RESCUE_PROTO_MAX_FRAME];
+    static uint8_t seq = 50U;
+    const size_t n = Rescue_Encode_Bench_Actuator(seq++, {gate_cmd, pitch_cmd, 0U}, buf, sizeof(buf));
+    Vision_Uart_RxCallback(buf, static_cast<uint16_t>(n));
+}
+Struct_Rescue_Telemetry Decode_Last_Telemetry() {
+    assert(huart1.last_tx_len > 0U);
+    Class_Rescue_Protocol_Parser p;
+    Struct_Rescue_Frame frame{};
+    bool got = false;
+    for (uint16_t i = 0U; i < huart1.last_tx_len; ++i) {
+        if (p.Feed_Byte(huart1.last_tx[i], frame)) {
+            got = true;
+            break;
+        }
+    }
+    assert(got && frame.msg_type == RESCUE_MSG_TELEMETRY);
+    Struct_Rescue_Telemetry tel{};
+    assert(Rescue_Decode_Telemetry(frame, tel));
+    return tel;
 }
 void Feed_Vision(uint16_t frame_seq, uint16_t flags = VIS_FLAG_TARGET_VALID) {
     uint8_t buf[RESCUE_PROTO_MAX_FRAME];
@@ -266,8 +328,13 @@ int main(int argc, char **argv) {
         Step(t += 30U, true);
         assert(Rescue_Mission.Get_State() == MISSION_LAUNCH_CROSS_BUMPS);
         assert(M2006[0].torque < 0.0f && M2006[1].torque > 0.0f);
-        assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_UART_RX) == 0U);
         assert((Telemetry_Snapshot.status_flags & TEL_FLAG_VISION_FRESH) != 0U);
+        // FAULT_FLAG_UART_RX remains latched across ticks until the 50 ms telemetry sender transmits it!
+        assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_UART_RX) != 0U);
+        assert(Telemetry_Service_Tx());
+        assert((Decode_Last_Telemetry().fault_flags & FAULT_FLAG_UART_RX) != 0U);
+        Step(t += 1U, false);
+        assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_UART_RX) == 0U);
 
         // Sub-millisecond recovery epoch bump (rx_healthy stayed true between Drive_Control ticks!)
         // with pre-recovery bytes queued in ring buffer -> MUST flush ring, invalidate vision, and inhibit motion!
@@ -681,16 +748,186 @@ int main(int argc, char **argv) {
         assert((Telemetry_Snapshot.status_flags & TEL_FLAG_VISION_FRESH) == 0U);
         Stopped();
 
-        // Brand-new post-overflow FAR frame cleanly restores VISION_FRESH and allows launch!
+        // Brand-new post-overflow FAR frame cleanly restores VISION_FRESH, while FAULT_FLAG_UART_RX
+        // remains latched across ticks until the 50 ms telemetry sender transmits it!
         Feed_Vision(5U);
         Step(430U, false);
         Step(460U, false);
         assert((Telemetry_Snapshot.status_flags & TEL_FLAG_VISION_FRESH) != 0U);
+        assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_UART_RX) != 0U);
+        assert(Telemetry_Service_Tx());
+        assert((Decode_Last_Telemetry().fault_flags & FAULT_FLAG_UART_RX) != 0U);
+        Step(465U, false);
         assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_UART_RX) == 0U);
         Step(470U, true);
         Step(500U, true);
         assert(Rescue_Mission.Get_State() == MISSION_LAUNCH_CROSS_BUMPS);
-        std::puts("PASS: UART RX ring overflow flushes ring/parser, invalidates vision, blocks launch, and recovers on fresh frame");
+
+        // Finding 2 (R13 P2-1): Transient RX ring overflow DURING active competition MUST invalidate
+        // vision, inhibit motion, keep FAULT_FLAG_UART_RX latched until 50 ms telemetry TX, and MUST NOT
+        // permanently latch MISSION_FAULT_STOP — allowing clean recovery once a fresh frame arrives!
+        uint32_t ot = 500U;
+        uint16_t oseq = 6U;
+        for (int k = 0; k < 20; ++k) {
+            Step(++ot, false);
+        }
+        Feed_Vision(oseq++);
+        Vision_Uart_RxCallback(pad, sizeof(pad));
+        Feed_Vision(oseq++);
+        Step(++ot, false);
+        assert(Rescue_Mission.Get_State() != MISSION_FAULT_STOP);
+        assert((Telemetry_Snapshot.status_flags & TEL_FLAG_VISION_FRESH) == 0U);
+        assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_UART_RX) != 0U);
+        assert(Chassis_Drive.Get_Mode() == CHASSIS_MODE_STOPPING || Chassis_Drive.Get_Mode() == CHASSIS_MODE_IDLE);
+        for (int k = 0; k < 15; ++k) {
+            Step(++ot, false);
+            assert(Rescue_Mission.Get_State() != MISSION_FAULT_STOP);
+            // FAULT_FLAG_UART_RX MUST survive 15+ ms until Telemetry_Service_Tx() transmits it!
+            assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_UART_RX) != 0U);
+        }
+        assert(Telemetry_Service_Tx());
+        assert((Decode_Last_Telemetry().fault_flags & FAULT_FLAG_UART_RX) != 0U);
+        Feed_Vision(oseq++);
+        Step(++ot, false);
+        assert(Rescue_Mission.Get_State() != MISSION_FAULT_STOP);
+        assert((Telemetry_Snapshot.status_flags & TEL_FLAG_VISION_FRESH) != 0U);
+        assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_UART_RX) == 0U);
+        std::puts("PASS: UART RX ring overflow flushes ring/parser, preserves sticky fault telemetry until TX, and recovers mid-match without permanent fault latch");
+        return 0;
+    }
+
+    const bool bench_exit_settle = argc > 1 && std::strcmp(argv[1], "bench_exit_settle") == 0;
+    if (bench_exit_settle) {
+        // Finding 1 (R13 P1-1): Leaving bench mode with Gate_Servo settled closed (1900 us) + competition
+        // SET_CONFIG + FAR frame in the same drain MUST NEVER launch while the gate is still closed!
+        Feed_Config(RESCUE_TEAM_UNSET, 0U, RESCUE_MODE_BENCH_STRAIGHT);
+        Feed_Bench_Cmd(BENCH_SERVO_POS_B, BENCH_SERVO_POS_A); // Gate closed (1900 us), Pitch FAR (1500 us)
+        uint32_t bt = 0U;
+        for (; bt < 700U; ++bt) {
+            Step(bt, false);
+        }
+        assert(Gate_Servo.Get_Current_Us() == Gate_Closed_Us && Gate_Servo.Is_Settled());
+        assert(Pitch_Servo.Get_Current_Us() == Pitch_Far_Us && Pitch_Servo.Is_Settled());
+
+        // Same drain: switch to competition + deliver FAR frame, with debounced button rising edge!
+        Step(bt += 10U, true);
+        uint16_t bseq = 1U;
+        Feed_Config(RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION);
+        Feed_Vision(bseq++);
+        Step(bt += 30U, true);
+        assert(Rescue_Mission.Get_State() == MISSION_PRE_MATCH);
+        assert(!Rescue_Mission.Is_Config_Locked());
+        assert(Gate_Servo.Get_Target_Us() == Gate_Open_Us);
+        assert((Telemetry_Snapshot.status_flags & TEL_FLAG_GATE_SETTLED) == 0U);
+        Stopped();
+
+        // Repeated button presses while Gate_Servo slews from 1900 us -> 1000 us and settles (600 ms) MUST be rejected!
+        for (int k = 0; k < 800 && !Gate_Servo.Is_Settled(); ++k) {
+            ++bt;
+            if ((bt % 25U) == 0U) { Feed_Vision(bseq++); }
+            const bool press = ((k % 80) >= 40);
+            Step(bt, press);
+            assert(Rescue_Mission.Get_State() == MISSION_PRE_MATCH);
+            Stopped();
+        }
+        assert(Gate_Servo.Get_Current_Us() == Gate_Open_Us && Gate_Servo.Is_Settled());
+
+        // Release button cleanly, deliver a strictly newer post-settle FAR frame, and press -> launches at 1000 us!
+        Step(bt += 10U, false);
+        Step(bt += 30U, false);
+        Feed_Vision(bseq++);
+        Step(bt += 10U, true);
+        Step(bt += 30U, true);
+        assert(Rescue_Mission.Get_State() == MISSION_LAUNCH_CROSS_BUMPS);
+        assert(Gate_Servo.Get_Current_Us() == Gate_Open_Us && Gate_Servo.Is_Settled());
+        assert(M2006[0].torque < 0.0f && M2006[1].torque > 0.0f);
+        std::puts("PASS: bench exit commands open/FAR, waits for open settle + post-settle FAR frame, and never launches closed");
+        return 0;
+    }
+
+    const bool adc_race = argc > 1 && std::strcmp(argv[1], "adc_race") == 0;
+    if (adc_race) {
+        // Finding 6 (R13 P1-6): Battery ADC fault (Battery.Stop()) firing AFTER Drive_Control's initial
+        // snapshot but BEFORE the final atomic commit MUST block launch, cut power rails & servos,
+        // output zero torque, and clear TEL_FLAG_BATTERY_OK in the same tick!
+        Feed_Config(RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION);
+        uint16_t aseq = 1U;
+        uint32_t at = 0U;
+        for (; at < 200U; ++at) {
+            if ((at % 30U) == 0U) { Feed_Vision(aseq++); }
+            Step(at, false);
+        }
+        assert(BSP_Power.dc24_0 && BSP_Power.dc24_1);
+        assert(Gate_Servo.Is_Settled() && Pitch_Servo.Is_Settled());
+
+        Step(at += 10U, true);
+        irq_after_unmask = [] { Battery.Stop(); };
+        Step(at += 30U, true);
+        assert(Rescue_Mission.Get_State() == MISSION_PRE_MATCH);
+        assert(!Rescue_Mission.Is_Config_Locked());
+        Stopped();
+        assert(!BSP_Power.dc24_0 && !BSP_Power.dc24_1 && !BSP_Power.dc5);
+        assert(!Gate_Servo.Is_Enabled() && !Pitch_Servo.Is_Enabled());
+        assert(Servos_Fault_Latched);
+        assert((Telemetry_Snapshot.status_flags & TEL_FLAG_BATTERY_OK) == 0U);
+        assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_BATTERY) != 0U);
+        std::puts("PASS: mid-tick Battery.Stop() ADC fault race blocks launch, cuts rails/servos, zeroes torque, and publishes fault");
+        return 0;
+    }
+
+    const bool can_bus_off = argc > 1 && std::strcmp(argv[1], "can_bus_off") == 0;
+    if (can_bus_off) {
+        // Finding 7 (R13 P1-7): FDCAN Bus-Off ISR recovery clears TX requests and notifies Drive_Control:
+        // (1) Pre-match Bus-Off blocks launch and exposes sticky FAULT_FLAG_CAN_TX until telemetry TX;
+        // (2) Active competition Bus-Off immediately forces zero torque, latches MISSION_FAULT_STOP,
+        //     invalidates any pending standstill proof, and reports sticky FAULT_FLAG_CAN_TX!
+        Feed_Config(RESCUE_TEAM_RED, 1U, RESCUE_MODE_COMPETITION);
+        uint16_t bseq = 1U;
+        uint32_t ct = 0U;
+        for (; ct < 200U; ++ct) {
+            if ((ct % 30U) == 0U) { Feed_Vision(bseq++); }
+            Step(ct, false);
+        }
+        assert(Gate_Servo.Is_Settled() && Pitch_Servo.Is_Settled());
+
+        // Pre-match Bus-Off injected right after initial snapshot -> blocks launch + exposes sticky FAULT_FLAG_CAN_TX!
+        Step(ct += 10U, true);
+        irq_after_unmask = [] { hfdcan1.inject_bus_off(); };
+        Step(ct += 30U, true);
+        assert(Rescue_Mission.Get_State() == MISSION_PRE_MATCH);
+        assert(!Rescue_Mission.Is_Config_Locked());
+        assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_CAN_TX) != 0U);
+        Stopped();
+        // Sticky FAULT_FLAG_CAN_TX persists across ticks until Telemetry_Service_Tx() transmits it!
+        Step(ct += 10U, false);
+        assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_CAN_TX) != 0U);
+        assert(Telemetry_Service_Tx());
+        assert((Decode_Last_Telemetry().fault_flags & FAULT_FLAG_CAN_TX) != 0U);
+        Step(ct += 30U, false);
+        assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_CAN_TX) == 0U);
+
+        // Launch cleanly into active competition, then inject Bus-Off on FDCAN2 mid-run!
+        Feed_Vision(bseq++);
+        Step(ct += 10U, true);
+        Step(ct += 30U, true);
+        assert(Rescue_Mission.Get_State() == MISSION_LAUNCH_CROSS_BUMPS);
+        assert(M2006[0].torque < 0.0f && M2006[1].torque > 0.0f);
+
+        hfdcan2.inject_bus_off();
+        Step(++ct, false);
+        assert(Rescue_Mission.Get_State() == MISSION_FAULT_STOP);
+        Stopped();
+        assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_CAN_TX) != 0U);
+        Step(++ct, false);
+        assert(Rescue_Mission.Get_State() == MISSION_FAULT_STOP);
+        assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_CAN_TX) != 0U);
+        assert(Telemetry_Service_Tx());
+        assert((Decode_Last_Telemetry().fault_flags & FAULT_FLAG_CAN_TX) != 0U);
+        Step(++ct, false);
+        assert(Rescue_Mission.Get_State() == MISSION_FAULT_STOP);
+        assert((Telemetry_Snapshot.fault_flags & FAULT_FLAG_CAN_TX) == 0U);
+        Stopped();
+        std::puts("PASS: FDCAN Bus-Off blocks pre-match launch, latches active MISSION_FAULT_STOP with zero torque, and exposes sticky FAULT_FLAG_CAN_TX");
         return 0;
     }
 
@@ -1354,5 +1591,5 @@ cmd = ["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-Wno-unused-variable
 if os.name == "nt":
     cmd.append("-static")
 subprocess.run(cmd, check=True)
-for mode in ([], ["held"], ["comp"], ["can_fault"], ["frozen"], ["cold_boot"], ["servo_fail"], ["reverse_abort"], ["uart_unhealthy"], ["standstill_can"], ["irq_races"], ["uart_atomic"], ["uart_overflow"], ["resync_drain"], ["gate_blind_abort"], ["can_tx_complete"], ["can_standstill_hw"]):
+for mode in ([], ["held"], ["comp"], ["can_fault"], ["frozen"], ["cold_boot"], ["servo_fail"], ["reverse_abort"], ["uart_unhealthy"], ["standstill_can"], ["irq_races"], ["uart_atomic"], ["uart_overflow"], ["resync_drain"], ["gate_blind_abort"], ["can_tx_complete"], ["can_standstill_hw"], ["bench_exit_settle"], ["adc_race"], ["can_bus_off"]):
     subprocess.run([str(exe), *mode], check=True)

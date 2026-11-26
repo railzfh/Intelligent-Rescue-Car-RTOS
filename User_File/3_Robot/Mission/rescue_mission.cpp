@@ -34,10 +34,12 @@ bool Class_Rescue_Mission::On_Set_Config(const Struct_Match_Config_Cmd &cfg)
     if (Run_Mode != RESCUE_MODE_BENCH_STRAIGHT &&
         (prev_mode == RESCUE_MODE_BENCH_STRAIGHT || Gate_Closed_Cmd || Camera_Near_Cmd))
     {
-        // Clear any bench actuator overrides when entering/leaving into competition mode and require
-        // settled open/FAR servos plus a fresh post-settle FAR frame before launch.
+        // Clear any bench actuator overrides when entering/leaving into competition mode:
+        // first apply open/FAR targets on a control tick, wait for those targets to settle,
+        // and then require a strictly newer post-settle FAR frame before competition launch.
         Gate_Closed_Cmd = false;
         Camera_Near_Cmd = false;
+        Pre_Match_Wait_Servo_Apply = true;
         Pre_Match_Need_Post_Settle_Far = true;
         Pre_Match_Settle_Accept_Id = Vision_Accept_Counter;
     }
@@ -74,6 +76,10 @@ bool Class_Rescue_Mission::On_Vision_State(const Struct_Vision_State &vis, uint3
     if ((vis.flags & (VIS_FLAG_OPPONENT_NEAR | VIS_FLAG_OPPONENT_ZONE_NEAR)) != 0U)
     {
         Pending_Opponent_Alert_Event = true;
+    }
+    if ((vis.flags & VIS_FLAG_REAR_CLEAR) == 0U)
+    {
+        Pending_Rear_Clear_Lost_Event = true;
     }
     if (vis.camera_view != CAMERA_VIEW_FAR)
     {
@@ -190,6 +196,7 @@ void Class_Rescue_Mission::Fault_Stop(uint32_t now_ms)
     Pending_Near_Hazard_Event = false;
     Pending_Near_Non_Valid_Corral_Event = false;
     Pending_Opponent_Alert_Event = false;
+    Pending_Rear_Clear_Lost_Event = false;
     Pending_Drop_Path_Blocked_Event = false;
     Pending_Drop_Baseline_Not_Ready_Event = false;
     Pending_Home_Half_Mismatch_Event = false;
@@ -322,6 +329,7 @@ void Class_Rescue_Mission::Enter_State(Enum_Mission_State next, uint32_t now_ms)
     Pending_Near_Hazard_Event = false;
     Pending_Near_Non_Valid_Corral_Event = false;
     Pending_Opponent_Alert_Event = false;
+    Pending_Rear_Clear_Lost_Event = false;
     Pending_Drop_Path_Blocked_Event = false;
     Pending_Drop_Baseline_Not_Ready_Event = false;
     Pending_Home_Half_Mismatch_Event = false;
@@ -438,7 +446,8 @@ void Class_Rescue_Mission::Start_Escape(const Struct_Mission_Inputs &in, float r
     const bool was_reversing = Is_Active_Reverse_State();
     Enter_State(MISSION_ESCAPE_RECOVERY, in.now_ms);
     Pending_Escape_Reverse_M = (reverse_abs_m >= Config.min_proven_reverse_m) ? reverse_abs_m : 0.0f;
-    if (was_reversing || in.chassis_active || !in.wheels_still)
+    if (was_reversing || in.chassis_active || !in.wheels_still ||
+        (in.chassis_motion_aborted && in.use_motor_feedback_seq))
     {
         // Cancel active motion immediately and confirm fresh standstill before reversing or turning.
         if (was_reversing || in.use_motor_feedback_seq)
@@ -543,6 +552,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
     const bool near_hazard_event = Pending_Near_Hazard_Event;
     const bool near_non_valid_corral_event = Pending_Near_Non_Valid_Corral_Event;
     const bool opponent_alert_event = Pending_Opponent_Alert_Event;
+    const bool rear_clear_lost_event = Pending_Rear_Clear_Lost_Event;
     const bool drop_path_blocked_event = Pending_Drop_Path_Blocked_Event;
     const bool drop_baseline_not_ready_event = Pending_Drop_Baseline_Not_Ready_Event;
     const bool home_half_mismatch_event = Pending_Home_Half_Mismatch_Event;
@@ -553,17 +563,20 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
     Pending_Near_Hazard_Event = false;
     Pending_Near_Non_Valid_Corral_Event = false;
     Pending_Opponent_Alert_Event = false;
+    Pending_Rear_Clear_Lost_Event = false;
     Pending_Drop_Path_Blocked_Event = false;
     Pending_Drop_Baseline_Not_Ready_Event = false;
     Pending_Home_Half_Mismatch_Event = false;
     Pending_Near_Cargo_Mismatch_Event = false;
     Pending_Drop_Unconfirmed_Event = false;
 
-    // Global standstill interlock after any cancelled/interrupted/completed reverse transition:
+    // Global standstill interlock after any cancelled/interrupted/completed reverse or push-abort transition:
     // inhibit ALL motion across ALL states until fresh post-stop feedback from EACH motor confirms
-    // standstill, or latch a fault.
+    // standstill, or latch a fault. Always reset & anchor confirmation streak while blocked AND at release
+    // so no frame accepted before standstill release can ever count toward confirmation.
     if (Require_Standstill_Gate && is_competition_active)
     {
+        Reset_Confirm_Streak();
         if (Is_Fresh_Standstill(in))
         {
             Require_Standstill_Gate = false;
@@ -576,7 +589,6 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                                       in.camera_settled && (Latest_Vision.camera_view == CAMERA_VIEW_NEAR);
             if (!near_view_ok || !in.wheels_still || in.chassis_active)
             {
-                Reset_Confirm_Streak();
                 if (Gate_Closed_Cmd && !in.gate_settled)
                 {
                     Clear_Cargo();
@@ -599,7 +611,8 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         }
     }
 
-    const bool rear_sensor_clear = vision_fresh && ((Latest_Vision.flags & VIS_FLAG_REAR_CLEAR) != 0U);
+    const bool rear_sensor_clear =
+        vision_fresh && !rear_clear_lost_event && ((Latest_Vision.flags & VIS_FLAG_REAR_CLEAR) != 0U);
     const bool opponent_alert =
         vision_fresh && (opponent_alert_event ||
                          ((Latest_Vision.flags & (VIS_FLAG_OPPONENT_NEAR | VIS_FLAG_OPPONENT_ZONE_NEAR)) != 0U));
@@ -821,7 +834,15 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
         {
             Gate_Closed_Cmd = false;
             Camera_Near_Cmd = false;
-            if (!in.gate_settled || !in.camera_settled || !vision_fresh)
+            if (Pre_Match_Wait_Servo_Apply)
+            {
+                // This tick's settled bits still belong to the previous (bench) servo targets;
+                // command open/FAR first and require a fresh post-settle FAR frame on later ticks.
+                Pre_Match_Wait_Servo_Apply = false;
+                Pre_Match_Need_Post_Settle_Far = true;
+                Pre_Match_Settle_Accept_Id = Vision_Accept_Counter;
+            }
+            else if (!in.gate_settled || !in.camera_settled || !vision_fresh)
             {
                 Pre_Match_Need_Post_Settle_Far = true;
                 Pre_Match_Settle_Accept_Id = Vision_Accept_Counter;
@@ -842,6 +863,7 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
             }
             else if ((Team == RESCUE_TEAM_RED || Team == RESCUE_TEAM_BLUE) &&
                      vision_fresh &&
+                     !opponent_alert &&
                      !Gate_Closed_Cmd && !Camera_Near_Cmd &&
                      in.gate_settled && in.camera_settled &&
                      !non_far_view_event &&
@@ -1400,6 +1422,10 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                 Clear_Cargo();
                 Camera_Near_Cmd = false;
                 Enter_State(MISSION_BACK_OUT_SEPARATE, in.now_ms);
+                if (in.chassis_active || !in.wheels_still)
+                {
+                    Engage_Standstill_Gate(in.now_ms, in);
+                }
                 out.drive_action = DRIVE_ACTION_EMERGENCY_STOP;
                 break;
             }
@@ -1410,14 +1436,21 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                 Gate_Closed_Cmd = false;
                 Camera_Near_Cmd = false;
                 Enter_State(MISSION_BACK_OUT_SEPARATE, in.now_ms);
+                if (in.chassis_active || !in.wheels_still)
+                {
+                    Engage_Standstill_Gate(in.now_ms, in);
+                }
                 out.drive_action = DRIVE_ACTION_EMERGENCY_STOP;
                 break;
             }
             if (home_half_mismatch_event)
             {
-                Gate_Closed_Cmd = true;
+                // Keep gate open and require fresh, consecutive, hazard-free NEAR authorization at
+                // measured standstill in MISSION_INSPECT_CORRAL before ever commanding gate closure.
+                Clear_Cargo();
+                Gate_Closed_Cmd = false;
                 Camera_Near_Cmd = true;
-                Enter_State(MISSION_CLOSE_GATE_VERIFY, in.now_ms);
+                Enter_State(MISSION_INSPECT_CORRAL, in.now_ms);
                 out.drive_action = DRIVE_ACTION_SOFT_STOP;
                 break;
             }
@@ -1442,14 +1475,19 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                     Gate_Closed_Cmd = false;
                     Camera_Near_Cmd = false;
                     Enter_State(MISSION_BACK_OUT_SEPARATE, in.now_ms);
+                    if (in.chassis_active || !in.wheels_still)
+                    {
+                        Engage_Standstill_Gate(in.now_ms, in);
+                    }
                     out.drive_action = DRIVE_ACTION_EMERGENCY_STOP;
                     break;
                 }
                 if (!half_ok)
                 {
-                    Gate_Closed_Cmd = true;
+                    Clear_Cargo();
+                    Gate_Closed_Cmd = false;
                     Camera_Near_Cmd = true;
-                    Enter_State(MISSION_CLOSE_GATE_VERIFY, in.now_ms);
+                    Enter_State(MISSION_INSPECT_CORRAL, in.now_ms);
                     out.drive_action = DRIVE_ACTION_SOFT_STOP;
                     break;
                 }
@@ -1504,6 +1542,9 @@ Struct_Mission_Output Class_Rescue_Mission::Update(const Struct_Mission_Inputs &
                 Gate_Closed_Cmd = false;
                 Camera_Near_Cmd = false;
                 Enter_State(MISSION_BACK_OUT_SEPARATE, in.now_ms);
+                // Engage two-bus zero-TX and fresh post-stop feedback interlock before allowing
+                // any separation reverse or turn after aborting an active push!
+                Engage_Standstill_Gate(in.now_ms, in);
                 out.drive_action = DRIVE_ACTION_EMERGENCY_STOP;
                 break;
             }

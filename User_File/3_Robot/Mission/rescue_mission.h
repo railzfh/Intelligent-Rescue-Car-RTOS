@@ -206,12 +206,14 @@ private:
     bool Pending_Near_Hazard_Event = false;
     bool Pending_Near_Non_Valid_Corral_Event = false;
     bool Pending_Opponent_Alert_Event = false;
+    bool Pending_Rear_Clear_Lost_Event = false;
     bool Pending_Drop_Path_Blocked_Event = false;
     bool Pending_Drop_Baseline_Not_Ready_Event = false;
     bool Pending_Home_Half_Mismatch_Event = false;
     bool Pending_Near_Cargo_Mismatch_Event = false;
     bool Pending_Drop_Unconfirmed_Event = false;
 
+    bool Pre_Match_Wait_Servo_Apply = false;
     bool Pre_Match_Need_Post_Settle_Far = false;
     uint32_t Pre_Match_Settle_Accept_Id = 0U;
 

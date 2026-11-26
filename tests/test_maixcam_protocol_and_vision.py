@@ -1887,6 +1887,37 @@ class MaixcamVisionAndUITest(unittest.TestCase):
         self.assertFalse(st_det.flags & VIS_FLAG_DROP_PATH_CLEAR)
         self.assertFalse(st_det.flags & VIS_FLAG_DROP_CONFIRMED)
 
+        # 5. Round 13 P2-4: Protruding ramp wings MUST be included in misplaced occupancy so a stray block
+        #    on a protruding ramp wing invalidates baseline and can NEVER substitute for trip cargo!
+        proc_wing = RescueVisionProcessor(self.cfg)
+        wing_ramp = Blob("purple_ramp", 70, 75, 250, 12, 3000)  # protrudes left/right of home [97, 297)
+        stray_wing = Blob("green", 71, 75, 12, 10, 120)
+        st_wing_base = proc_wing.process(
+            [home, wing_ramp, stray_wing, Blob("green", 140, 150, 12, 10, 120)],
+            True, True, TEAM_RED, False,
+            mission_state=MISSION_DROP_OPEN_AND_PUSH, gate_closed=True,
+        )
+        self.assertFalse(st_wing_base.flags & VIS_FLAG_DROP_BASELINE_READY)
+        st_wing_post = proc_wing.process(
+            [home, wing_ramp, Blob("green", 140, 40, 12, 10, 120)],
+            True, True, TEAM_RED, False,
+            mission_state=MISSION_DROP_BACKOUT_VERIFY, gate_closed=False,
+        )
+        self.assertFalse(st_wing_post.flags & VIS_FLAG_DROP_CONFIRMED)
+
+        # 6. Round 13 P2-3: Tier 3 MUST subtract component occupancy BEFORE deduplicating residuals so an
+        #    adjacent 210-px unknown enclosed inside a concave L-conflict's AABB is NOT suppressed!
+        img_l_t3 = _FakeMaixImage(320, 240, floor)
+        img_l_t3.fill_rect(100, 130, 53, 4, shared_go)
+        img_l_t3.fill_rect(100, 134, 4, 41, shared_go)
+        img_l_t3.fill_rect(104, 144, 15, 14, (55, 0, 85))  # 210-px uncalibrated object inside L's AABB!
+        exact_l = extract_blobs_from_maix_image(img_l_t3, go_cfg, scan_unknown_near=True)
+        tier3_l = extract_blobs_from_maix_image(
+            SimpleNamespace(find_blobs=img_l_t3.find_blobs), go_cfg, scan_unknown_near=True
+        )
+        self.assertEqual(sum(b.label == "unknown" for b in exact_l), 2)
+        self.assertEqual(sum(b.label == "unknown" for b in tier3_l), 2)
+
     def test_home_half_match_checks_full_corral_width_and_opponent_zone(self) -> None:
         # Home x=100..320 (cx=210, left material half=[100, 192]).
         # Center=160, corral_align_half_w_px=24 => footprint [136, 184] strictly inside [100, 192]!
