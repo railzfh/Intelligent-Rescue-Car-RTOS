@@ -69,6 +69,8 @@ class Blob:
     density: float = 1.0  # pixels / (w * h)
     in_corral: Optional[bool] = None
     in_sweep: Optional[bool] = None
+    from_yolo: bool = False
+    score: Optional[float] = None
 
     @property
     def cx(self) -> float:
@@ -150,10 +152,20 @@ def _lab_ranges_overlap(a: Sequence[int], b: Sequence[int]) -> bool:
 
 def _is_verified_object_blob(blob: Blob, min_pixels: int, cfg: Optional[RescueVisionConfig] = None) -> bool:
     if blob.label == "cyan":
-        req = cfg.min_hazard_pixels if cfg is not None else min_pixels
+        if blob.from_yolo:
+            req = cfg.yolo_min_box_pixels if cfg is not None else min_pixels
+        else:
+            req = cfg.min_hazard_pixels if cfg is not None else min_pixels
         return blob.pixels >= req
     if blob.label not in ("green", "black", "orange"):
         return False
+    if blob.from_yolo:
+        min_px = cfg.yolo_min_box_pixels if cfg is not None else min_pixels
+        max_px = cfg.yolo_max_box_pixels if cfg is not None else 24000
+        if blob.pixels < min_px or blob.pixels > max_px:
+            return False
+        aspect = max(blob.w, blob.h) / max(1, min(blob.w, blob.h))
+        return aspect <= 4.0
     min_px = cfg.min_block_pixels if cfg is not None else min_pixels
     max_px = cfg.max_block_pixels if cfg is not None else 9500
     if blob.pixels < min_px or blob.pixels > max_px:
@@ -823,21 +835,27 @@ class RescueVisionProcessor:
         blocks: List[Blob] = []
         unknowns: List[Blob] = []
         for b in all_blobs:
+            min_hz = self.cfg.yolo_min_box_pixels if b.from_yolo else self.cfg.min_hazard_pixels
             if b.label == "cyan":
-                if b.pixels >= self.cfg.min_hazard_pixels:
+                if b.pixels >= min_hz:
                     hazards.append(b)
             elif b.label in ("green", "black", "orange"):
                 if self._is_valid_target_block(b):
                     blocks.append(b)
-                elif b.pixels >= self.cfg.min_hazard_pixels:
+                elif b.pixels >= min_hz:
                     unknowns.append(b)
             elif b.label == "unknown":
-                if b.pixels >= self.cfg.min_hazard_pixels:
+                if b.pixels >= min_hz:
                     unknowns.append(b)
 
         zones = [b for b in all_blobs if b.label in ("red_zone", "blue_zone")]
         ramps = [b for b in all_blobs if b.label == "purple_ramp" and b.pixels >= self.cfg.min_ramp_pixels]
-        opponents = [b for b in all_blobs if b.label == "opponent" and b.pixels >= self.cfg.min_opponent_pixels]
+        opponents = [
+            b
+            for b in all_blobs
+            if b.label == "opponent"
+            and b.pixels >= (self.cfg.yolo_min_box_pixels if b.from_yolo else self.cfg.min_opponent_pixels)
+        ]
 
         flags = 0
         if rear_clear:
@@ -878,7 +896,11 @@ class RescueVisionProcessor:
                 state.target_type = _label_to_target_type(best.label)
                 state.target_err_x_mrad = self.bearing_mrad(best.cx)
                 state.target_dist_mm = self.estimate_far_distance_mm(best.y2)
-                state.confidence = 90
+                state.confidence = (
+                    max(1, min(100, int(round(best.score * 100.0))))
+                    if best.score is not None
+                    else 90
+                )
             elif home is not None:
                 state.confidence = 85
             else:

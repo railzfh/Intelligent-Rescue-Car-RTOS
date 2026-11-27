@@ -1,0 +1,16 @@
+# Ultralytics YOLO11 / YOLOv8 dataset template for Intelligent Rescue Car (MaixCAM SG2002)
+# Canonical class order matches maixcam/yolo.py and maixcam/config.py (yolo_label_map).
+#
+# Recommended training resolution for MaixCAM NPU: 320x224 (imgsz=[224, 320] or 320).
+# Keep hsv_h <= 0.01 during training so green/cyan and orange/red do not swap classes!
+
+path: ./rescue_dataset
+train: images/train
+val: images/val
+
+names:
+  0: green      # 绿色普通物资 (+5 分，首单必须单运 1 个)
+  1: black      # 黑色核心物资 (+10 分)
+  2: orange     # 橘色伤员 (+15 分，必须单独运送)
+  3: cyan       # 浅蓝危险目标 (严禁推入安全区或出界)
+  4: opponent   # 对手机器人

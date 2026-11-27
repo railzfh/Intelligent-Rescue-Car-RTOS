@@ -76,6 +76,55 @@ class RescueVisionConfig:
     motion_static_sad_max: float = 4.5
     motion_min_cells_per_s: float = 3.0
 
+    # YOLO + lightweight LAB hybrid vision settings (MaixCAM SG2002 NPU, 320x224 INT8 recommended).
+    # Backends:
+    #   "hybrid" - YOLO objects + LAB zones/ramp + near-view LAB cyan/unknown safety net (recommended)
+    #   "yolo"   - YOLO primary + LAB zones/ramp (unless YOLO model outputs surfaces)
+    #   "lab"    - original pure LAB pipeline (instant match-day fallback)
+    vision_backend: str = "hybrid"
+    yolo_arch: str = "yolo11"  # "yolo11", "yolov8", or "yolo5"
+    yolo_model_path: str = "/root/models/rescue_yolo11n.mud"
+    yolo_dual_buff: bool = False
+    yolo_fallback_to_lab: bool = True
+    yolo_conf_th: float = 0.45
+    yolo_hazard_conf_th: float = 0.25
+    yolo_opponent_conf_th: float = 0.40
+    yolo_surface_conf_th: float = 0.40
+    yolo_iou_th: float = 0.45
+    yolo_cross_class_iou_th: float = 0.50
+    yolo_ambiguous_score_margin: float = 0.10
+    yolo_min_box_pixels: int = 36
+    yolo_max_box_pixels: int = 24000
+    yolo_unknown_unmapped: bool = True
+    yolo_use_lab_surfaces: bool = True
+    hybrid_lab_cyan_backup: bool = True
+    hybrid_lab_unknown_backup: bool = True
+    yolo_label_map: Dict[str, str] = field(
+        default_factory=lambda: {
+            "green": "green",
+            "green_block": "green",
+            "material_green": "green",
+            "black": "black",
+            "black_block": "black",
+            "core": "black",
+            "material_black": "black",
+            "orange": "orange",
+            "orange_block": "orange",
+            "casualty": "orange",
+            "cyan": "cyan",
+            "cyan_block": "cyan",
+            "hazard": "cyan",
+            "danger": "cyan",
+            "opponent": "opponent",
+            "robot": "opponent",
+            "car": "opponent",
+            "red_zone": "red_zone",
+            "blue_zone": "blue_zone",
+            "purple_ramp": "purple_ramp",
+            "ramp": "purple_ramp",
+        }
+    )
+
     def min_reachable_far_distance_mm(self) -> int:
         dy = max(8, self.frame_height - self.far_horizon_y)
         return max(80, min(3000, int(round(self.far_dist_k / dy))))
@@ -102,6 +151,24 @@ class RescueVisionConfig:
                 raise ValueError(f"{name} must be [x, y, w, h] with positive size")
             if roi[0] < 0 or roi[1] < 0 or roi[0] + roi[2] > self.frame_width or roi[1] + roi[3] > self.frame_height:
                 raise ValueError(f"{name}={roi} exceeds frame {self.frame_width}x{self.frame_height}")
+        if self.vision_backend not in ("hybrid", "yolo", "lab"):
+            raise ValueError(f"unsupported vision_backend: {self.vision_backend!r}")
+        if self.yolo_arch not in ("yolo11", "yolov8", "yolo5"):
+            raise ValueError(f"unsupported yolo_arch: {self.yolo_arch!r}")
+        for name, value in (
+            ("yolo_conf_th", self.yolo_conf_th),
+            ("yolo_hazard_conf_th", self.yolo_hazard_conf_th),
+            ("yolo_opponent_conf_th", self.yolo_opponent_conf_th),
+            ("yolo_surface_conf_th", self.yolo_surface_conf_th),
+            ("yolo_iou_th", self.yolo_iou_th),
+            ("yolo_cross_class_iou_th", self.yolo_cross_class_iou_th),
+        ):
+            if not (0.0 < float(value) <= 1.0):
+                raise ValueError(f"{name} must be in (0, 1], got {value}")
+        if self.yolo_ambiguous_score_margin < 0.0:
+            raise ValueError("yolo_ambiguous_score_margin must be non-negative")
+        if self.yolo_min_box_pixels <= 0 or self.yolo_max_box_pixels < self.yolo_min_box_pixels:
+            raise ValueError("yolo box pixel bounds must satisfy 0 < min <= max")
 
     def save(self, path: Path) -> None:
         path.write_text(json.dumps(asdict(self), indent=2, ensure_ascii=False), encoding="utf-8")

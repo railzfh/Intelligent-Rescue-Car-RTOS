@@ -61,7 +61,9 @@ class TouchButton:
 class TouchUIController:
     """Handles MaixCAM touchscreen team/zone/mode selection and config locking."""
 
-    def __init__(self, width: int = 552, height: int = 368) -> None:
+    _VISION_MODES = ("hybrid", "yolo", "lab")
+
+    def __init__(self, width: int = 552, height: int = 368, vision_mode: str = "hybrid") -> None:
         self.width = width
         self.height = height
         self.config = MatchConfigCmd(
@@ -70,6 +72,8 @@ class TouchUIController:
             run_mode=MODE_COMPETITION,
             max_materials_per_trip=1,
         )
+        self.vision_mode = vision_mode if vision_mode in self._VISION_MODES else "hybrid"
+        self.vision_mode_dirty = False
         self.bench_gate_closed = False
         self.bench_camera_near = False
         self.pending_bench_cmd: Optional[BenchActuatorCmd] = None
@@ -82,7 +86,7 @@ class TouchUIController:
         panel_w = max(168, int(self.width * 0.34))
         px = self.width - panel_w
         pad = 6
-        btn_h = max(36, (self.height - 64) // 6)
+        btn_h = max(32, (self.height - 44 - 7 * pad) // 6)
         half_w = (panel_w - 3 * pad) // 2
         qtr_w = (panel_w - 5 * pad) // 4
 
@@ -91,6 +95,7 @@ class TouchUIController:
         y2 = y1 + btn_h + pad
         y3 = y2 + btn_h + pad
         y4 = y3 + btn_h + pad
+        y5 = y4 + btn_h + pad
         return [
             TouchButton("team_red", "RED", px + pad, y0, half_w, btn_h),
             TouchButton("team_blue", "BLUE", px + 2 * pad + half_w, y0, half_w, btn_h),
@@ -102,6 +107,7 @@ class TouchUIController:
             TouchButton("max_mat", "LOAD:1", px + pad, y3, panel_w - 2 * pad, btn_h),
             TouchButton("bench_gate", "GATE", px + pad, y4, half_w, btn_h),
             TouchButton("bench_cam", "PITCH", px + 2 * pad + half_w, y4, half_w, btn_h),
+            TouchButton("vision_mode", "VIS:HYB", px + pad, y5, panel_w - 2 * pad, btn_h),
         ]
 
     def handle_touch(self, x: int, y: int, pressed: bool, telemetry: Telemetry) -> Optional[str]:
@@ -157,6 +163,11 @@ class TouchUIController:
                     pitch_cmd=BENCH_SERVO_POS_B if self.bench_camera_near else BENCH_SERVO_POS_A,
                 )
                 return btn.button_id
+            if btn.button_id == "vision_mode":
+                idx = self._VISION_MODES.index(self.vision_mode)
+                self.vision_mode = self._VISION_MODES[(idx + 1) % len(self._VISION_MODES)]
+                self.vision_mode_dirty = True
+                return btn.button_id
         return None
 
     def pop_bench_cmd(self) -> Optional[BenchActuatorCmd]:
@@ -178,8 +189,15 @@ class TouchUIController:
         return line1, line2
 
 
-def render_touch_overlay(img, ui: TouchUIController, telemetry: Telemetry) -> None:
-    """Draw HUD and touch controls onto a MaixPy display image."""
+def render_touch_overlay(
+    img,
+    ui: TouchUIController,
+    telemetry: Telemetry,
+    blobs=None,
+    cfg=None,
+    backend_tag: str = "",
+) -> None:
+    """Draw detections, calibrated ROIs, HUD, and touch controls onto a MaixPy display image."""
     from maix import image  # Imported lazily so desktop tests require no MaixPy SDK.
 
     c_white = image.Color.from_rgb(245, 245, 245)
@@ -189,8 +207,50 @@ def render_touch_overlay(img, ui: TouchUIController, telemetry: Telemetry) -> No
     c_green = image.Color.from_rgb(40, 175, 85)
     c_dim = image.Color.from_rgb(65, 72, 86)
     c_amber = image.Color.from_rgb(220, 155, 25)
+    c_cyan = image.Color.from_rgb(0, 220, 235)
+    c_purple = image.Color.from_rgb(185, 75, 230)
+    c_orange = image.Color.from_rgb(245, 130, 35)
+
+    if cfg is not None and cfg.frame_width > 0 and cfg.frame_height > 0:
+        sx = ui.width / float(cfg.frame_width)
+        sy = ui.height / float(cfg.frame_height)
+        if telemetry.status_flags & TEL_FLAG_CAMERA_NEAR:
+            for roi, col in ((cfg.near_corral_roi, c_green), (cfg.near_sweep_roi, c_amber)):
+                img.draw_rect(
+                    int(roi[0] * sx),
+                    int(roi[1] * sy),
+                    max(1, int(roi[2] * sx)),
+                    max(1, int(roi[3] * sy)),
+                    color=col,
+                    thickness=1,
+                )
+        if blobs:
+            color_map = {
+                "green": c_green,
+                "black": c_white,
+                "orange": c_orange,
+                "cyan": c_cyan,
+                "unknown": c_red,
+                "opponent": c_red,
+                "red_zone": c_red,
+                "blue_zone": c_blue,
+                "purple_ramp": c_purple,
+            }
+            for b in blobs:
+                col = color_map.get(b.label, c_amber)
+                bx = int(b.x * sx)
+                by = int(b.y * sy)
+                bw = max(1, int(b.w * sx))
+                bh = max(1, int(b.h * sy))
+                img.draw_rect(bx, by, bw, bh, color=col, thickness=2 if b.label in ("cyan", "unknown") else 1)
+                tag = b.label[:4]
+                if getattr(b, "score", None) is not None:
+                    tag = f"{tag}:{b.score:.2f}"
+                img.draw_string(bx + 2, max(40, by + 2), tag, color=col, scale=0.8)
 
     line1, line2 = ui.hud_summary_lines(telemetry)
+    if backend_tag:
+        line2 = f"{line2} | {backend_tag}"
     img.draw_rect(0, 0, ui.width, 38, color=c_bg, thickness=-1)
     img.draw_string(6, 4, line1, color=c_white, scale=1.0)
     img.draw_string(6, 20, line2, color=c_amber if telemetry.fault_flags else c_green, scale=1.0)
@@ -217,6 +277,14 @@ def render_touch_overlay(img, ui: TouchUIController, telemetry: Telemetry) -> No
         elif btn.button_id == "bench_cam":
             label = "CAM:NEAR" if (telemetry.status_flags & TEL_FLAG_CAMERA_NEAR) else "CAM:FAR"
             color = c_amber if ui.config.run_mode == MODE_BENCH_STRAIGHT else c_bg
+        elif btn.button_id == "vision_mode":
+            if backend_tag.startswith("LAB(FB)"):
+                label = "VIS:LAB(FB)"
+                color = c_amber
+            else:
+                short = {"hybrid": "HYB", "yolo": "YOLO", "lab": "LAB"}.get(ui.vision_mode, "HYB")
+                label = f"VIS:{short}"
+                color = c_green if ui.vision_mode == "hybrid" else (c_blue if ui.vision_mode == "yolo" else c_dim)
 
         if locked:
             color = c_bg
