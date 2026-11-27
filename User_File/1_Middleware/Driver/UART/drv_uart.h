@@ -35,6 +35,8 @@
  */
 typedef void (*UART_Callback)(uint8_t *Buffer, uint16_t Length);
 
+typedef void (*UART_Tx_Callback)(bool Completed);
+
 /**
  * @brief UART通信处理结构体
  */
@@ -42,6 +44,7 @@ struct Struct_UART_Manage_Object
 {
     UART_HandleTypeDef *UART_Handler;
     UART_Callback Callback_Function;
+    UART_Tx_Callback Tx_Callback_Function;
 
     // 双缓冲适配的缓冲区以及当前激活的缓冲区
     uint8_t Rx_Buffer_0[UART_BUFFER_SIZE];
@@ -53,6 +56,12 @@ struct Struct_UART_Manage_Object
 
     // 接收时间戳
     uint64_t Rx_Time_Stamp;
+    // 中断上下文检测到 RX 停止或重装失败后，交由任务上下文终止旧 DMA 流并重装。
+    volatile bool Rx_Recovery_Pending;
+    volatile bool Rx_Recovery_Fault_Latched;
+    volatile uint32_t Rx_Recovery_Epoch;
+    uint8_t Rx_Recovery_Fail_Count;
+    volatile bool Tx_Active;
 };
 
 /* Exported variables --------------------------------------------------------*/
@@ -74,7 +83,17 @@ extern struct Struct_UART_Manage_Object UART10_Manage_Object;
 
 void UART_Init(UART_HandleTypeDef *huart, UART_Callback Callback_Function);
 
+void UART_Set_Tx_Callback(UART_HandleTypeDef *huart, UART_Tx_Callback Callback_Function);
+
 void UART_Reinit(UART_HandleTypeDef * huart);
+
+bool UART_Service_Rx_Recovery(UART_HandleTypeDef *huart);
+
+bool UART_Is_Rx_Healthy(UART_HandleTypeDef *huart);
+
+bool UART_Is_Rx_Fault_Latched(UART_HandleTypeDef *huart);
+
+uint32_t UART_Get_Rx_Epoch(UART_HandleTypeDef *huart);
 
 uint8_t UART_Transmit_Data(UART_HandleTypeDef *huart, uint8_t *Data, uint16_t Length);
 

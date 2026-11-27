@@ -50,6 +50,10 @@ struct Struct_CAN_Manage_Object
 
     // 接收时间戳
     uint64_t Rx_Timestamp;
+
+    // 总线离线(Bus-Off)锁存状态与计数，由错误中断在重启控制器前置位，控制任务消费并锁停电机
+    volatile bool Bus_Off_Latched;
+    volatile uint32_t Bus_Off_Count;
 };
 
 /* Exported variables ---------------------------------------------------------*/
@@ -91,6 +95,18 @@ extern uint8_t CAN_Supercap_Tx_Data[];
 void CAN_Init(FDCAN_HandleTypeDef *hfdcan, CAN_Callback Callback_Function);
 
 uint8_t CAN_Transmit_Data(FDCAN_HandleTypeDef *hfdcan, uint16_t ID, uint8_t *Data, uint16_t Length);
+
+bool CAN_Is_Tx_Buffer_Occurred(const FDCAN_HandleTypeDef *hfdcan, uint32_t tx_buffer_mask);
+
+bool CAN_Is_Rx_Fifo0_Empty(const FDCAN_HandleTypeDef *hfdcan);
+
+bool CAN_Is_Bus_Off_Active(const FDCAN_HandleTypeDef *hfdcan);
+
+bool CAN_Is_Bus_Off_Latched(const FDCAN_HandleTypeDef *hfdcan);
+
+bool CAN_Consume_Bus_Off(const FDCAN_HandleTypeDef *hfdcan);
+
+uint32_t CAN_Get_Bus_Off_Count(const FDCAN_HandleTypeDef *hfdcan);
 
 void TIM_100us_CAN_PeriodElapsedCallback();
 

@@ -20,7 +20,13 @@ public:
 
     void Check_Timeout(uint32_t now_ms)
     {
-        if (Sample_Received && (uint32_t)(now_ms - Last_Sample_Ms) >= 100U)
+        if (!Sample_Received)
+        {
+            return;
+        }
+        const uint32_t elapsed = static_cast<uint32_t>(now_ms - Last_Sample_Ms);
+        // 忽略 ADC 中断写入更新时间戳（now_ms 略落后 1 tick）的良性时钟推进，仅对真实超时锁停。
+        if (elapsed < 0x80000000U && elapsed >= 100U)
         {
             Stop();
         }
@@ -35,6 +41,11 @@ public:
     bool Can_Run() const
     {
         return Sample_Received && !Stop_Latched;
+    }
+
+    bool Is_Fault_Latched() const
+    {
+        return Stop_Latched;
     }
 
     float Get_Pack_Voltage() const
